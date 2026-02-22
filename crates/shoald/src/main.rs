@@ -415,10 +415,12 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
                             .await;
                         });
 
-                        // Handle bi-directional streams (shard pull requests).
+                        // Handle bi-directional streams (shard pull, manifest pull).
+                        let meta_bi = meta.clone();
                         tokio::spawn(async move {
                             ShoalTransport::handle_bi_streams(conn, move |msg| {
                                 let store = store.clone();
+                                let meta = meta_bi.clone();
                                 async move {
                                     match msg {
                                         ShoalMessage::ShardRequest { shard_id } => {
@@ -426,6 +428,21 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
                                             Some(ShoalMessage::ShardResponse {
                                                 shard_id,
                                                 data: data.map(|b| b.to_vec()),
+                                            })
+                                        }
+                                        ShoalMessage::ManifestRequest { bucket, key } => {
+                                            let manifest_bytes = meta
+                                                .get_object_key(&bucket, &key)
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|oid| {
+                                                    meta.get_manifest(&oid).ok().flatten()
+                                                })
+                                                .and_then(|m| postcard::to_allocvec(&m).ok());
+                                            Some(ShoalMessage::ManifestResponse {
+                                                bucket,
+                                                key,
+                                                manifest_bytes,
                                             })
                                         }
                                         _ => None,

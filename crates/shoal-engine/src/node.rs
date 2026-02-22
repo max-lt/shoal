@@ -267,23 +267,17 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<(Vec<u8>, Manifest), EngineError> {
-        // Step 1: look up ObjectId.
-        let object_id =
-            self.meta
-                .get_object_key(bucket, key)?
-                .ok_or_else(|| EngineError::ObjectNotFound {
+        // Step 1: look up manifest — try local first, then ask peers.
+        let manifest = match self.lookup_manifest(bucket, key).await? {
+            Some(m) => m,
+            None => {
+                return Err(EngineError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
-                })?;
-
-        // Step 2: fetch manifest.
-        let manifest =
-            self.meta
-                .get_manifest(&object_id)?
-                .ok_or_else(|| EngineError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                })?;
+                });
+            }
+        };
+        let object_id = manifest.object_id;
 
         debug!(
             %object_id,
@@ -443,6 +437,75 @@ impl ShoalNode {
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
+
+    /// Look up a manifest locally, falling back to asking peers.
+    ///
+    /// If found remotely, the manifest and key mapping are cached locally.
+    async fn lookup_manifest(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Manifest>, EngineError> {
+        // Try local first.
+        if let Some(object_id) = self.meta.get_object_key(bucket, key)?
+            && let Some(manifest) = self.meta.get_manifest(&object_id)?
+        {
+            return Ok(Some(manifest));
+        }
+
+        // Ask peers if transport is available.
+        let Some(transport) = &self.transport else {
+            return Ok(None);
+        };
+
+        let peers = self.cluster.members().await;
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                continue;
+            };
+            match transport.pull_manifest(addr, bucket, key).await {
+                Ok(Some(manifest_bytes)) => {
+                    match postcard::from_bytes::<Manifest>(&manifest_bytes) {
+                        Ok(manifest) => {
+                            debug!(
+                                %bucket, %key,
+                                object_id = %manifest.object_id,
+                                from = %peer.node_id,
+                                "fetched manifest from peer"
+                            );
+                            // Cache locally.
+                            let _ = self.meta.put_manifest(&manifest);
+                            let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+                            // Also cache shard owners from the manifest.
+                            for chunk in &manifest.chunks {
+                                for shard_meta in &chunk.shards {
+                                    // The shard owners aren't in the manifest, but
+                                    // we know the writer's node stored them all.
+                                    // Just record the peer as an owner for now.
+                                    let _ = self
+                                        .meta
+                                        .put_shard_owners(&shard_meta.shard_id, &[peer.node_id]);
+                                }
+                            }
+                            return Ok(Some(manifest));
+                        }
+                        Err(e) => {
+                            warn!(from = %peer.node_id, %e, "bad manifest from peer");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    debug!(from = %peer.node_id, %e, "manifest pull failed");
+                }
+            }
+        }
+
+        Ok(None)
+    }
 
     /// Resolve a NodeId to an EndpointAddr using the address book,
     /// falling back to constructing one from the NodeId bytes (relay-only).

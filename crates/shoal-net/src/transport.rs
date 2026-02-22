@@ -286,6 +286,54 @@ impl ShoalTransport {
         }
     }
 
+    /// Request a manifest from a remote node by bucket/key.
+    ///
+    /// Opens a bidirectional stream: sends a `ManifestRequest`, receives a
+    /// `ManifestResponse`. Returns the raw manifest bytes if found.
+    pub async fn pull_manifest(
+        &self,
+        addr: EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::ManifestRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::ManifestResponse {
+                manifest_bytes: Some(bytes),
+                ..
+            } => {
+                debug!(%bucket, %key, "pulled manifest from peer");
+                Ok(Some(bytes))
+            }
+            ShoalMessage::ManifestResponse {
+                manifest_bytes: None,
+                ..
+            } => Ok(None),
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
     // -------------------------------------------------------------------
     // Incoming message handling
     // -------------------------------------------------------------------
