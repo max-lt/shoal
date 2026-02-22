@@ -3383,9 +3383,11 @@ name = "shoal-erasure"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "reed-solomon-simd",
  "shoal-types",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
 ]
 
