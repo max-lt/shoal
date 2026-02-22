@@ -4,16 +4,19 @@
 //! and network transport, and exposes the write/read/delete pipeline for
 //! objects.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use iroh::EndpointAddr;
 use shoal_cas::{Chunker, build_manifest};
 use shoal_cluster::ClusterState;
 use shoal_erasure::ErasureEncoder;
 use shoal_meta::MetaStore;
+use shoal_net::{ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
 use shoal_types::*;
-use tracing::{debug, info};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
 
 use crate::error::EngineError;
 
@@ -67,6 +70,10 @@ pub struct ShoalNode {
     erasure_m: usize,
     /// Replication factor (k + m).
     replication_factor: usize,
+    /// Network transport (None in tests / single-node mode).
+    transport: Option<Arc<ShoalTransport>>,
+    /// NodeId → EndpointAddr mapping for remote nodes.
+    address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>,
 }
 
 impl ShoalNode {
@@ -89,7 +96,21 @@ impl ShoalNode {
             erasure_k: config.erasure_k,
             erasure_m: config.erasure_m,
             replication_factor,
+            transport: None,
+            address_book: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Set the network transport for distributed operations.
+    pub fn with_transport(mut self, transport: Arc<ShoalTransport>) -> Self {
+        self.transport = Some(transport);
+        self
+    }
+
+    /// Set the address book for resolving NodeId to EndpointAddr.
+    pub fn with_address_book(mut self, book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>) -> Self {
+        self.address_book = book;
+        self
     }
 
     /// Return this node's ID.
@@ -148,21 +169,28 @@ impl ShoalNode {
                 // Determine owners via placement ring.
                 let owners = ring.owners(&shard.id, self.replication_factor);
 
-                // Store on local node if we are an owner, otherwise store anyway
-                // (in a single-node setup the local node is always the owner).
-                let mut stored = false;
-                for owner in &owners {
-                    if *owner == self.node_id {
-                        self.store.put(shard.id, shard.data.clone()).await?;
-                        stored = true;
-                        break;
-                    }
-                }
+                // Always store locally (writer keeps a copy).
+                self.store.put(shard.id, shard.data.clone()).await?;
 
-                // In single-node or if we're not an owner, store locally anyway
-                // so the data is available for reads from this node.
-                if !stored {
-                    self.store.put(shard.id, shard.data.clone()).await?;
+                // Push to remote owners if transport is available.
+                if let Some(transport) = &self.transport {
+                    for owner in &owners {
+                        if *owner == self.node_id {
+                            continue;
+                        }
+                        if let Some(addr) = self.resolve_addr(owner).await
+                            && let Err(e) = transport
+                                .push_shard(addr, shard.id, shard.data.clone())
+                                .await
+                        {
+                            warn!(
+                                target_node = %owner,
+                                shard_id = %shard.id,
+                                %e,
+                                "failed to push shard to remote owner"
+                            );
+                        }
+                    }
                 }
 
                 // Record shard owners in metadata.
@@ -187,9 +215,34 @@ impl ShoalNode {
         let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
         let object_id = manifest.object_id;
 
-        // Step 4: persist manifest and key mapping.
+        // Step 4: persist manifest and key mapping locally.
         self.meta.put_manifest(&manifest)?;
         self.meta.put_object_key(bucket, key, &object_id)?;
+
+        // Step 5: broadcast manifest to all known peers.
+        if let Some(transport) = &self.transport {
+            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
+            let msg = ShoalMessage::ManifestPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                manifest_bytes,
+            };
+            let peers = self.cluster.members().await;
+            for peer in &peers {
+                if peer.node_id == self.node_id {
+                    continue;
+                }
+                if let Some(addr) = self.resolve_addr(&peer.node_id).await
+                    && let Err(e) = transport.send_to(addr, &msg).await
+                {
+                    warn!(
+                        peer = %peer.node_id,
+                        %e,
+                        "failed to broadcast manifest"
+                    );
+                }
+            }
+        }
 
         info!(
             bucket, key, %object_id,
@@ -206,8 +259,9 @@ impl ShoalNode {
 
     /// Retrieve an object by bucket/key.
     ///
-    /// Looks up the manifest, fetches shards, erasure-decodes each chunk,
-    /// and returns the reconstructed data.
+    /// Looks up the manifest, fetches shards (locally first, then from
+    /// remote peers), erasure-decodes each chunk, and returns the
+    /// reconstructed data.
     pub async fn get_object(
         &self,
         bucket: &str,
@@ -248,13 +302,59 @@ impl ShoalNode {
                 if collected.len() >= self.erasure_k {
                     break;
                 }
+                // Try local first.
                 if let Some(data) = self.store.get(shard_meta.shard_id).await? {
                     collected.push((shard_meta.index, data.to_vec()));
-                } else {
+                    continue;
+                }
+                // Try remote if transport available.
+                if let Some(transport) = &self.transport
+                    && let Some(owners) = self.meta.get_shard_owners(&shard_meta.shard_id)?
+                {
+                    for owner in &owners {
+                        if *owner == self.node_id {
+                            continue;
+                        }
+                        if let Some(addr) = self.resolve_addr(owner).await {
+                            match transport.pull_shard(addr, shard_meta.shard_id).await {
+                                Ok(Some(data)) => {
+                                    debug!(
+                                        shard_id = %shard_meta.shard_id,
+                                        from = %owner,
+                                        "pulled shard from remote"
+                                    );
+                                    // Cache locally for future reads.
+                                    let _ = self.store.put(shard_meta.shard_id, data.clone()).await;
+                                    collected.push((shard_meta.index, data.to_vec()));
+                                    break;
+                                }
+                                Ok(None) => {
+                                    debug!(
+                                        shard_id = %shard_meta.shard_id,
+                                        from = %owner,
+                                        "remote node does not have shard"
+                                    );
+                                }
+                                Err(e) => {
+                                    debug!(
+                                        shard_id = %shard_meta.shard_id,
+                                        from = %owner,
+                                        %e,
+                                        "failed to pull shard from remote"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if collected.len() < self.erasure_k
+                    && !collected.iter().any(|(idx, _)| *idx == shard_meta.index)
+                {
                     debug!(
                         shard_id = %shard_meta.shard_id,
                         index = shard_meta.index,
-                        "shard not found locally"
+                        "shard not found locally or remotely"
                     );
                 }
             }
@@ -338,5 +438,26 @@ impl ShoalNode {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })
+    }
+
+    // ------------------------------------------------------------------
+    // Private helpers
+    // ------------------------------------------------------------------
+
+    /// Resolve a NodeId to an EndpointAddr using the address book,
+    /// falling back to constructing one from the NodeId bytes (relay-only).
+    async fn resolve_addr(&self, node_id: &NodeId) -> Option<EndpointAddr> {
+        // Check address book first.
+        if let Some(addr) = self.address_book.read().await.get(node_id) {
+            return Some(addr.clone());
+        }
+        // Fallback: construct from public key bytes (iroh relay discovery).
+        match iroh::EndpointId::from_bytes(node_id.as_bytes()) {
+            Ok(eid) => Some(EndpointAddr::new(eid)),
+            Err(_) => {
+                warn!(%node_id, "cannot resolve address");
+                None
+            }
+        }
     }
 }

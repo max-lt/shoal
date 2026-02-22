@@ -325,20 +325,36 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         let transport = transport.clone();
         let handle = membership_handle.clone();
         let store = store.clone();
+        let meta = meta.clone();
+        let address_book = address_book.clone();
         tokio::spawn(async move {
             loop {
                 match transport.accept().await {
                     Some(conn) => {
+                        // Learn the remote peer's address for future routing.
+                        let remote_id = conn.remote_id();
+                        let remote_node_id = NodeId::from(*remote_id.as_bytes());
+                        let remote_addr = EndpointAddr::new(remote_id);
+                        address_book
+                            .write()
+                            .await
+                            .insert(remote_node_id, remote_addr);
+
                         // Spawn a handler for each connection.
                         let handle = handle.clone();
                         let store = store.clone();
+                        let meta = meta.clone();
 
-                        // Handle uni-directional streams (SWIM data, shard push).
+                        // Handle uni-directional streams (SWIM data, shard push, manifest).
                         let conn_uni = conn.clone();
                         let handle_uni = handle.clone();
+                        let store_uni = store.clone();
+                        let meta_uni = meta.clone();
                         tokio::spawn(async move {
                             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                                 let handle = handle_uni.clone();
+                                let store = store_uni.clone();
+                                let meta = meta_uni.clone();
                                 async move {
                                     match msg {
                                         ShoalMessage::SwimData(data) => {
@@ -347,8 +363,41 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
                                             }
                                         }
                                         ShoalMessage::ShardPush { shard_id, data } => {
-                                            debug!(%shard_id, "received shard push (not stored yet)");
-                                            let _ = (shard_id, data);
+                                            debug!(%shard_id, len = data.len(), "received shard push");
+                                            if let Err(e) = store
+                                                .put(shard_id, bytes::Bytes::from(data))
+                                                .await
+                                            {
+                                                warn!(%shard_id, %e, "failed to store pushed shard");
+                                            }
+                                        }
+                                        ShoalMessage::ManifestPut {
+                                            bucket,
+                                            key,
+                                            manifest_bytes,
+                                        } => {
+                                            match postcard::from_bytes::<shoal_types::Manifest>(
+                                                &manifest_bytes,
+                                            ) {
+                                                Ok(manifest) => {
+                                                    debug!(
+                                                        %bucket, %key,
+                                                        object_id = %manifest.object_id,
+                                                        "received manifest broadcast"
+                                                    );
+                                                    if let Err(e) = meta.put_manifest(&manifest) {
+                                                        warn!(%e, "failed to store broadcast manifest");
+                                                    }
+                                                    if let Err(e) =
+                                                        meta.put_object_key(&bucket, &key, &manifest.object_id)
+                                                    {
+                                                        warn!(%e, "failed to store broadcast object key");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(%e, "failed to deserialize broadcast manifest");
+                                                }
+                                            }
                                         }
                                         other => {
                                             debug!("unhandled uni-stream message: {other:?}");
@@ -395,18 +444,22 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     );
 
     // --- Engine ---
-    let engine = Arc::new(ShoalNode::new(
-        ShoalNodeConfig {
-            node_id,
-            chunk_size: config.chunk_size(),
-            erasure_k: config.erasure_k() as usize,
-            erasure_m: config.erasure_m() as usize,
-            vnodes_per_node: 128,
-        },
-        store,
-        meta,
-        cluster,
-    ));
+    let engine = Arc::new(
+        ShoalNode::new(
+            ShoalNodeConfig {
+                node_id,
+                chunk_size: config.chunk_size(),
+                erasure_k: config.erasure_k() as usize,
+                erasure_m: config.erasure_m() as usize,
+                vnodes_per_node: 128,
+            },
+            store,
+            meta.clone(),
+            cluster,
+        )
+        .with_transport(transport.clone())
+        .with_address_book(address_book.clone()),
+    );
 
     // --- S3 HTTP API ---
     let server = S3Server::new(S3ServerConfig {

@@ -17,10 +17,12 @@ shoal-store = { workspace = true }
 shoal-types = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
 iroh = { workspace = true }
 libc = { workspace = true }
+postcard = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }

@@ -53,4 +53,14 @@ pub enum ShoalMessage {
 
     /// Raw SWIM protocol data routed between foca membership services.
     SwimData(Vec<u8>),
+
+    /// Broadcast a manifest and its object key mapping to other nodes.
+    ManifestPut {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+        /// Postcard-serialized [`Manifest`](shoal_types::Manifest).
+        manifest_bytes: Vec<u8>,
+    },
 }

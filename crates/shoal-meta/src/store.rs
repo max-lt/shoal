@@ -122,12 +122,10 @@ impl MetaStore {
                 Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
                 None => Ok(None),
             },
-            Backend::Memory(m) => {
-                match m.manifests.read().unwrap().get(id.as_bytes()) {
-                    Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
-                    None => Ok(None),
-                }
-            }
+            Backend::Memory(m) => match m.manifests.read().unwrap().get(id.as_bytes()) {
+                Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
+                None => Ok(None),
+            },
         }
     }
 
@@ -141,7 +139,10 @@ impl MetaStore {
                 objects.insert(storage_key.as_bytes(), id.as_bytes())?;
             }
             Backend::Memory(m) => {
-                m.objects.write().unwrap().insert(storage_key, *id.as_bytes());
+                m.objects
+                    .write()
+                    .unwrap()
+                    .insert(storage_key, *id.as_bytes());
             }
         }
         debug!(bucket, key, object_id = %id, "stored object key mapping");
@@ -253,12 +254,10 @@ impl MetaStore {
                 Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
                 None => Ok(None),
             },
-            Backend::Memory(m) => {
-                match m.shardmap.read().unwrap().get(id.as_bytes()) {
-                    Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
-                    None => Ok(None),
-                }
-            }
+            Backend::Memory(m) => match m.shardmap.read().unwrap().get(id.as_bytes()) {
+                Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
+                None => Ok(None),
+            },
         }
     }
 
@@ -289,12 +288,10 @@ impl MetaStore {
                 Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
                 None => Ok(None),
             },
-            Backend::Memory(m) => {
-                match m.membership.read().unwrap().get(id.as_bytes()) {
-                    Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
-                    None => Ok(None),
-                }
-            }
+            Backend::Memory(m) => match m.membership.read().unwrap().get(id.as_bytes()) {
+                Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
+                None => Ok(None),
+            },
         }
     }
 
@@ -344,10 +341,7 @@ impl MetaStore {
                 repair_queue.insert(key.as_slice(), id.as_bytes())?;
             }
             Backend::Memory(m) => {
-                m.repair_queue
-                    .write()
-                    .unwrap()
-                    .insert(key, *id.as_bytes());
+                m.repair_queue.write().unwrap().insert(key, *id.as_bytes());
             }
         }
         debug!(%id, priority, "enqueued shard for repair");
@@ -703,12 +697,8 @@ mod tests {
     fn test_repair_queue_len() {
         with_both_backends(|store| {
             assert_eq!(store.repair_queue_len().unwrap(), 0);
-            store
-                .enqueue_repair(&ShardId::from_data(b"s1"), 1)
-                .unwrap();
-            store
-                .enqueue_repair(&ShardId::from_data(b"s2"), 2)
-                .unwrap();
+            store.enqueue_repair(&ShardId::from_data(b"s1"), 1).unwrap();
+            store.enqueue_repair(&ShardId::from_data(b"s2"), 2).unwrap();
             assert_eq!(store.repair_queue_len().unwrap(), 2);
             store.dequeue_repair().unwrap();
             assert_eq!(store.repair_queue_len().unwrap(), 1);
