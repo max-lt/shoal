@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 shoal-types = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 postcard = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

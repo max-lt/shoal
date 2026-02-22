@@ -1,5 +1,6 @@
 //! Core trait and types for shard storage.
 
+use bytes::Bytes;
 use shoal_types::ShardId;
 
 use crate::error::StoreError;
@@ -18,13 +19,14 @@ pub struct StorageCapacity {
 /// Trait for storing and retrieving erasure-coded shards.
 ///
 /// All implementations must be `Send + Sync` for use across async tasks.
+/// Data is passed as [`Bytes`] to enable zero-copy transfers through the pipeline.
 #[async_trait::async_trait]
 pub trait ShardStore: Send + Sync {
     /// Store a shard with the given ID.
-    async fn put(&self, id: ShardId, data: &[u8]) -> Result<(), StoreError>;
+    async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError>;
 
     /// Retrieve a shard by ID. Returns `None` if not found.
-    async fn get(&self, id: ShardId) -> Result<Option<Vec<u8>>, StoreError>;
+    async fn get(&self, id: ShardId) -> Result<Option<Bytes>, StoreError>;
 
     /// Delete a shard by ID.
     async fn delete(&self, id: ShardId) -> Result<(), StoreError>;

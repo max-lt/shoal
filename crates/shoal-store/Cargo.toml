@@ -7,6 +7,7 @@ edition.workspace = true
 shoal-types = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 libc = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

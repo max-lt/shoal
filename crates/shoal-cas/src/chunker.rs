@@ -1,5 +1,6 @@
 //! Fixed-size chunker for splitting data into content-addressed chunks.
 
+use bytes::Bytes;
 use shoal_types::ChunkId;
 use tokio::io::AsyncRead;
 
@@ -13,7 +14,7 @@ pub struct Chunk {
     /// Byte offset within the original object.
     pub offset: u64,
     /// The raw chunk data.
-    pub data: Vec<u8>,
+    pub data: Bytes,
 }
 
 /// Fixed-size chunker that splits data into chunks of a configured size.
@@ -48,7 +49,7 @@ impl Chunker {
             chunks.push(Chunk {
                 id,
                 offset,
-                data: slice.to_vec(),
+                data: Bytes::copy_from_slice(slice),
             });
             offset += slice.len() as u64;
         }
@@ -91,7 +92,7 @@ impl Chunker {
             chunks.push(Chunk {
                 id,
                 offset,
-                data: buf,
+                data: Bytes::from(buf),
             });
             offset += filled as u64;
         }
@@ -117,7 +118,7 @@ mod tests {
         let data = vec![0xABu8; 16];
         let chunks = chunker.chunk(&data);
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].data, data);
+        assert_eq!(chunks[0].data.as_ref(), data.as_slice());
         assert_eq!(chunks[0].offset, 0);
     }
 

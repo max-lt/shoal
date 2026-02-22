@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use shoal_types::ShardId;
 use tracing::debug;
 
@@ -16,7 +17,7 @@ use crate::traits::{ShardStore, StorageCapacity};
 /// Tracks total bytes stored against a configurable maximum.
 /// Used bytes are maintained incrementally via an atomic counter (O(1) per operation).
 pub struct MemoryStore {
-    shards: RwLock<HashMap<ShardId, Vec<u8>>>,
+    shards: RwLock<HashMap<ShardId, Bytes>>,
     max_bytes: u64,
     used_bytes: AtomicU64,
 }
@@ -33,14 +34,14 @@ impl MemoryStore {
 
     /// Return a reference to the inner map (for testing purposes).
     #[cfg(test)]
-    pub(crate) fn inner(&self) -> &RwLock<HashMap<ShardId, Vec<u8>>> {
+    pub(crate) fn inner(&self) -> &RwLock<HashMap<ShardId, Bytes>> {
         &self.shards
     }
 }
 
 #[async_trait::async_trait]
 impl ShardStore for MemoryStore {
-    async fn put(&self, id: ShardId, data: &[u8]) -> Result<(), StoreError> {
+    async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
         let mut map = self.shards.write().expect("lock poisoned");
         let data_len = data.len() as u64;
         let used = self.used_bytes.load(Ordering::Relaxed);
@@ -57,14 +58,14 @@ impl ShardStore for MemoryStore {
         }
 
         debug!(%id, size = data.len(), "storing shard in memory");
-        map.insert(id, data.to_vec());
+        map.insert(id, data);
         // Update used bytes: add new size, subtract old size.
         self.used_bytes
             .store(used - existing_len + data_len, Ordering::Relaxed);
         Ok(())
     }
 
-    async fn get(&self, id: ShardId) -> Result<Option<Vec<u8>>, StoreError> {
+    async fn get(&self, id: ShardId) -> Result<Option<Bytes>, StoreError> {
         let map = self.shards.read().expect("lock poisoned");
         Ok(map.get(&id).cloned())
     }
@@ -117,12 +118,12 @@ mod tests {
     #[tokio::test]
     async fn test_put_get_roundtrip() {
         let store = MemoryStore::new(1024 * 1024);
-        let data = b"hello shard";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"hello shard");
+        let id = ShardId::from_data(&data);
 
-        store.put(id, data).await.unwrap();
+        store.put(id, data.clone()).await.unwrap();
         let result = store.get(id).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result, Some(data));
     }
 
     #[tokio::test]
@@ -136,8 +137,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_then_get_returns_none() {
         let store = MemoryStore::new(1024 * 1024);
-        let data = b"to be deleted";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"to be deleted");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
         store.delete(id).await.unwrap();
@@ -148,8 +149,8 @@ mod tests {
     #[tokio::test]
     async fn test_contains_true_false() {
         let store = MemoryStore::new(1024 * 1024);
-        let data = b"exists";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"exists");
+        let id = ShardId::from_data(&data);
 
         assert!(!store.contains(id).await.unwrap());
         store.put(id, data).await.unwrap();
@@ -159,12 +160,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_returns_all_stored_ids() {
         let store = MemoryStore::new(1024 * 1024);
-        let data1 = b"shard one";
-        let data2 = b"shard two";
-        let data3 = b"shard three";
-        let id1 = ShardId::from_data(data1);
-        let id2 = ShardId::from_data(data2);
-        let id3 = ShardId::from_data(data3);
+        let data1 = Bytes::from_static(b"shard one");
+        let data2 = Bytes::from_static(b"shard two");
+        let data3 = Bytes::from_static(b"shard three");
+        let id1 = ShardId::from_data(&data1);
+        let id2 = ShardId::from_data(&data2);
+        let id3 = ShardId::from_data(&data3);
 
         store.put(id1, data1).await.unwrap();
         store.put(id2, data2).await.unwrap();
@@ -180,8 +181,8 @@ mod tests {
     #[tokio::test]
     async fn test_verify_valid_shard() {
         let store = MemoryStore::new(1024 * 1024);
-        let data = b"valid shard data";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"valid shard data");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
         assert!(store.verify(id).await.unwrap());
@@ -190,15 +191,15 @@ mod tests {
     #[tokio::test]
     async fn test_verify_corrupted_shard() {
         let store = MemoryStore::new(1024 * 1024);
-        let data = b"original data";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"original data");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
 
         // Corrupt the internal data directly.
         {
             let mut map = store.inner().write().unwrap();
-            map.insert(id, b"corrupted data".to_vec());
+            map.insert(id, Bytes::from_static(b"corrupted data"));
         }
 
         assert!(!store.verify(id).await.unwrap());
@@ -215,14 +216,14 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_tracking() {
         let store = MemoryStore::new(1024);
-        let data = b"some data here"; // 14 bytes
+        let data = Bytes::from_static(b"some data here"); // 14 bytes
 
         let cap = store.capacity().await.unwrap();
         assert_eq!(cap.total_bytes, 1024);
         assert_eq!(cap.used_bytes, 0);
         assert_eq!(cap.available_bytes, 1024);
 
-        let id = ShardId::from_data(data);
+        let id = ShardId::from_data(&data);
         store.put(id, data).await.unwrap();
 
         let cap = store.capacity().await.unwrap();
@@ -234,8 +235,8 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_exceeded() {
         let store = MemoryStore::new(10); // tiny store
-        let data = b"this is way too large for the store";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"this is way too large for the store");
+        let id = ShardId::from_data(&data);
 
         let result = store.put(id, data).await;
         assert!(result.is_err());
@@ -248,8 +249,8 @@ mod tests {
     #[tokio::test]
     async fn test_capacity_after_delete() {
         let store = MemoryStore::new(1024);
-        let data = b"track me"; // 8 bytes
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"track me"); // 8 bytes
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
         assert_eq!(store.capacity().await.unwrap().used_bytes, 8);
@@ -261,8 +262,8 @@ mod tests {
     #[tokio::test]
     async fn test_put_overwrite_updates_capacity() {
         let store = MemoryStore::new(1024);
-        let data_small = b"small";
-        let data_big = b"bigger data here";
+        let data_small = Bytes::from_static(b"small");
+        let data_big = Bytes::from_static(b"bigger data here");
 
         // Use a synthetic ID so we can overwrite with different data.
         let fixed_id = ShardId::from([0xAA; 32]);

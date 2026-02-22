@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use bytes::Bytes;
 use shoal_types::ShardId;
 use tracing::debug;
 
@@ -41,7 +42,7 @@ impl FileStore {
 
 #[async_trait::async_trait]
 impl ShardStore for FileStore {
-    async fn put(&self, id: ShardId, data: &[u8]) -> Result<(), StoreError> {
+    async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
         let path = self.shard_path(&id);
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -50,17 +51,17 @@ impl ShardStore for FileStore {
         // Atomic write: write to a temp file in the same directory, then rename.
         // This ensures we never leave a half-written shard on disk.
         let tmp_path = path.with_extension("tmp");
-        tokio::fs::write(&tmp_path, data).await?;
+        tokio::fs::write(&tmp_path, &data).await?;
         tokio::fs::rename(&tmp_path, &path).await?;
 
         debug!(%id, path = %path.display(), size = data.len(), "stored shard to file");
         Ok(())
     }
 
-    async fn get(&self, id: ShardId) -> Result<Option<Vec<u8>>, StoreError> {
+    async fn get(&self, id: ShardId) -> Result<Option<Bytes>, StoreError> {
         let path = self.shard_path(&id);
         match tokio::fs::read(&path).await {
-            Ok(data) => Ok(Some(data)),
+            Ok(data) => Ok(Some(Bytes::from(data))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::Io(e)),
         }
@@ -219,12 +220,12 @@ mod tests {
     #[tokio::test]
     async fn test_put_get_roundtrip() {
         let (store, _dir) = make_store().await;
-        let data = b"hello file shard";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"hello file shard");
+        let id = ShardId::from_data(&data);
 
-        store.put(id, data).await.unwrap();
+        store.put(id, data.clone()).await.unwrap();
         let result = store.get(id).await.unwrap();
-        assert_eq!(result, Some(data.to_vec()));
+        assert_eq!(result, Some(data));
     }
 
     #[tokio::test]
@@ -237,8 +238,8 @@ mod tests {
     #[tokio::test]
     async fn test_delete_then_get_returns_none() {
         let (store, _dir) = make_store().await;
-        let data = b"to delete";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"to delete");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
         store.delete(id).await.unwrap();
@@ -248,8 +249,8 @@ mod tests {
     #[tokio::test]
     async fn test_contains_true_false() {
         let (store, _dir) = make_store().await;
-        let data = b"exists on disk";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"exists on disk");
+        let id = ShardId::from_data(&data);
 
         assert!(!store.contains(id).await.unwrap());
         store.put(id, data).await.unwrap();
@@ -259,12 +260,12 @@ mod tests {
     #[tokio::test]
     async fn test_list_returns_all_stored_ids() {
         let (store, _dir) = make_store().await;
-        let data1 = b"file shard one";
-        let data2 = b"file shard two";
-        let data3 = b"file shard three";
-        let id1 = ShardId::from_data(data1);
-        let id2 = ShardId::from_data(data2);
-        let id3 = ShardId::from_data(data3);
+        let data1 = Bytes::from_static(b"file shard one");
+        let data2 = Bytes::from_static(b"file shard two");
+        let data3 = Bytes::from_static(b"file shard three");
+        let id1 = ShardId::from_data(&data1);
+        let id2 = ShardId::from_data(&data2);
+        let id3 = ShardId::from_data(&data3);
 
         store.put(id1, data1).await.unwrap();
         store.put(id2, data2).await.unwrap();
@@ -280,8 +281,8 @@ mod tests {
     #[tokio::test]
     async fn test_verify_valid_shard() {
         let (store, _dir) = make_store().await;
-        let data = b"valid file data";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"valid file data");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
         assert!(store.verify(id).await.unwrap());
@@ -290,8 +291,8 @@ mod tests {
     #[tokio::test]
     async fn test_verify_corrupted_shard() {
         let (store, _dir) = make_store().await;
-        let data = b"original file data";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"original file data");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
 
@@ -321,10 +322,10 @@ mod tests {
     #[tokio::test]
     async fn test_fanout_directory_structure() {
         let (store, dir) = make_store().await;
-        let data = b"fanout test data";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"fanout test data");
+        let id = ShardId::from_data(&data);
 
-        store.put(id, data).await.unwrap();
+        store.put(id, data.clone()).await.unwrap();
 
         let hex = id.to_string();
         let expected_path = dir.path().join(&hex[0..2]).join(&hex[2..4]).join(&hex);
@@ -337,7 +338,7 @@ mod tests {
 
         // Verify the file content matches.
         let stored = std::fs::read(&expected_path).unwrap();
-        assert_eq!(stored, data);
+        assert_eq!(stored, data.as_ref());
     }
 
     #[tokio::test]
@@ -351,8 +352,8 @@ mod tests {
     #[tokio::test]
     async fn test_atomic_write_no_tmp_file_left() {
         let (store, dir) = make_store().await;
-        let data = b"atomic write test";
-        let id = ShardId::from_data(data);
+        let data = Bytes::from_static(b"atomic write test");
+        let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
 
