@@ -96,7 +96,12 @@ impl MetaStore {
         let storage_key = object_storage_key(bucket, key);
         match self.objects.get(storage_key.as_bytes())? {
             Some(bytes) => {
-                let arr: [u8; 32] = bytes[..32].try_into().expect("ObjectId is 32 bytes");
+                let arr: [u8; 32] = bytes[..32].try_into().map_err(|_| {
+                    MetaError::CorruptData(format!(
+                        "ObjectId expected 32 bytes, got {}",
+                        bytes.len()
+                    ))
+                })?;
                 Ok(Some(ObjectId::from(arr)))
             }
             None => Ok(None),
@@ -117,7 +122,9 @@ impl MetaStore {
         let mut keys = Vec::new();
         for guard in self.objects.prefix(scan_prefix.as_bytes()) {
             let k = guard.key()?;
-            let full_key = std::str::from_utf8(&k).unwrap_or_default();
+            let full_key = std::str::from_utf8(&k).map_err(|e| {
+                MetaError::CorruptData(format!("object key is not valid UTF-8: {e}"))
+            })?;
             if let Some(stripped) = full_key.strip_prefix(&bucket_prefix) {
                 keys.push(stripped.to_string());
             }
@@ -206,7 +213,9 @@ impl MetaStore {
         // first_key_value returns the smallest key = lowest priority.
         if let Some(guard) = self.repair_queue.first_key_value() {
             let (key, value) = guard.into_inner()?;
-            let arr: [u8; 32] = value[..32].try_into().expect("ShardId is 32 bytes");
+            let arr: [u8; 32] = value[..32].try_into().map_err(|_| {
+                MetaError::CorruptData(format!("ShardId expected 32 bytes, got {}", value.len()))
+            })?;
             let shard_id = ShardId::from(arr);
             self.repair_queue.remove(key.as_ref())?;
             debug!(%shard_id, "dequeued shard from repair queue");

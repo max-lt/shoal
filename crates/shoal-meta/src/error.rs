@@ -14,4 +14,8 @@ pub enum MetaError {
     /// Serialization/deserialization error.
     #[error("serialization error: {0}")]
     Serde(#[from] postcard::Error),
+
+    /// Stored data is corrupt or has an unexpected format.
+    #[error("corrupt data: {0}")]
+    CorruptData(String),
 }
