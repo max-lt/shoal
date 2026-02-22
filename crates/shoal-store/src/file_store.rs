@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use shoal_types::ShardId;
-use tracing::debug;
+use tracing::{debug, error, warn};
 
 use crate::error::StoreError;
 use crate::traits::{ShardStore, StorageCapacity};
@@ -61,7 +61,20 @@ impl ShardStore for FileStore {
     async fn get(&self, id: ShardId) -> Result<Option<Bytes>, StoreError> {
         let path = self.shard_path(&id);
         match tokio::fs::read(&path).await {
-            Ok(data) => Ok(Some(Bytes::from(data))),
+            Ok(data) => {
+                // Verify-on-read: always re-hash and compare to the ShardId.
+                // A corrupt shard is treated as an error (not returned to the caller)
+                // so the read path will fetch from another node and RS-decode instead.
+                let actual_id = ShardId::from_data(&data);
+                if actual_id != id {
+                    error!(expected = %id, actual = %actual_id, "shard corruption detected on read");
+                    return Err(StoreError::CorruptShard {
+                        expected: id,
+                        actual: actual_id,
+                    });
+                }
+                Ok(Some(Bytes::from(data)))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(StoreError::Io(e)),
         }
@@ -188,10 +201,29 @@ fn statvfs(path: &Path) -> Result<StorageCapacity, StoreError> {
         let free = stat.f_bfree * block_size;
         let used = total.saturating_sub(free);
 
+        let inodes_total = stat.f_files;
+        let inodes_free = stat.f_ffree;
+
+        // Warn when inode usage exceeds 80%.
+        if inodes_total > 0 {
+            let used_inodes = inodes_total.saturating_sub(inodes_free);
+            let usage_pct = (used_inodes as f64 / inodes_total as f64) * 100.0;
+            if usage_pct > 80.0 {
+                warn!(
+                    usage_pct = format!("{usage_pct:.1}%"),
+                    inodes_free,
+                    inodes_total,
+                    "filesystem inode usage above 80% — consider using XFS or increasing inode count"
+                );
+            }
+        }
+
         Ok(StorageCapacity {
             total_bytes: total,
             used_bytes: used,
             available_bytes: available,
+            inodes_total,
+            inodes_free,
         })
     }
 }
@@ -203,6 +235,8 @@ fn statvfs(_path: &Path) -> Result<StorageCapacity, StoreError> {
         total_bytes: 0,
         used_bytes: 0,
         available_bytes: 0,
+        inodes_total: 0,
+        inodes_free: 0,
     })
 }
 
@@ -347,6 +381,26 @@ mod tests {
         let id = ShardId::from_data(b"never stored");
         // Should not error.
         store.delete(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_corrupted_shard_returns_error() {
+        let (store, _dir) = make_store().await;
+        let data = Bytes::from_static(b"data to corrupt on disk");
+        let id = ShardId::from_data(&data);
+
+        store.put(id, data).await.unwrap();
+
+        // Corrupt the file on disk.
+        let path = store.shard_path(&id);
+        tokio::fs::write(&path, b"corrupted!").await.unwrap();
+
+        // Verify-on-read should return a CorruptShard error.
+        let result = store.get(id).await;
+        assert!(
+            matches!(result, Err(StoreError::CorruptShard { .. })),
+            "expected CorruptShard error, got: {result:?}"
+        );
     }
 
     #[tokio::test]

@@ -14,6 +14,10 @@ pub struct StorageCapacity {
     pub used_bytes: u64,
     /// Bytes available for new data.
     pub available_bytes: u64,
+    /// Total inodes on the filesystem (0 if unavailable).
+    pub inodes_total: u64,
+    /// Free inodes on the filesystem (0 if unavailable).
+    pub inodes_free: u64,
 }
 
 /// Trait for storing and retrieving erasure-coded shards.

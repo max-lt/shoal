@@ -21,4 +21,16 @@ pub enum StoreError {
         /// Bytes currently available.
         available: u64,
     },
+
+    /// Shard data on disk does not match its content-addressed ID.
+    ///
+    /// The shard is treated as missing (not returned to the caller) and
+    /// should be enqueued for repair.
+    #[error("shard corruption detected: expected {expected}, actual hash {actual}")]
+    CorruptShard {
+        /// The ID that was requested.
+        expected: ShardId,
+        /// The ID computed from the data actually on disk.
+        actual: ShardId,
+    },
 }

@@ -7,14 +7,16 @@
 
 use std::collections::BTreeMap;
 
-use shoal_types::{ChunkMeta, Manifest, ObjectId};
+use shoal_types::{ChunkMeta, MANIFEST_VERSION, Manifest, ObjectId};
 
 use crate::error::CasError;
 
 /// Intermediate manifest content used to derive the ObjectId.
 ///
-/// This contains everything except the `object_id` field, so we can
-/// serialize it deterministically, hash it, and then set `object_id`.
+/// This contains everything except the `object_id` and `version` fields,
+/// so we can serialize it deterministically, hash it, and then set `object_id`.
+/// The version is excluded so that bumping the version doesn't change existing
+/// ObjectIds (the content hasn't changed, only the envelope format).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestContent {
     total_size: u64,
@@ -63,6 +65,7 @@ pub fn build_manifest_with_timestamp(
     let object_id = ObjectId::from_data(&serialized);
 
     Ok(Manifest {
+        version: MANIFEST_VERSION,
         object_id,
         total_size,
         chunk_size,
@@ -78,8 +81,19 @@ pub fn serialize_manifest(manifest: &Manifest) -> Result<Vec<u8>, CasError> {
 }
 
 /// Deserialize a manifest from postcard bytes.
+///
+/// Rejects manifests with unknown version numbers to prevent silent
+/// misinterpretation of data across format changes.
 pub fn deserialize_manifest(bytes: &[u8]) -> Result<Manifest, CasError> {
-    postcard::from_bytes(bytes).map_err(|e| CasError::Serialization(e.to_string()))
+    let manifest: Manifest =
+        postcard::from_bytes(bytes).map_err(|e| CasError::Serialization(e.to_string()))?;
+    if manifest.version != MANIFEST_VERSION {
+        return Err(CasError::UnsupportedVersion {
+            found: manifest.version,
+            supported: MANIFEST_VERSION,
+        });
+    }
+    Ok(manifest)
 }
 
 fn now_secs() -> u64 {
@@ -180,6 +194,29 @@ mod tests {
         let bytes = serialize_manifest(&manifest).unwrap();
         let decoded = deserialize_manifest(&bytes).unwrap();
         assert_eq!(manifest, decoded);
+    }
+
+    #[test]
+    fn test_manifest_version_is_set() {
+        let manifest =
+            build_manifest_with_timestamp(&sample_chunks(), 1524, 1024, BTreeMap::new(), 0)
+                .unwrap();
+        assert_eq!(manifest.version, MANIFEST_VERSION);
+    }
+
+    #[test]
+    fn test_deserialize_rejects_unknown_version() {
+        let mut manifest =
+            build_manifest_with_timestamp(&sample_chunks(), 1524, 1024, BTreeMap::new(), 0)
+                .unwrap();
+        manifest.version = 99;
+        let bytes = serialize_manifest(&manifest).unwrap();
+        let err = deserialize_manifest(&bytes).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported manifest version 99"),
+            "error should mention version: {msg}"
+        );
     }
 
     #[test]

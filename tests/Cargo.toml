@@ -1,0 +1,19 @@
+[package]
+name = "shoal-integration-tests"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[dependencies]
+shoal-types = { workspace = true }
+shoal-store = { workspace = true }
+shoal-cas = { workspace = true }
+shoal-meta = { workspace = true }
+shoal-erasure = { workspace = true }
+shoal-placement = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[[test]]
+name = "local_pipeline"
+path = "integration/local_pipeline.rs"

@@ -116,6 +116,7 @@ pub struct NodeId([u8; 32]);       // derived from iroh endpoint key
 
 // === Core structures ===
 pub struct Manifest {
+    pub version: u8,            // format version (current: 1), prevents cross-version corruption
     pub object_id: ObjectId,
     pub total_size: u64,
     pub chunk_size: u32,
@@ -155,6 +156,15 @@ pub struct NodeConfig {
     pub repair_max_bandwidth: u64,          // bytes/sec for repair traffic
     pub repair_concurrent_transfers: u16,   // 1 (RPi) .. 64 (datacenter)
     pub gossip_interval_ms: u32,
+    pub replication_boundary: ReplicationBoundary,
+    pub zone_write_ack: ZoneWriteAck,
+    pub repair_circuit_breaker: RepairCircuitBreaker,
+}
+
+pub struct RepairCircuitBreaker {
+    pub max_down_fraction: f64,             // default 0.5 — suspend repair if ≥50% nodes down
+    pub queue_pressure_threshold: usize,    // default 10000 — throttle when queue exceeds this
+    pub rebalance_cooldown_secs: u64,       // default 60 — wait after node comes back
 }
 ```
 
@@ -164,23 +174,25 @@ pub struct NodeConfig {
 
 1. Client sends PUT via S3 API
 2. Object data is chunked into fixed-size chunks (size depends on config)
-3. Each chunk → Reed-Solomon encode → k data shards + m parity shards
-4. Each shard is BLAKE3-hashed to get its ShardId
-5. Placement ring determines which nodes own each shard
-6. Shards are transferred to owner nodes via iroh QUIC streams
-7. Manifest is built, serialized with postcard, then itself stored as a regular erasure-coded object (chunked → RS encoded → distributed)
-8. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
-9. Every object, regardless of size, goes through this same pipeline — no inline shortcut
+3. Determine local zone from this node's topology + `ReplicationBoundary`
+4. Each chunk → Reed-Solomon encode → k data shards + m parity shards
+5. Each shard is BLAKE3-hashed to get its ShardId
+6. Distribute shards via local zone's ring
+7. Build manifest → gossip broadcast to ALL nodes (all zones)
+8. ACK to client per `ZoneWriteAck` policy
+9. Background (`ZoneReplicator` in `shoal-engine`, Milestone 11):
+   → Send full chunk data to other zones
+   → Each remote zone EC-encodes independently via its own ring
+10. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
+11. Every object, regardless of size, goes through this same pipeline — no inline shortcut
 
 ### Read Path
 
 1. Client sends GET via S3 API
-2. Look up ObjectId in local Fjall index by bucket/key
-3. Fetch manifest shards from cluster → RS decode → deserialize Manifest
-4. For each chunk: determine shard locations via placement ring
-5. Fetch k shards (minimum needed) from owner nodes in parallel
-6. Reed-Solomon decode to reconstruct chunk
-7. Stream reconstructed chunks to client
+2. Look up manifest in local Fjall (always available via gossip)
+3. Fetch shards from LOCAL zone's ring only
+4. EC decode → stream reconstructed chunks to client
+5. Never crosses zone boundaries for normal reads
 
 ### Node Join
 
@@ -356,7 +368,7 @@ Consistent hashing ring for deterministic shard placement (~150 lines).
 
 ---
 
-## Milestone 6 — `shoal-meta`
+## Milestone 6 — `shoal-meta` ✅
 
 Metadata store wrapping Fjall for persistent state.
 
@@ -365,13 +377,13 @@ Everything in Fjall is reconstructible from the cluster. Manifests are themselve
 as regular erasure-coded objects in the cluster. If Fjall is lost, the node can reconstruct
 its index by scanning manifest shards from the cluster.
 
-- [ ] Initialize Fjall `Database` with the following keyspaces:
+- [x] Initialize Fjall `Database` with the following keyspaces:
   - `objects` — user key (bucket/key string) → ObjectId — **CACHE**, reconstructible from manifests in the cluster
   - `manifests` — ObjectId → serialized Manifest — **CACHE**, the manifest itself is stored as a regular erasure-coded object in the cluster
   - `shardmap` — ShardId → serialized list of NodeIds (current owners) — **CACHE**, derived from placement ring computation
   - `membership` — NodeId → serialized Member — **CACHE**, derived from foca/gossip
   - `repair_queue` — ShardId → priority (u64, lower = more urgent) — **LOCAL**, transient, rebuilt on restart by anti-entropy scan
-- [ ] Implement typed accessors for each keyspace:
+- [x] Implement typed accessors for each keyspace:
 
   ```rust
   pub struct MetaStore { db: fjall::Database, /* keyspaces */ }
@@ -403,27 +415,27 @@ its index by scanning manifest shards from the cluster.
   }
   ```
 
-- [ ] All serialization via postcard
-- [ ] `MetaStore::open(path)` and `MetaStore::open_temporary()` (in-memory for tests)
+- [x] All serialization via postcard
+- [x] `MetaStore::open(path)` and `MetaStore::open_temporary()` (in-memory for tests)
 
 **Tests**:
 
-- [ ] Manifest put/get round-trip
-- [ ] Object key put/get/list/delete
-- [ ] List objects with prefix filtering
-- [ ] Shard owners put/get
-- [ ] Member CRUD
-- [ ] Repair queue: enqueue, dequeue in priority order, len
-- [ ] Persistence: write, drop store, reopen, read back
-- [ ] `cargo test -p shoal-meta` passes
+- [x] Manifest put/get round-trip
+- [x] Object key put/get/list/delete
+- [x] List objects with prefix filtering
+- [x] Shard owners put/get
+- [x] Member CRUD
+- [x] Repair queue: enqueue, dequeue in priority order, len
+- [x] Persistence: write, drop store, reopen, read back
+- [x] `cargo test -p shoal-meta` passes
 
 ---
 
-## Milestone 7 — Full Local Pipeline (Integration)
+## Milestone 7 — Full Local Pipeline (Integration) ✅
 
 Connect store + cas + erasure + placement + meta into a working local write/read pipeline. No networking yet.
 
-- [ ] Create an integration test in `tests/integration/local_pipeline.rs`:
+- [x] Create an integration test in `tests/integration/local_pipeline.rs`:
   1. Create a `NodeConfig` with chunk_size=1024, k=2, m=1
   2. Create 3 `MemoryStore` instances (simulating 3 nodes)
   3. Create a `Ring` with 3 nodes
@@ -444,8 +456,8 @@ Connect store + cas + erasure + placement + meta into a working local write/read
   8. **Total failure**: delete 2 shards per chunk
      - Read should fail gracefully (fewer than k shards)
 
-- [ ] All assertions pass
-- [ ] `cargo test --test local_pipeline` passes
+- [x] All assertions pass
+- [x] `cargo test --test local_pipeline` passes
 
 ---
 
@@ -453,7 +465,7 @@ Connect store + cas + erasure + placement + meta into a working local write/read
 
 Network protocol on top of iroh.
 
-- [ ] Define protocol messages (postcard-serialized):
+- [x] Define protocol messages (postcard-serialized):
 
   ```rust
   pub enum ShoalMessage {
@@ -474,25 +486,25 @@ Network protocol on top of iroh.
   }
   ```
 
-- [ ] Implement `ShoalTransport`:
+- [x] Implement `ShoalTransport`:
   - Wraps an `iroh::Endpoint`
   - `send_message(node_id, message)` — opens a QUIC stream, sends postcard-encoded message
   - `recv_message(stream)` — reads and decodes
   - Handles connection pooling (reuse connections to same node)
-- [ ] Implement shard transfer:
+- [x] Implement shard transfer:
   - `push_shard(node_id, shard_id, data)` — sends shard to a node
   - `pull_shard(node_id, shard_id)` — requests a shard from a node
-  - Receiver verifies blake3 hash matches shard_id before accepting
-- [ ] Define ALPN protocol identifier: `b"shoal/0"`
-- [ ] Implement request handler that dispatches incoming messages
+  - **End-to-end integrity** (see Production Hardening): Receiver verifies blake3 hash matches shard_id before accepting. Requester verifies pull responses. Manifest gossip verifies ObjectId = blake3(serialized manifest). Reject on mismatch, try another node.
+- [x] Define ALPN protocol identifier: `b"shoal/0"`
+- [x] Implement request handler that dispatches incoming messages
 
 **Tests**:
 
-- [ ] Spin up 2 iroh endpoints in-process
-- [ ] Send a shard from node A to node B, verify it arrives intact
-- [ ] Pull a shard from node B, verify it matches
-- [ ] Send corrupted shard (wrong data for the shard_id) → receiver rejects
-- [ ] `cargo test -p shoal-net` passes
+- [x] Spin up 2 iroh endpoints in-process
+- [x] Send a shard from node A to node B, verify it arrives intact
+- [x] Pull a shard from node B, verify it matches
+- [x] Send corrupted shard (wrong data for the shard_id) → receiver rejects
+- [x] `cargo test -p shoal-net` passes
 
 ---
 
@@ -560,6 +572,17 @@ Auto-repair and rebalancing.
 - [ ] Implement `Throttle`:
   - Token bucket rate limiter for repair bandwidth
   - Adaptive: reduce repair rate when node is under read/write load
+- [ ] Implement `RepairCircuitBreaker` logic (see `NodeConfig.repair_circuit_breaker`):
+  - If ≥`max_down_fraction` of nodes are down → STOP all repair, log CRITICAL
+  - If a node was down < `rebalance_cooldown_secs` → don't rebalance its shards
+  - Exponential backoff on repair rate when multiple nodes are flapping
+  - Queue pressure: throttle aggressively when queue exceeds `queue_pressure_threshold`
+- [ ] Implement majority-vote deep scrub:
+  - For each local shard, compute blake3 hash
+  - Ask N peers who also hold this shard for their hash (lightweight RPC, 32 bytes)
+  - If local hash matches majority → shard is good
+  - If local hash differs from majority → local shard is corrupt, fetch correct version
+  - If no majority agrees → flag for manual inspection, do NOT auto-repair
 
 **Tests**:
 
@@ -568,6 +591,8 @@ Auto-repair and rebalancing.
 - [ ] Executor successfully repairs a shard by fetching from surviving node
 - [ ] Executor successfully repairs a shard by RS reconstruction when direct copy unavailable
 - [ ] Rate limiting: repair doesn't exceed configured bandwidth
+- [ ] Circuit breaker: repair stops when ≥50% of nodes are down
+- [ ] Circuit breaker: no rebalance during cooldown period after node restart
 - [ ] After repair: object is fully readable again
 - [ ] `cargo test -p shoal-repair` passes
 
@@ -797,6 +822,20 @@ Small objects (smaller than `chunk_size`) are packed together into shared chunks
 
 **No code changes needed now** — the existing `ChunkMeta` struct already supports this via its `offset` and `size` fields. The packing logic will be implemented in `shoal-engine` (Milestone 11).
 
+### Production Hardening (Lessons from Ceph, MinIO, Meta)
+
+These protections are built into Shoal's design from day one, informed by
+real-world incidents at Ceph, MinIO, Meta/Facebook, CERN, and others:
+
+* **Content-addressing everywhere**: Every shard, chunk, and manifest is identified by its BLAKE3 hash. Corruption is detectable at every layer.
+* **Verify-on-read**: `FileStore` re-hashes every shard on read. Corrupt data is treated as missing (returns `CorruptShard` error), not returned to the client. The read path will fetch from another node and RS-decode instead. Cost: ~60µs for a 64KB shard (blake3 hashes at 1GB/s+).
+* **End-to-end integrity**: Network transfers (Milestone 8) verify blake3 hashes at the receiver on every hop. Push path: receiver hashes data, compares to ShardId. Pull path: requester hashes response. Manifest gossip: verify ObjectId = blake3(serialized manifest). No trust boundaries.
+* **Manifest versioning**: `version: u8` field enables safe format evolution. `deserialize_manifest` rejects unknown versions with a clear error. Prevents Ceph-style cross-version corruption (January 2026 "fast EC" incident: format change without versioning caused 340K scrub errors).
+* **Rebalancing circuit breaker** (Milestone 10): `RepairCircuitBreaker` in `NodeConfig` prevents cascade meltdowns. If ≥50% of nodes are down → suspend all repair. If a node was down < cooldown period → don't rebalance its shards (probably rebooting). Queue pressure threshold throttles aggressively. Inspired by Ceph's 2018 rebalancing storm where one OSD restart cascaded into total unavailability.
+* **Majority-vote scrub** (Milestone 10): Background anti-entropy uses peer consensus, not primary-wins, to identify corrupt shards. Compute local hash, ask N peers for theirs, majority wins. If no majority → flag for manual inspection. Prevents Ceph's scrub-propagates-corruption bug where the primary held the corrupt copy.
+* **m=1 warnings**: `suggest_config` returns `ErasureSuggestion` with a warning when m≤1. Warns that during repair of a failed shard, a second failure will cause data loss.
+* **Inode monitoring**: `FileStore::capacity()` reports inode usage via statvfs and warns at >80% usage. Recommendation: use XFS over ext4 for production (XFS dynamically allocates inodes; ext4 requires `mkfs.ext4 -N <count>`).
+
 ### Things NOT to do yet
 
 - No encryption at rest (later)
@@ -804,4 +843,4 @@ Small objects (smaller than `chunk_size`) are packed together into shared chunks
 - No versioning (later)
 - No lifecycle policies (later)
 - No `io_uring` / `O_DIRECT` backend (later, behind feature flag)
-- No cross-region replication (later)
+- No `ZoneReplicator` implementation yet (Milestone 11) — cross-zone replication is designed but not yet coded

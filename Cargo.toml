@@ -12,6 +12,7 @@ members = [
     "crates/shoal-engine",
     "crates/shoal-s3",
     "crates/shoal-cli",
+    "tests",
 ]
 resolver = "3"
 
@@ -43,11 +44,14 @@ fjall = "3"
 reed-solomon-simd = "3"
 
 # Networking
-iroh = "0.35"
-iroh-gossip = { version = "0.35", features = ["net"] }
+iroh = "0.96"
+iroh-gossip = { version = "0.96", features = ["net"] }
 
 # Membership
-foca = "0.17"
+foca = { version = "0.17", features = ["postcard-codec", "std", "tracing"] }
+
+# Random
+rand = { version = "0.8", features = ["small_rng"] }
 
 # Serialization
 postcard = { version = "1", features = ["alloc"] }

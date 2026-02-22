@@ -96,6 +96,8 @@ impl ShardStore for MemoryStore {
             total_bytes: self.max_bytes,
             used_bytes: used,
             available_bytes: self.max_bytes.saturating_sub(used),
+            inodes_total: 0,
+            inodes_free: 0,
         })
     }
 
