@@ -3320,6 +3320,7 @@ name = "shoal-cas"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "bytes",
  "postcard",
  "serde",
  "shoal-types",
@@ -3457,6 +3458,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "blake3",
+ "bytes",
  "libc",
  "shoal-types",
  "tempfile",
