@@ -122,6 +122,19 @@ impl ShoalTransport {
     }
 
     // -------------------------------------------------------------------
+    // High-level message sending
+    // -------------------------------------------------------------------
+
+    /// Send an arbitrary message to a remote peer.
+    ///
+    /// Opens a new uni-directional stream on a (pooled) connection to the
+    /// given address and sends the postcard-encoded message.
+    pub async fn send_to(&self, addr: EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError> {
+        let conn = self.get_connection(addr).await?;
+        Self::send_message(&conn, msg).await
+    }
+
+    // -------------------------------------------------------------------
     // Low-level message send/receive
     // -------------------------------------------------------------------
 

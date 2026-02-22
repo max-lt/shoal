@@ -50,4 +50,7 @@ pub enum ShoalMessage {
         /// Timestamp from the original ping.
         timestamp: u64,
     },
+
+    /// Raw SWIM protocol data routed between foca membership services.
+    SwimData(Vec<u8>),
 }

@@ -11,6 +11,7 @@ path = "src/main.rs"
 shoal-cluster = { workspace = true }
 shoal-engine = { workspace = true }
 shoal-meta = { workspace = true }
+shoal-net = { workspace = true }
 shoal-s3 = { workspace = true }
 shoal-store = { workspace = true }
 shoal-types = { workspace = true }
@@ -18,7 +19,9 @@ anyhow = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
+iroh = { workspace = true }
 libc = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

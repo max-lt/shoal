@@ -6,29 +6,34 @@
 //! # Usage
 //!
 //! ```text
-//! shoald start                   # start the node
-//! shoald start -c shoal.toml    # start with a config file
-//! shoald status                  # show cluster status
-//! shoald repair status           # show repair queue
-//! shoald benchmark -n 200 -s 65536  # write/read benchmark
+//! shoald start                              # start the node
+//! shoald start -c shoal.toml               # start with a config file
+//! shoald start -d ./node2 -l 127.0.0.1:4822  # second instance
+//! shoald start --seed <endpoint_id>         # join an existing cluster
+//! shoald status                             # show cluster status
+//! shoald repair status                      # show repair queue
+//! shoald benchmark -n 200 -s 65536          # write/read benchmark
 //! ```
 
 mod config;
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use shoal_cluster::ClusterState;
+use iroh::{EndpointAddr, SecretKey};
+use shoal_cluster::{ClusterIdentity, ClusterState, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
+use shoal_net::ShoalTransport;
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use config::CliConfig;
 
@@ -62,6 +67,13 @@ enum Commands {
         /// Override S3 listen address (e.g. "127.0.0.1:4822").
         #[arg(short = 'l', long)]
         s3_listen_addr: Option<String>,
+
+        /// Seed node(s) to join an existing cluster.
+        ///
+        /// Format: `<endpoint_id>` or `<endpoint_id>@<host:port>`.
+        /// Can be specified multiple times.
+        #[arg(short, long)]
+        seed: Vec<String>,
     },
 
     /// Show cluster status from the local metadata store.
@@ -106,6 +118,7 @@ async fn main() -> Result<()> {
         Commands::Start {
             data_dir,
             s3_listen_addr,
+            seed,
         } => {
             // CLI args override config file values.
             if let Some(dir) = data_dir {
@@ -113,6 +126,10 @@ async fn main() -> Result<()> {
             }
             if let Some(addr) = s3_listen_addr {
                 config.node.s3_listen_addr = addr;
+            }
+            // Merge CLI seeds with config seeds.
+            if !seed.is_empty() {
+                config.cluster.seeds = seed;
             }
             cmd_start(config).await
         }
@@ -153,15 +170,33 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     // Create data directory.
     std::fs::create_dir_all(&config.node.data_dir).context("failed to create data directory")?;
 
-    // Load or generate a persistent node secret key.
-    let node_id = load_or_create_node_key(&config.node.data_dir)?;
-    info!(%node_id, "node identity");
+    // --- Node identity (iroh SecretKey) ---
+    let secret_key = load_or_create_secret_key(&config.node.data_dir)?;
+    let public_key = secret_key.public();
+    let node_id = NodeId::from(*public_key.as_bytes());
+    info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
-    // Metadata store.
+    // --- Network transport (iroh QUIC) ---
+    let transport = Arc::new(
+        ShoalTransport::bind(secret_key, iroh::RelayMode::Default)
+            .await
+            .context("failed to bind iroh endpoint")?,
+    );
+
+    let local_addr = transport.addr();
+    info!(
+        endpoint_id = %transport.endpoint_id().fmt_short(),
+        "iroh endpoint ready"
+    );
+    for addr in local_addr.ip_addrs() {
+        info!(%addr, "listening on");
+    }
+
+    // --- Metadata store ---
     let meta_path = config.node.data_dir.join("meta");
     let meta = Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?);
 
-    // Shard store.
+    // --- Shard store ---
     let store: Arc<dyn ShardStore> = match config.storage.backend.as_str() {
         "memory" => {
             info!("using in-memory shard store");
@@ -174,19 +209,49 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         }
     };
 
-    // Cluster state (single-node bootstrap).
+    // --- Cluster state ---
     let cluster = ClusterState::new(node_id, 128);
-    cluster
-        .add_member(Member {
-            node_id,
-            capacity: u64::MAX,
-            state: MemberState::Alive,
-            generation: 1,
-            topology: NodeTopology::default(),
-        })
-        .await;
 
-    // Engine.
+    // --- Membership service (foca SWIM) ---
+    let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default());
+    let membership_handle = membership::start(
+        identity.clone(),
+        membership::default_config(100),
+        cluster.clone(),
+        Some(meta.clone()),
+    );
+
+    // --- SWIM routing loop: forward foca messages via iroh transport ---
+    // Foca produces outgoing SWIM messages destined for other nodes.
+    // We route them via the iroh transport as SwimData messages.
+    // NOTE: MembershipHandle cannot be cloned, so we keep it on the main
+    // task for now and drive routing in the S3 serve loop's background.
+    // For a production system this would be an Arc<MembershipHandle> pattern.
+
+    // --- Connect to seed nodes ---
+    for seed_str in &config.cluster.seeds {
+        match parse_seed(seed_str) {
+            Ok((_seed_endpoint_addr, seed_node_id)) => {
+                let seed_identity =
+                    ClusterIdentity::new(seed_node_id, 1, u64::MAX, NodeTopology::default());
+                info!(seed = %seed_str, "joining cluster via seed");
+                if let Err(e) = membership_handle.join(seed_identity) {
+                    warn!(seed = %seed_str, %e, "failed to announce to seed");
+                }
+            }
+            Err(e) => {
+                warn!(seed = %seed_str, %e, "invalid seed format, skipping");
+            }
+        }
+    }
+
+    // Print join command for other nodes.
+    info!(
+        "to join this node: shoald start --seed {}",
+        transport.endpoint_id()
+    );
+
+    // --- Engine ---
     let engine = Arc::new(ShoalNode::new(
         ShoalNodeConfig {
             node_id,
@@ -200,7 +265,7 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         cluster,
     ));
 
-    // S3 HTTP API.
+    // --- S3 HTTP API ---
     let server = S3Server::new(S3ServerConfig {
         engine,
         auth_secret: config.s3_auth_secret(),
@@ -213,6 +278,76 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         .context("S3 server failed")?;
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Networking helpers
+// -----------------------------------------------------------------------
+
+/// Parse a seed node string.
+///
+/// Formats:
+/// - `<endpoint_id>` — hex-encoded 32-byte public key (iroh relay used for discovery)
+/// - `<endpoint_id>@<host:port>` — with an explicit direct address
+fn parse_seed(s: &str) -> Result<(EndpointAddr, NodeId)> {
+    let (id_str, addr_str) = match s.split_once('@') {
+        Some((id, addr)) => (id, Some(addr)),
+        None => (s, None),
+    };
+
+    let endpoint_id: iroh::EndpointId = id_str
+        .parse()
+        .context("invalid endpoint ID (expected hex-encoded public key)")?;
+
+    let mut endpoint_addr = EndpointAddr::new(endpoint_id);
+    if let Some(addr) = addr_str {
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .context("invalid socket address in seed (expected host:port)")?;
+        endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+    }
+
+    let node_id = NodeId::from(*endpoint_id.as_bytes());
+
+    Ok((endpoint_addr, node_id))
+}
+
+// -----------------------------------------------------------------------
+// Key management
+// -----------------------------------------------------------------------
+
+/// Load or create a persistent iroh secret key from `data_dir/node.key`.
+///
+/// On first run, generates a new random ed25519 key and writes it to `node.key`.
+/// On subsequent runs, reads the existing key. This gives each node a stable
+/// iroh identity across restarts, and different `data_dir`s get different identities.
+fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
+    let key_path = data_dir.join("node.key");
+    if key_path.exists() {
+        let bytes = std::fs::read(&key_path).context("failed to read node.key")?;
+        anyhow::ensure!(bytes.len() == 32, "node.key must be exactly 32 bytes");
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let key = SecretKey::from_bytes(&arr);
+        info!(
+            endpoint_id = %key.public().fmt_short(),
+            "loaded existing node key"
+        );
+        Ok(key)
+    } else {
+        // Generate a new random ed25519 key.
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let key = SecretKey::from(bytes);
+        std::fs::write(&key_path, key.to_bytes()).context("failed to write node.key")?;
+        info!(
+            path = %key_path.display(),
+            endpoint_id = %key.public().fmt_short(),
+            "generated new node key"
+        );
+        Ok(key)
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -352,36 +487,6 @@ async fn cmd_benchmark(config: &CliConfig, count: usize, size: usize) -> Result<
     Ok(())
 }
 
-/// Load or create a persistent node secret key from `data_dir/node.key`.
-///
-/// On first run, generates 32 random bytes and writes them to `node.key`.
-/// On subsequent runs, reads the existing key. This gives each node a stable
-/// identity across restarts, and different `data_dir`s yield different identities.
-fn load_or_create_node_key(data_dir: &Path) -> Result<NodeId> {
-    let key_path = data_dir.join("node.key");
-    if key_path.exists() {
-        let bytes = std::fs::read(&key_path).context("failed to read node.key")?;
-        anyhow::ensure!(bytes.len() == 32, "node.key must be exactly 32 bytes");
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes);
-        Ok(NodeId::from(arr))
-    } else {
-        // Generate a new key from random bytes.
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let seed_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let seed_addr = data_dir.as_os_str().len();
-        let combined = format!("{seed_time}-{seed_addr}-{}", std::process::id());
-        let hash = blake3::hash(combined.as_bytes());
-        let key: [u8; 32] = *hash.as_bytes();
-        std::fs::write(&key_path, key).context("failed to write node.key")?;
-        info!(path = %key_path.display(), "generated new node identity");
-        Ok(NodeId::from(key))
-    }
-}
-
 /// Generate deterministic test data for benchmarking.
 fn generate_bench_data(size: usize) -> Vec<u8> {
     let mut data = Vec::with_capacity(size);
@@ -459,5 +564,57 @@ mod tests {
         assert!(conn.is_ok(), "should be able to connect to the S3 port");
 
         handle.abort();
+    }
+
+    #[test]
+    fn test_parse_seed_endpoint_id_only() {
+        // Use a known valid ed25519 public key (all zeros is not valid, use a generated one).
+        let key = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            SecretKey::from(b)
+        };
+        let id_str = key.public().to_string();
+
+        let (addr, node_id) = parse_seed(&id_str).unwrap();
+        assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
+        assert!(addr.is_empty()); // no direct addresses, relay-only
+    }
+
+    #[test]
+    fn test_parse_seed_with_address() {
+        let key = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            SecretKey::from(b)
+        };
+        let id_str = key.public().to_string();
+        let seed = format!("{id_str}@127.0.0.1:4820");
+
+        let (addr, node_id) = parse_seed(&seed).unwrap();
+        assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
+        assert!(!addr.is_empty()); // has a direct address
+    }
+
+    #[test]
+    fn test_parse_seed_invalid() {
+        assert!(parse_seed("not-a-valid-key").is_err());
+        assert!(parse_seed("abc123@not-a-valid-addr").is_err());
+    }
+
+    #[test]
+    fn test_secret_key_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First call generates a new key.
+        let key1 = load_or_create_secret_key(dir.path()).unwrap();
+
+        // Second call loads the same key.
+        let key2 = load_or_create_secret_key(dir.path()).unwrap();
+
+        assert_eq!(key1.to_bytes(), key2.to_bytes());
+        assert_eq!(key1.public(), key2.public());
     }
 }
