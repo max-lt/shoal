@@ -214,255 +214,145 @@ Work through these milestones **in order**. After each milestone, **run all test
 
 ---
 
-## Milestone 0 — Workspace Setup
+## Milestone 0 — Workspace Setup ✅
 
 Set up the Rust workspace and all crate skeletons.
 
-- [ ] Create `shoal/Cargo.toml` workspace with all member crates
-- [ ] Create each crate directory with `Cargo.toml` and `src/lib.rs` (or `src/main.rs` for `shoal-cli`)
-- [ ] Set up `[workspace.dependencies]` with all shared deps:
-  - `blake3 = "1"`
-  - `fjall = "3"`
-  - `reed-solomon-simd = "3"`
-  - `iroh = "0.35"`
-  - `iroh-gossip = "0.35"` (must be compatible with iroh 0.35 — check crates.io for the right version)
-  - `foca = "0.17"`
-  - `postcard = { version = "1", features = ["alloc"] }`
-  - `serde = { version = "1", features = ["derive"] }`
-  - `axum = "0.8"`
-  - `tokio = { version = "1", features = ["full"] }`
-  - `tracing = "0.1"`
-  - `thiserror = "2"`
-  - `anyhow = "1"`
-- [ ] Verify the entire workspace compiles: `cargo build`
-- [ ] Verify iroh 0.35 and iroh-gossip version compatibility — if 0.35 doesn't work for iroh-gossip, find the compatible pair and document it
+- [x] Create `shoal/Cargo.toml` workspace with all member crates
+- [x] Create each crate directory with `Cargo.toml` and `src/lib.rs` (or `src/main.rs` for `shoal-cli`)
+- [x] Set up `[workspace.dependencies]` with all shared deps (blake3, fjall, reed-solomon-simd, iroh, iroh-gossip, foca, postcard, serde, axum, tokio, tracing, thiserror, anyhow, bytes)
+- [x] Verify the entire workspace compiles: `cargo build`
+- [x] Verify iroh 0.35 and iroh-gossip version compatibility (iroh-gossip 0.35 with `net` feature)
 
 **Test**: `cargo build` succeeds with no errors.
 
 ---
 
-## Milestone 1 — `shoal-types`
+## Milestone 1 — `shoal-types` ✅
 
 All shared types and identifiers.
 
-- [ ] Define `ShardId`, `ChunkId`, `ObjectId` as newtype wrappers around `[u8; 32]`
-- [ ] Implement `Display` (hex), `Debug`, `From<[u8; 32]>`, `AsRef<[u8]>`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd` for all ID types
-- [ ] Implement `Serialize` / `Deserialize` (via serde) for all ID types
-- [ ] Define `NodeId` (also `[u8; 32]`, derived from iroh key)
-- [ ] Define `Manifest`, `ChunkMeta`, `ShardMeta` structs with serde derives
-- [ ] Define `Member` and `MemberState` enum (`Alive`, `Suspect`, `Dead`)
-- [ ] Define `NodeConfig` with all adaptive fields and sensible defaults
-- [ ] Define `StorageBackend` enum (`Memory`, `File`, `Direct`)
-- [ ] Define `ErasureConfig` struct (`k`, `m`, `chunk_size`)
-- [ ] Define `ClusterEvent` enum: `NodeJoined(Member)`, `NodeLeft(NodeId)`, `NodeDead(NodeId)`, `ShardStored(ShardId, NodeId)`, `RepairNeeded(ShardId)`
-- [ ] Helper functions: `ShardId::from_data(data: &[u8]) -> ShardId` (blake3 hash), same for `ChunkId`, `ObjectId`
+- [x] Define `ShardId`, `ChunkId`, `ObjectId` as newtype wrappers around `[u8; 32]`
+- [x] Implement `Display` (hex), `Debug`, `From<[u8; 32]>`, `AsRef<[u8]>`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd` for all ID types
+- [x] Implement `Serialize` / `Deserialize` (via serde) for all ID types
+- [x] Define `NodeId` (also `[u8; 32]`, derived from iroh key)
+- [x] Define `Manifest`, `ChunkMeta`, `ShardMeta` structs with serde derives
+- [x] Define `Member` and `MemberState` enum (`Alive`, `Suspect`, `Dead`)
+- [x] Define `NodeConfig` with all adaptive fields and sensible defaults
+- [x] Define `StorageBackend` enum (`Memory`, `File`, `Direct`)
+- [x] Define `ErasureConfig` struct (`k`, `m`, `chunk_size`)
+- [x] Define `ClusterEvent` enum: `NodeJoined(Member)`, `NodeLeft(NodeId)`, `NodeDead(NodeId)`, `ShardStored(ShardId, NodeId)`, `RepairNeeded(ShardId)`
+- [x] Helper functions: `ShardId::from_data(data: &[u8]) -> ShardId` (blake3 hash), same for `ChunkId`, `ObjectId`
+- [x] ID types also implement `as_bytes() -> &[u8; 32]` accessor
 
-**Tests**:
+**Tests** (26 tests):
 
-- [ ] Round-trip serialize/deserialize all types with postcard
-- [ ] Verify ID generation: same data → same ID, different data → different ID
-- [ ] Verify Display outputs hex correctly
-- [ ] `cargo test -p shoal-types` passes
+- [x] Round-trip serialize/deserialize all types with postcard
+- [x] Verify ID generation: same data → same ID, different data → different ID
+- [x] Verify Display outputs hex correctly
+- [x] `cargo test -p shoal-types` passes
 
 ---
 
-## Milestone 2 — `shoal-store`
+## Milestone 2 — `shoal-store` ✅
 
 The shard storage trait and in-memory backend.
 
-- [ ] Define the `ShardStore` trait:
+- [x] Define the `ShardStore` trait using `Bytes` for zero-copy:
 
   ```rust
   #[async_trait]
   pub trait ShardStore: Send + Sync {
-      async fn put(&self, id: ShardId, data: &[u8]) -> Result<()>;
-      async fn get(&self, id: ShardId) -> Result<Option<Vec<u8>>>;
+      async fn put(&self, id: ShardId, data: Bytes) -> Result<()>;
+      async fn get(&self, id: ShardId) -> Result<Option<Bytes>>;
       async fn delete(&self, id: ShardId) -> Result<()>;
       async fn contains(&self, id: ShardId) -> Result<bool>;
       async fn list(&self) -> Result<Vec<ShardId>>;
       async fn capacity(&self) -> Result<StorageCapacity>;
-      async fn verify(&self, id: ShardId) -> Result<bool>; // re-hash and compare
-  }
-
-  pub struct StorageCapacity {
-      pub total_bytes: u64,
-      pub used_bytes: u64,
-      pub available_bytes: u64,
+      async fn verify(&self, id: ShardId) -> Result<bool>;
   }
   ```
 
-- [ ] Implement `MemoryStore` using `DashMap<ShardId, Vec<u8>>` (or `RwLock<HashMap>`)
-- [ ] `MemoryStore::capacity()` should track total bytes stored and use a configurable max
-- [ ] `MemoryStore::verify()` should re-hash the stored data and compare to the ShardId
-- [ ] Implement `FileStore` — one file per shard, stored in a configurable directory
-  - File path: `{base_dir}/{hex(shard_id)[0..2]}/{hex(shard_id)[2..4]}/{hex(shard_id)}` (2-level fan-out to avoid too many files in one dir)
-  - `capacity()` uses `statvfs` or similar to report filesystem capacity
-  - `verify()` reads file, hashes, compares
+- [x] Implement `MemoryStore` using `RwLock<HashMap<ShardId, Bytes>>`
+- [x] `MemoryStore::capacity()` tracked via `AtomicU64` counter (O(1) per operation)
+- [x] `MemoryStore::verify()` re-hashes stored data and compares to ShardId
+- [x] Implement `FileStore` — one file per shard, 2-level fan-out directory layout
+  - Atomic writes: write to temp file, then rename (crash-safe)
+  - `contains()` uses async `tokio::fs::metadata` (not blocking `path.exists()`)
+  - `capacity()` uses `statvfs` via `spawn_blocking` (not blocking the async runtime)
 
-**Tests**:
+**Tests** (24 tests):
 
-- [ ] `MemoryStore`: put/get round-trip
-- [ ] `MemoryStore`: get nonexistent returns None
-- [ ] `MemoryStore`: delete then get returns None
-- [ ] `MemoryStore`: contains true/false
-- [ ] `MemoryStore`: list returns all stored ShardIds
-- [ ] `MemoryStore`: verify returns true for valid, false for corrupted (modify internal data to test)
-- [ ] `MemoryStore`: capacity tracking
-- [ ] `FileStore`: same test suite as MemoryStore (use tempdir)
-- [ ] `FileStore`: fan-out directory structure is correct
-- [ ] `cargo test -p shoal-store` passes
+- [x] `MemoryStore`: put/get round-trip, get nonexistent, delete, contains, list, verify, capacity, overwrite
+- [x] `FileStore`: same suite + fan-out structure verification + atomic write (no .tmp left)
+- [x] `cargo test -p shoal-store` passes
 
 ---
 
-## Milestone 3 — `shoal-cas`
+## Milestone 3 — `shoal-cas` ✅
 
 Content addressing: chunking objects into chunks, building manifests.
 
-- [ ] Implement fixed-size chunker:
-  ```rust
-  pub struct Chunker {
-      chunk_size: u32,
-  }
-  impl Chunker {
-      pub fn chunk(&self, data: &[u8]) -> Vec<Chunk>;
-  }
-  pub struct Chunk {
-      pub id: ChunkId,
-      pub offset: u64,
-      pub data: Vec<u8>,
-  }
-  ```
-- [ ] `Chunk.id` = `blake3(chunk.data)`
-- [ ] Last chunk may be smaller than `chunk_size`
-- [ ] Implement streaming chunker for large data (takes `impl Read` or `impl AsyncRead`)
-- [ ] Implement `Manifest` builder:
+- [x] Implement fixed-size chunker with `Chunk.data: Bytes` (zero-copy through pipeline)
+- [x] `Chunk.id` = `blake3(chunk.data)`, last chunk may be smaller
+- [x] Implement streaming chunker (`chunk_stream` takes `impl AsyncRead + Unpin`)
+- [x] Implement `build_manifest` and `build_manifest_with_timestamp` (deterministic testing)
+  - `ObjectId` = blake3 of postcard-serialized content (without object_id field)
+- [x] Implement manifest serialization/deserialization with postcard
 
-  ```rust
-  pub fn build_manifest(
-      chunks: &[ChunkMeta],
-      total_size: u64,
-      chunk_size: u32,
-      metadata: BTreeMap<String, String>,
-  ) -> Manifest
-  ```
+**Tests** (13 tests):
 
-  - `ObjectId` = blake3 of the postcard-serialized manifest (without the object_id field — use a deterministic serialization of the chunks list)
-
-- [ ] Implement manifest serialization/deserialization with postcard
-
-**Tests**:
-
-- [ ] Chunking: 0 bytes → 0 chunks
-- [ ] Chunking: exactly chunk_size bytes → 1 chunk
-- [ ] Chunking: chunk_size + 1 bytes → 2 chunks, second chunk is 1 byte
-- [ ] Chunking: 3.5 \* chunk_size → 4 chunks, last is half size
-- [ ] ChunkId is deterministic: same data → same ChunkId
-- [ ] Deduplication: two identical chunks produce same ChunkId
-- [ ] Manifest round-trip: build → serialize → deserialize → compare
-- [ ] ObjectId is deterministic
-- [ ] `cargo test -p shoal-cas` passes
+- [x] Chunking: 0 bytes, exact size, size+1, 3.5x size
+- [x] ChunkId deterministic, deduplication (identical chunks → same ID)
+- [x] Streaming chunker matches sync chunker
+- [x] Manifest round-trip, ObjectId deterministic, ObjectId changes with content
+- [x] `cargo test -p shoal-cas` passes
 
 ---
 
-## Milestone 4 — `shoal-erasure`
+## Milestone 4 — `shoal-erasure` ✅
 
 Erasure coding wrapper around reed-solomon-simd.
 
-- [ ] Implement encoder:
-  ```rust
-  pub struct ErasureEncoder {
-      k: usize,  // data shards
-      m: usize,  // parity shards
-  }
-  impl ErasureEncoder {
-      pub fn encode(&self, chunk: &[u8]) -> Result<Vec<Shard>>;
-  }
-  pub struct Shard {
-      pub id: ShardId,
-      pub index: u8,       // 0..k+m
-      pub data: Vec<u8>,
-  }
-  ```
-- [ ] Padding: if chunk isn't evenly divisible by k, pad with zeros. Record original size.
-- [ ] Shard size constraint: reed-solomon-simd requires even shard sizes. Ensure this.
-- [ ] Each shard's `id` = blake3(shard.data)
-- [ ] Implement decoder:
+- [x] Implement `ErasureEncoder::encode(chunk) -> (Vec<Shard>, original_size)`
+  - `Shard` has `id: ShardId`, `index: u8` (0..k for data, k..k+m for parity), `data: Bytes`
+  - Automatic padding: `ceil(len/k)` rounded up to even (reed-solomon-simd requirement)
+- [x] Implement `decode(k, m, shards, original_size) -> Vec<u8>`
+  - Fast-path: if all k data shards present, skip RS decode (just concatenate)
+  - Full RS decode when missing data shards
+- [x] Implement `suggest_config(node_count) -> (k, m)`:
+  - 1→(1,0), 2→(1,1), 3→(2,1), 4→(2,2), 5→(3,2), 6-11→(4,2), 12+→(8,4)
+  - Guarantee: k+m never exceeds node_count
 
-  ```rust
-  pub fn decode(&self, shards: &[(u8, Vec<u8>)], original_size: usize) -> Result<Vec<u8>>;
-  ```
+**Tests** (21 tests):
 
-  - Takes at least k shards (any combination of data + parity)
-  - Returns the original chunk data (unpadded)
-
-- [ ] Implement adaptive config: suggest k/m based on cluster size
-  - 3 nodes: k=2, m=1
-  - 5 nodes: k=3, m=2
-  - 10+ nodes: k=4, m=2 (or k=8, m=4 for large clusters)
-
-**Tests**:
-
-- [ ] Encode then decode with all shards → original data
-- [ ] Encode then decode with only k shards (drop m shards) → original data
-- [ ] Encode then decode with mixed data+parity shards → original data
-- [ ] Encode then decode dropping different combinations of shards → all work as long as k remain
-- [ ] Encoding with non-even-divisible chunk size works (padding)
-- [ ] ShardIds are deterministic
-- [ ] Decode with fewer than k shards → error
-- [ ] Large chunk (1MB) encode/decode works correctly
-- [ ] `cargo test -p shoal-erasure` passes
+- [x] Encode/decode: all shards, data-only, parity-only, mixed, all combinations for k=2/m=2
+- [x] Padding (non-divisible chunk), 1MB chunk, deterministic IDs
+- [x] Fewer than k shards → error, empty chunk → error
+- [x] Adaptive config: all node counts 0-50, never exceeds nodes
+- [x] `cargo test -p shoal-erasure` passes
 
 ---
 
-## Milestone 5 — `shoal-placement`
+## Milestone 5 — `shoal-placement` ✅
 
-Consistent hashing ring for deterministic shard placement.
+Consistent hashing ring for deterministic shard placement (~150 lines).
 
-- [ ] Implement `Ring` struct:
-  ```rust
-  pub struct Ring {
-      vnodes: BTreeMap<u64, NodeId>,    // position on ring → node
-      nodes: HashMap<NodeId, NodeInfo>,  // node metadata
-      vnodes_per_node: u16,             // default 128, scaled by capacity
-  }
-  pub struct NodeInfo {
-      pub capacity: u64,
-      pub weight: u16,  // number of vnodes (proportional to capacity)
-  }
-  ```
-- [ ] vnode positions: `blake3(node_id ++ vnode_index)` truncated to u64
-- [ ] `Ring::owners(shard_id: ShardId, replication_factor: usize) -> Vec<NodeId>`:
-  - Walk clockwise from shard's position on ring
-  - Collect `replication_factor` **distinct** NodeIds (skip duplicate physical nodes)
-  - If fewer distinct nodes than replication_factor exist, return all available
-- [ ] `Ring::add_node(node_id, capacity)` and `Ring::remove_node(node_id)`
-- [ ] `Ring::diff(old: &Ring, new: &Ring) -> Vec<Migration>`:
+- [x] `Ring` struct with `BTreeMap<u64, NodeId>` vnodes, `HashMap<NodeId, NodeInfo>` metadata
+- [x] vnode positions: `blake3(node_id ++ vnode_index)` truncated to u64
+- [x] `Ring::owners(&ShardId, replication_factor) -> Vec<NodeId>`: clockwise walk, distinct physical nodes
+- [x] `Ring::add_node`, `add_node_with_weight`, `remove_node`
+- [x] `Ring::diff(old, new, shard_ids, replication_factor) -> Vec<Migration>`
+- [x] Weighted nodes: `add_node_with_weight` for capacity-proportional vnode counts
 
-  ```rust
-  pub struct Migration {
-      pub shard_id: ShardId,   // which shard
-      pub from: NodeId,        // old owner
-      pub to: NodeId,          // new owner
-  }
-  ```
+**Tests** (12 tests):
 
-  - Given a set of known shard IDs, compute which shards need to move
-  - This is critical for rebalancing
-
-- [ ] Weighted nodes: nodes with more capacity get proportionally more vnodes
-
-**Tests**:
-
-- [ ] Single node: all shards map to that node
-- [ ] Two nodes: shards are roughly 50/50 distributed (within 20% tolerance)
-- [ ] Add a node: only ~1/N of shards move (consistent hashing property)
-- [ ] Remove a node: only that node's shards redistribute
-- [ ] Replication factor 3: each shard has 3 distinct owners
-- [ ] Replication factor > number of nodes: returns all nodes without panic
-- [ ] Weighted nodes: node with 2x capacity gets ~2x shards
-- [ ] Ring diff: correctly identifies migrations after add/remove
-- [ ] Deterministic: same input → same placement
-- [ ] `cargo test -p shoal-placement` passes
+- [x] Single node ownership, balanced 2-node distribution (~50/50)
+- [x] Consistent hashing: ~1/N moves on add, only removed node's shards redistribute
+- [x] Replication factor 3 → 3 distinct owners, replication > nodes → all nodes
+- [x] Weighted 2x → ~2x shards, diff identifies migrations to new node
+- [x] Deterministic placement, empty ring, re-add updates weight
+- [x] `cargo test -p shoal-placement` passes
 
 ---
 
@@ -888,6 +778,24 @@ Full cluster tests with real networking.
 - On reads: fetch shards in parallel across nodes
 - Repair: always respect the rate limiter, never starve client traffic
 - All objects, regardless of size, go through the same pipeline (no inline shortcut)
+
+### Small Object Packing
+
+Small objects (smaller than `chunk_size`) are packed together into shared chunks to avoid wasting space and erasure coding overhead on tiny payloads.
+
+**Design**: `ChunkMeta` already carries `offset` and `size` fields. For large objects, each chunk maps 1:1 to a data range. For small objects, multiple objects can share the same underlying chunk — each object's `ChunkMeta` references a `(chunk_id, offset, size)` slice within the shared chunk.
+
+**Write path** (implemented in `shoal-engine`, Milestone 11):
+- The engine maintains an `OpenChunk` buffer per node (or per bucket) that accumulates small objects.
+- When an object arrives that is smaller than `chunk_size`, it is appended to the current `OpenChunk` buffer at the next available offset.
+- When the buffer is full (or a flush interval elapses), the entire chunk is erasure-coded and distributed like any regular chunk.
+- Each small object gets its own `Manifest` whose single `ChunkMeta` points to the shared chunk at its `(offset, size)`.
+
+**Read path**: Fetch the shared chunk (or reconstruct it from shards), then extract the byte range `[offset..offset+size]`.
+
+**Deletion and compaction**: Deleting a small object only removes its manifest and key mapping. The underlying shared chunk remains until a background compaction pass detects that all (or most) objects referencing it are deleted, at which point the chunk can be garbage-collected. This is a late-stage optimization (post-Milestone 11).
+
+**No code changes needed now** — the existing `ChunkMeta` struct already supports this via its `offset` and `size` fields. The packing logic will be implemented in `shoal-engine` (Milestone 11).
 
 ### Things NOT to do yet
 
