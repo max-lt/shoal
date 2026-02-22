@@ -16,3 +16,11 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+rand = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+futures-lite = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
