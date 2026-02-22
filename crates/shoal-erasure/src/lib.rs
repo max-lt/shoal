@@ -13,7 +13,7 @@ mod decoder;
 mod encoder;
 mod error;
 
-pub use config::suggest_config;
+pub use config::{ErasureSuggestion, suggest_config};
 pub use decoder::decode;
 pub use encoder::{ErasureEncoder, Shard};
 pub use error::ErasureError;

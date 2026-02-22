@@ -86,12 +86,21 @@ define_id!(
 // Core data structures
 // ---------------------------------------------------------------------------
 
+/// Current manifest format version.
+pub const MANIFEST_VERSION: u8 = 1;
+
 /// Top-level manifest describing a stored object.
 ///
 /// A manifest records how an object was chunked and erasure-coded,
 /// allowing any node to reconstruct the original data.
+///
+/// The `version` field enables safe format evolution. All code that reads
+/// a manifest must check this field and reject unknown versions rather than
+/// silently misinterpreting data (lesson from Ceph's "fast EC" incident).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Format version. Current version is [`MANIFEST_VERSION`] (1).
+    pub version: u8,
     /// Unique identifier for this object (blake3 of the serialized manifest content).
     pub object_id: ObjectId,
     /// Total size of the original object in bytes.
@@ -269,7 +278,7 @@ impl Default for ErasureConfig {
 ///
 /// Every object goes through the same pipeline regardless of size:
 /// chunking → erasure coding → shard distribution via the placement ring.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Which storage backend to use.
     pub storage_backend: StorageBackend,
@@ -289,6 +298,8 @@ pub struct NodeConfig {
     pub replication_boundary: ReplicationBoundary,
     /// When to ACK writes to the client relative to zone replication.
     pub zone_write_ack: ZoneWriteAck,
+    /// Circuit breaker settings for repair and rebalancing.
+    pub repair_circuit_breaker: RepairCircuitBreaker,
 }
 
 impl Default for NodeConfig {
@@ -303,6 +314,36 @@ impl Default for NodeConfig {
             gossip_interval_ms: 1_000,
             replication_boundary: ReplicationBoundary::default(),
             zone_write_ack: ZoneWriteAck::default(),
+            repair_circuit_breaker: RepairCircuitBreaker::default(),
+        }
+    }
+}
+
+/// Circuit breaker for repair and rebalancing operations.
+///
+/// Prevents cascade meltdowns where repair activity overwhelms the cluster
+/// (lesson from Ceph's 2018 rebalancing storm: one OSD restart triggered
+/// cascading OOM kills across the cluster).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepairCircuitBreaker {
+    /// If more than this fraction of nodes are down, suspend all repair/rebalance.
+    /// Default: 0.5 (50%).
+    pub max_down_fraction: f64,
+    /// Throttle aggressively when repair queue exceeds this many shards.
+    /// Default: 10,000.
+    pub queue_pressure_threshold: usize,
+    /// Seconds to wait after a node comes back before starting rebalance.
+    /// Prevents flapping nodes from triggering repeated rebalance storms.
+    /// Default: 60 seconds.
+    pub rebalance_cooldown_secs: u64,
+}
+
+impl Default for RepairCircuitBreaker {
+    fn default() -> Self {
+        Self {
+            max_down_fraction: 0.5,
+            queue_pressure_threshold: 10_000,
+            rebalance_cooldown_secs: 60,
         }
     }
 }
@@ -445,6 +486,7 @@ mod tests {
     #[test]
     fn test_manifest_roundtrip_postcard() {
         let manifest = Manifest {
+            version: MANIFEST_VERSION,
             object_id: ObjectId::from_data(b"test object"),
             total_size: 5000,
             chunk_size: 1024,
@@ -670,5 +712,52 @@ mod tests {
         assert_eq!(decoded.topology.region, "ap-southeast");
         assert_eq!(decoded.topology.datacenter, "sg-1");
         assert_eq!(decoded.topology.machine, "rack-04-slot-12");
+    }
+
+    // --- Production hardening tests ---
+
+    #[test]
+    fn test_manifest_version_field() {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            object_id: ObjectId::from_data(b"versioned"),
+            total_size: 100,
+            chunk_size: 1024,
+            chunks: vec![],
+            created_at: 0,
+            metadata: BTreeMap::new(),
+        };
+        assert_eq!(manifest.version, 1);
+        let encoded = postcard::to_allocvec(&manifest).unwrap();
+        let decoded: Manifest = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.version, 1);
+    }
+
+    #[test]
+    fn test_repair_circuit_breaker_default() {
+        let cb = RepairCircuitBreaker::default();
+        assert!((cb.max_down_fraction - 0.5).abs() < f64::EPSILON);
+        assert_eq!(cb.queue_pressure_threshold, 10_000);
+        assert_eq!(cb.rebalance_cooldown_secs, 60);
+    }
+
+    #[test]
+    fn test_repair_circuit_breaker_roundtrip_postcard() {
+        let cb = RepairCircuitBreaker {
+            max_down_fraction: 0.3,
+            queue_pressure_threshold: 5000,
+            rebalance_cooldown_secs: 120,
+        };
+        let encoded = postcard::to_allocvec(&cb).unwrap();
+        let decoded: RepairCircuitBreaker = postcard::from_bytes(&encoded).unwrap();
+        assert!((decoded.max_down_fraction - 0.3).abs() < f64::EPSILON);
+        assert_eq!(decoded.queue_pressure_threshold, 5000);
+        assert_eq!(decoded.rebalance_cooldown_secs, 120);
+    }
+
+    #[test]
+    fn test_node_config_includes_circuit_breaker() {
+        let config = NodeConfig::default();
+        assert!((config.repair_circuit_breaker.max_down_fraction - 0.5).abs() < f64::EPSILON);
     }
 }

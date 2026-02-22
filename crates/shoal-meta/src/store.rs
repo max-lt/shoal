@@ -258,12 +258,13 @@ fn repair_queue_key(priority: u64, shard_id: &ShardId) -> Vec<u8> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use shoal_types::{ChunkMeta, MemberState, NodeTopology, ShardMeta};
+    use shoal_types::{ChunkMeta, MANIFEST_VERSION, MemberState, NodeTopology, ShardMeta};
 
     use super::*;
 
     fn test_manifest() -> Manifest {
         Manifest {
+            version: MANIFEST_VERSION,
             object_id: ObjectId::from_data(b"test object"),
             total_size: 5000,
             chunk_size: 1024,

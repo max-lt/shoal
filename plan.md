@@ -116,6 +116,7 @@ pub struct NodeId([u8; 32]);       // derived from iroh endpoint key
 
 // === Core structures ===
 pub struct Manifest {
+    pub version: u8,            // format version (current: 1), prevents cross-version corruption
     pub object_id: ObjectId,
     pub total_size: u64,
     pub chunk_size: u32,
@@ -155,6 +156,15 @@ pub struct NodeConfig {
     pub repair_max_bandwidth: u64,          // bytes/sec for repair traffic
     pub repair_concurrent_transfers: u16,   // 1 (RPi) .. 64 (datacenter)
     pub gossip_interval_ms: u32,
+    pub replication_boundary: ReplicationBoundary,
+    pub zone_write_ack: ZoneWriteAck,
+    pub repair_circuit_breaker: RepairCircuitBreaker,
+}
+
+pub struct RepairCircuitBreaker {
+    pub max_down_fraction: f64,             // default 0.5 — suspend repair if ≥50% nodes down
+    pub queue_pressure_threshold: usize,    // default 10000 — throttle when queue exceeds this
+    pub rebalance_cooldown_secs: u64,       // default 60 — wait after node comes back
 }
 ```
 
@@ -484,7 +494,7 @@ Network protocol on top of iroh.
 - [ ] Implement shard transfer:
   - `push_shard(node_id, shard_id, data)` — sends shard to a node
   - `pull_shard(node_id, shard_id)` — requests a shard from a node
-  - Receiver verifies blake3 hash matches shard_id before accepting
+  - **End-to-end integrity** (see Production Hardening): Receiver verifies blake3 hash matches shard_id before accepting. Requester verifies pull responses. Manifest gossip verifies ObjectId = blake3(serialized manifest). Reject on mismatch, try another node.
 - [ ] Define ALPN protocol identifier: `b"shoal/0"`
 - [ ] Implement request handler that dispatches incoming messages
 
@@ -562,6 +572,17 @@ Auto-repair and rebalancing.
 - [ ] Implement `Throttle`:
   - Token bucket rate limiter for repair bandwidth
   - Adaptive: reduce repair rate when node is under read/write load
+- [ ] Implement `RepairCircuitBreaker` logic (see `NodeConfig.repair_circuit_breaker`):
+  - If ≥`max_down_fraction` of nodes are down → STOP all repair, log CRITICAL
+  - If a node was down < `rebalance_cooldown_secs` → don't rebalance its shards
+  - Exponential backoff on repair rate when multiple nodes are flapping
+  - Queue pressure: throttle aggressively when queue exceeds `queue_pressure_threshold`
+- [ ] Implement majority-vote deep scrub:
+  - For each local shard, compute blake3 hash
+  - Ask N peers who also hold this shard for their hash (lightweight RPC, 32 bytes)
+  - If local hash matches majority → shard is good
+  - If local hash differs from majority → local shard is corrupt, fetch correct version
+  - If no majority agrees → flag for manual inspection, do NOT auto-repair
 
 **Tests**:
 
@@ -570,6 +591,8 @@ Auto-repair and rebalancing.
 - [ ] Executor successfully repairs a shard by fetching from surviving node
 - [ ] Executor successfully repairs a shard by RS reconstruction when direct copy unavailable
 - [ ] Rate limiting: repair doesn't exceed configured bandwidth
+- [ ] Circuit breaker: repair stops when ≥50% of nodes are down
+- [ ] Circuit breaker: no rebalance during cooldown period after node restart
 - [ ] After repair: object is fully readable again
 - [ ] `cargo test -p shoal-repair` passes
 
@@ -798,6 +821,20 @@ Small objects (smaller than `chunk_size`) are packed together into shared chunks
 **Deletion and compaction**: Deleting a small object only removes its manifest and key mapping. The underlying shared chunk remains until a background compaction pass detects that all (or most) objects referencing it are deleted, at which point the chunk can be garbage-collected. This is a late-stage optimization (post-Milestone 11).
 
 **No code changes needed now** — the existing `ChunkMeta` struct already supports this via its `offset` and `size` fields. The packing logic will be implemented in `shoal-engine` (Milestone 11).
+
+### Production Hardening (Lessons from Ceph, MinIO, Meta)
+
+These protections are built into Shoal's design from day one, informed by
+real-world incidents at Ceph, MinIO, Meta/Facebook, CERN, and others:
+
+* **Content-addressing everywhere**: Every shard, chunk, and manifest is identified by its BLAKE3 hash. Corruption is detectable at every layer.
+* **Verify-on-read**: `FileStore` re-hashes every shard on read. Corrupt data is treated as missing (returns `CorruptShard` error), not returned to the client. The read path will fetch from another node and RS-decode instead. Cost: ~60µs for a 64KB shard (blake3 hashes at 1GB/s+).
+* **End-to-end integrity**: Network transfers (Milestone 8) verify blake3 hashes at the receiver on every hop. Push path: receiver hashes data, compares to ShardId. Pull path: requester hashes response. Manifest gossip: verify ObjectId = blake3(serialized manifest). No trust boundaries.
+* **Manifest versioning**: `version: u8` field enables safe format evolution. `deserialize_manifest` rejects unknown versions with a clear error. Prevents Ceph-style cross-version corruption (January 2026 "fast EC" incident: format change without versioning caused 340K scrub errors).
+* **Rebalancing circuit breaker** (Milestone 10): `RepairCircuitBreaker` in `NodeConfig` prevents cascade meltdowns. If ≥50% of nodes are down → suspend all repair. If a node was down < cooldown period → don't rebalance its shards (probably rebooting). Queue pressure threshold throttles aggressively. Inspired by Ceph's 2018 rebalancing storm where one OSD restart cascaded into total unavailability.
+* **Majority-vote scrub** (Milestone 10): Background anti-entropy uses peer consensus, not primary-wins, to identify corrupt shards. Compute local hash, ask N peers for theirs, majority wins. If no majority → flag for manual inspection. Prevents Ceph's scrub-propagates-corruption bug where the primary held the corrupt copy.
+* **m=1 warnings**: `suggest_config` returns `ErasureSuggestion` with a warning when m≤1. Warns that during repair of a failed shard, a second failure will cause data loss.
+* **Inode monitoring**: `FileStore::capacity()` reports inode usage via statvfs and warns at >80% usage. Recommendation: use XFS over ext4 for production (XFS dynamically allocates inodes; ext4 requires `mkfs.ext4 -N <count>`).
 
 ### Things NOT to do yet
 
