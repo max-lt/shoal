@@ -1,6 +1,6 @@
 # Shoal — Distributed Object Storage Engine
 
-100% pure Rust. Zero C bindings. See @SHOAL.md for full architecture and implementation plan.
+100% pure Rust. Zero C bindings. See @plan.md for full architecture and implementation plan.
 
 ## Build & Test
 
