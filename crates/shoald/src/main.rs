@@ -17,7 +17,7 @@
 
 mod config;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,11 +29,12 @@ use iroh::{EndpointAddr, SecretKey};
 use shoal_cluster::{ClusterIdentity, ClusterState, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
-use shoal_net::ShoalTransport;
+use shoal_net::{ShoalMessage, ShoalTransport};
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
-use tracing::{error, info, warn};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 use config::CliConfig;
 
@@ -212,26 +213,28 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     // --- Cluster state ---
     let cluster = ClusterState::new(node_id, 128);
 
+    // --- Address book: NodeId → EndpointAddr for routing ---
+    let address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
     // --- Membership service (foca SWIM) ---
     let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default());
-    let membership_handle = membership::start(
+    let membership_handle = Arc::new(membership::start(
         identity.clone(),
         membership::default_config(100),
         cluster.clone(),
         Some(meta.clone()),
-    );
-
-    // --- SWIM routing loop: forward foca messages via iroh transport ---
-    // Foca produces outgoing SWIM messages destined for other nodes.
-    // We route them via the iroh transport as SwimData messages.
-    // NOTE: MembershipHandle cannot be cloned, so we keep it on the main
-    // task for now and drive routing in the S3 serve loop's background.
-    // For a production system this would be an Arc<MembershipHandle> pattern.
+    ));
 
     // --- Connect to seed nodes ---
     for seed_str in &config.cluster.seeds {
         match parse_seed(seed_str) {
-            Ok((_seed_endpoint_addr, seed_node_id)) => {
+            Ok((seed_endpoint_addr, seed_node_id)) => {
+                // Store seed address for routing.
+                address_book
+                    .write()
+                    .await
+                    .insert(seed_node_id, seed_endpoint_addr);
                 let seed_identity =
                     ClusterIdentity::new(seed_node_id, 1, u64::MAX, NodeTopology::default());
                 info!(seed = %seed_str, "joining cluster via seed");
@@ -243,6 +246,119 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
                 warn!(seed = %seed_str, %e, "invalid seed format, skipping");
             }
         }
+    }
+
+    // --- Outgoing SWIM routing loop ---
+    // Reads foca's outgoing messages and sends them to target nodes via iroh.
+    {
+        let transport = transport.clone();
+        let handle = membership_handle.clone();
+        let book = address_book.clone();
+        tokio::spawn(async move {
+            loop {
+                match handle.next_outgoing().await {
+                    Some((target, data)) => {
+                        // Resolve target address: check book first, then fall back to relay.
+                        let addr = {
+                            let book = book.read().await;
+                            book.get(&target.node_id).cloned()
+                        };
+                        let addr = match addr {
+                            Some(a) => a,
+                            None => {
+                                // No known direct address — construct from public key.
+                                // iroh will attempt relay-based connection.
+                                match iroh::EndpointId::from_bytes(target.node_id.as_bytes()) {
+                                    Ok(eid) => EndpointAddr::new(eid),
+                                    Err(_) => {
+                                        warn!(target = %target.node_id, "invalid endpoint ID");
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        let msg = ShoalMessage::SwimData(data);
+                        if let Err(e) = transport.send_to(addr, &msg).await {
+                            debug!(target = %target.node_id, %e, "failed to route SWIM message");
+                        }
+                    }
+                    None => {
+                        info!("membership service stopped, exiting routing loop");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // --- Incoming connection handler ---
+    // Accepts iroh connections and dispatches messages to the membership service.
+    {
+        let transport = transport.clone();
+        let handle = membership_handle.clone();
+        let store = store.clone();
+        tokio::spawn(async move {
+            loop {
+                match transport.accept().await {
+                    Some(conn) => {
+                        // Spawn a handler for each connection.
+                        let handle = handle.clone();
+                        let store = store.clone();
+
+                        // Handle uni-directional streams (SWIM data, shard push).
+                        let conn_uni = conn.clone();
+                        let handle_uni = handle.clone();
+                        tokio::spawn(async move {
+                            ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
+                                let handle = handle_uni.clone();
+                                async move {
+                                    match msg {
+                                        ShoalMessage::SwimData(data) => {
+                                            if let Err(e) = handle.feed_data(data) {
+                                                warn!(%e, "failed to feed SWIM data");
+                                            }
+                                        }
+                                        ShoalMessage::ShardPush { shard_id, data } => {
+                                            debug!(%shard_id, "received shard push (not stored yet)");
+                                            let _ = (shard_id, data);
+                                        }
+                                        other => {
+                                            debug!("unhandled uni-stream message: {other:?}");
+                                        }
+                                    }
+                                }
+                            })
+                            .await;
+                        });
+
+                        // Handle bi-directional streams (shard pull requests).
+                        tokio::spawn(async move {
+                            ShoalTransport::handle_bi_streams(conn, move |msg| {
+                                let store = store.clone();
+                                async move {
+                                    match msg {
+                                        ShoalMessage::ShardRequest { shard_id } => {
+                                            let data = store.get(shard_id).await.ok().flatten();
+                                            Some(ShoalMessage::ShardResponse {
+                                                shard_id,
+                                                data: data.map(|b| b.to_vec()),
+                                            })
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            })
+                            .await;
+                        });
+                    }
+                    None => {
+                        info!("transport shut down, exiting accept loop");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     // Print join command for other nodes.
