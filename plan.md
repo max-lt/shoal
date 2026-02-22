@@ -164,23 +164,25 @@ pub struct NodeConfig {
 
 1. Client sends PUT via S3 API
 2. Object data is chunked into fixed-size chunks (size depends on config)
-3. Each chunk → Reed-Solomon encode → k data shards + m parity shards
-4. Each shard is BLAKE3-hashed to get its ShardId
-5. Placement ring determines which nodes own each shard
-6. Shards are transferred to owner nodes via iroh QUIC streams
-7. Manifest is built, serialized with postcard, then itself stored as a regular erasure-coded object (chunked → RS encoded → distributed)
-8. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
-9. Every object, regardless of size, goes through this same pipeline — no inline shortcut
+3. Determine local zone from this node's topology + `ReplicationBoundary`
+4. Each chunk → Reed-Solomon encode → k data shards + m parity shards
+5. Each shard is BLAKE3-hashed to get its ShardId
+6. Distribute shards via local zone's ring
+7. Build manifest → gossip broadcast to ALL nodes (all zones)
+8. ACK to client per `ZoneWriteAck` policy
+9. Background (`ZoneReplicator` in `shoal-engine`, Milestone 11):
+   → Send full chunk data to other zones
+   → Each remote zone EC-encodes independently via its own ring
+10. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
+11. Every object, regardless of size, goes through this same pipeline — no inline shortcut
 
 ### Read Path
 
 1. Client sends GET via S3 API
-2. Look up ObjectId in local Fjall index by bucket/key
-3. Fetch manifest shards from cluster → RS decode → deserialize Manifest
-4. For each chunk: determine shard locations via placement ring
-5. Fetch k shards (minimum needed) from owner nodes in parallel
-6. Reed-Solomon decode to reconstruct chunk
-7. Stream reconstructed chunks to client
+2. Look up manifest in local Fjall (always available via gossip)
+3. Fetch shards from LOCAL zone's ring only
+4. EC decode → stream reconstructed chunks to client
+5. Never crosses zone boundaries for normal reads
 
 ### Node Join
 
@@ -804,4 +806,4 @@ Small objects (smaller than `chunk_size`) are packed together into shared chunks
 - No versioning (later)
 - No lifecycle policies (later)
 - No `io_uring` / `O_DIRECT` backend (later, behind feature flag)
-- No cross-region replication (later)
+- No `ZoneReplicator` implementation yet (Milestone 11) — cross-zone replication is designed but not yet coded

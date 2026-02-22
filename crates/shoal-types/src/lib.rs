@@ -131,6 +131,60 @@ pub struct ShardMeta {
 }
 
 // ---------------------------------------------------------------------------
+// Topology
+// ---------------------------------------------------------------------------
+
+/// Physical location of a node in the infrastructure hierarchy.
+///
+/// Used for failure-domain-aware shard placement and zone-scoped replication.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeTopology {
+    /// Region name (e.g. "eu-west", "us-east").
+    pub region: String,
+    /// Datacenter within the region (e.g. "ovh-rbx", "aws-euw1a").
+    pub datacenter: String,
+    /// Machine identifier within the datacenter (e.g. "node-07").
+    pub machine: String,
+}
+
+impl Default for NodeTopology {
+    fn default() -> Self {
+        Self {
+            region: "default".to_string(),
+            datacenter: "default".to_string(),
+            machine: "default".to_string(),
+        }
+    }
+}
+
+/// Where erasure coding stops and full replication begins.
+///
+/// Within a zone, shards are spread via erasure coding (space-efficient).
+/// Across zones, full chunk data is replicated (each zone EC-encodes independently).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplicationBoundary {
+    /// EC stays within a single datacenter. Full replica across DCs.
+    Datacenter,
+    /// EC can span DCs within a region. Full replica across regions.
+    /// This is the default — good for multi-DC single-region setups.
+    #[default]
+    Region,
+}
+
+/// When to ACK a write to the client.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZoneWriteAck {
+    /// ACK as soon as the local zone has stored all shards. Fast, but
+    /// there is a window where data exists in only one zone.
+    #[default]
+    Local,
+    /// ACK after N zones have confirmed. E.g. `Quorum(2)` with 3 zones.
+    Quorum(u8),
+    /// ACK after ALL zones have confirmed. Slowest, maximum durability.
+    All,
+}
+
+// ---------------------------------------------------------------------------
 // Cluster types
 // ---------------------------------------------------------------------------
 
@@ -145,6 +199,8 @@ pub struct Member {
     pub state: MemberState,
     /// Incarnation number, incremented on each restart.
     pub generation: u64,
+    /// Physical location in the infrastructure hierarchy.
+    pub topology: NodeTopology,
 }
 
 /// Membership state of a cluster node as determined by the SWIM protocol.
@@ -229,6 +285,10 @@ pub struct NodeConfig {
     pub repair_concurrent_transfers: u16,
     /// Interval in milliseconds between gossip rounds.
     pub gossip_interval_ms: u32,
+    /// Zone boundary for erasure coding vs full replication.
+    pub replication_boundary: ReplicationBoundary,
+    /// When to ACK writes to the client relative to zone replication.
+    pub zone_write_ack: ZoneWriteAck,
 }
 
 impl Default for NodeConfig {
@@ -241,6 +301,8 @@ impl Default for NodeConfig {
             repair_max_bandwidth: 104_857_600, // 100 MB/s
             repair_concurrent_transfers: 8,
             gossip_interval_ms: 1_000,
+            replication_boundary: ReplicationBoundary::default(),
+            zone_write_ack: ZoneWriteAck::default(),
         }
     }
 }
@@ -447,6 +509,11 @@ mod tests {
             capacity: 1_000_000_000,
             state: MemberState::Alive,
             generation: 1,
+            topology: NodeTopology {
+                region: "eu-west".to_string(),
+                datacenter: "ovh-rbx".to_string(),
+                machine: "node-07".to_string(),
+            },
         };
         let encoded = postcard::to_allocvec(&member).unwrap();
         let decoded: Member = postcard::from_bytes(&encoded).unwrap();
@@ -470,6 +537,7 @@ mod tests {
                 capacity: 500_000,
                 state: MemberState::Alive,
                 generation: 1,
+                topology: NodeTopology::default(),
             }),
             ClusterEvent::NodeLeft(NodeId::from_data(b"node-2")),
             ClusterEvent::NodeDead(NodeId::from_data(b"node-3")),
@@ -535,5 +603,72 @@ mod tests {
         assert_eq!(config.repair_max_bandwidth, 104_857_600);
         assert_eq!(config.repair_concurrent_transfers, 8);
         assert_eq!(config.gossip_interval_ms, 1_000);
+        assert_eq!(config.replication_boundary, ReplicationBoundary::Region);
+        assert_eq!(config.zone_write_ack, ZoneWriteAck::Local);
+    }
+
+    // --- Zone-aware type tests ---
+
+    #[test]
+    fn test_node_topology_roundtrip_postcard() {
+        let topo = NodeTopology {
+            region: "us-east".to_string(),
+            datacenter: "aws-use1a".to_string(),
+            machine: "i-abc123".to_string(),
+        };
+        let encoded = postcard::to_allocvec(&topo).unwrap();
+        let decoded: NodeTopology = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(topo, decoded);
+    }
+
+    #[test]
+    fn test_node_topology_default() {
+        let topo = NodeTopology::default();
+        assert_eq!(topo.region, "default");
+        assert_eq!(topo.datacenter, "default");
+        assert_eq!(topo.machine, "default");
+    }
+
+    #[test]
+    fn test_replication_boundary_roundtrip_postcard() {
+        for boundary in [ReplicationBoundary::Datacenter, ReplicationBoundary::Region] {
+            let encoded = postcard::to_allocvec(&boundary).unwrap();
+            let decoded: ReplicationBoundary = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(boundary, decoded);
+        }
+    }
+
+    #[test]
+    fn test_zone_write_ack_roundtrip_postcard() {
+        for ack in [
+            ZoneWriteAck::Local,
+            ZoneWriteAck::Quorum(2),
+            ZoneWriteAck::All,
+        ] {
+            let encoded = postcard::to_allocvec(&ack).unwrap();
+            let decoded: ZoneWriteAck = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(ack, decoded);
+        }
+    }
+
+    #[test]
+    fn test_member_with_topology_roundtrip() {
+        let member = Member {
+            node_id: NodeId::from_data(b"topo-node"),
+            capacity: 10_000_000_000,
+            state: MemberState::Alive,
+            generation: 3,
+            topology: NodeTopology {
+                region: "ap-southeast".to_string(),
+                datacenter: "sg-1".to_string(),
+                machine: "rack-04-slot-12".to_string(),
+            },
+        };
+        let encoded = postcard::to_allocvec(&member).unwrap();
+        let decoded: Member = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(member, decoded);
+        assert_eq!(decoded.topology.region, "ap-southeast");
+        assert_eq!(decoded.topology.datacenter, "sg-1");
+        assert_eq!(decoded.topology.machine, "rack-04-slot-12");
     }
 }
