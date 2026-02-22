@@ -1,6 +1,6 @@
 # Shoal
 
-Distributed, self-healing object storage engine written in **100% pure Rust**.
+Distributed, self-healing object storage engine written in Rust.
 
 Shoal is a lightweight, peer-to-peer alternative to S3-compatible storage that can run anywhere — from a Raspberry Pi with an SD card to a 128-core datacenter server with NVMe arrays. Nodes discover each other automatically, form a cluster, distribute data using erasure coding, and self-repair when nodes join or leave.
 
@@ -8,7 +8,7 @@ The name comes from a **shoal of fish** — lightweight individual units that mo
 
 ## Design Principles
 
-- **Pure Rust** — Zero C/C++ bindings. Zero `cc` build scripts. Cross-compilation is trivial.
+- **No C dependencies** — Zero C/C++ bindings. Cross-compilation is trivial.
 - **Adaptive** — Same binary runs on a Raspberry Pi 4 and a datacenter monster. Config adapts to available resources.
 - **Self-healing** — Nodes join and leave. The cluster detects failures, rebalances, and repairs automatically.
 - **Content-addressed** — All data is identified by its BLAKE3 hash. Integrity is verifiable at every layer.
@@ -68,7 +68,7 @@ tests/
 
 ## Technology Stack
 
-All dependencies are pure Rust — no C/C++ bindings anywhere.
+No C/C++ bindings in the dependency tree.
 
 | Purpose          | Crate               |
 | ---------------- | -------------------- |
