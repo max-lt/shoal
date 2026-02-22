@@ -218,7 +218,7 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     // --- Metadata store ---
     let meta = if memory_mode {
         info!("using in-memory metadata store");
-        Arc::new(MetaStore::open_temporary().context("failed to open temporary metadata store")?)
+        Arc::new(MetaStore::in_memory())
     } else {
         let meta_path = config.node.data_dir.join("meta");
         Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?)
