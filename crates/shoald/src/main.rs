@@ -75,6 +75,10 @@ enum Commands {
         /// Can be specified multiple times.
         #[arg(short, long)]
         seed: Vec<String>,
+
+        /// Run fully in-memory (no disk persistence).
+        #[arg(short, long)]
+        memory: bool,
     },
 
     /// Show cluster status from the local metadata store.
@@ -120,6 +124,7 @@ async fn main() -> Result<()> {
             data_dir,
             s3_listen_addr,
             seed,
+            memory,
         } => {
             // CLI args override config file values.
             if let Some(dir) = data_dir {
@@ -131,6 +136,9 @@ async fn main() -> Result<()> {
             // Merge CLI seeds with config seeds.
             if !seed.is_empty() {
                 config.cluster.seeds = seed;
+            }
+            if memory {
+                config.storage.backend = "memory".to_string();
             }
             cmd_start(config).await
         }
@@ -168,11 +176,25 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         "node configuration"
     );
 
-    // Create data directory.
-    std::fs::create_dir_all(&config.node.data_dir).context("failed to create data directory")?;
+    let memory_mode = config.storage.backend == "memory";
+
+    // Create data directory (skip in memory mode).
+    if !memory_mode {
+        std::fs::create_dir_all(&config.node.data_dir)
+            .context("failed to create data directory")?;
+    }
 
     // --- Node identity (iroh SecretKey) ---
-    let secret_key = load_or_create_secret_key(&config.node.data_dir)?;
+    let secret_key = if memory_mode {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let key = SecretKey::from(bytes);
+        info!("generated ephemeral node key (memory mode)");
+        key
+    } else {
+        load_or_create_secret_key(&config.node.data_dir)?
+    };
     let public_key = secret_key.public();
     let node_id = NodeId::from(*public_key.as_bytes());
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
@@ -194,8 +216,13 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     }
 
     // --- Metadata store ---
-    let meta_path = config.node.data_dir.join("meta");
-    let meta = Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?);
+    let meta = if memory_mode {
+        info!("using in-memory metadata store");
+        Arc::new(MetaStore::open_temporary().context("failed to open temporary metadata store")?)
+    } else {
+        let meta_path = config.node.data_dir.join("meta");
+        Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?)
+    };
 
     // --- Shard store ---
     let store: Arc<dyn ShardStore> = match config.storage.backend.as_str() {
