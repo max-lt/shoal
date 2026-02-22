@@ -200,8 +200,15 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
     // --- Network transport (iroh QUIC) ---
+    // Derive a cluster-specific ALPN from the shared secret so that nodes
+    // with different secrets cannot even establish QUIC connections.
+    let cluster_alpn = shoal_net::cluster_alpn(config.cluster.secret.as_bytes());
+    info!(
+        cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
+        "cluster identity derived from secret"
+    );
     let transport = Arc::new(
-        ShoalTransport::bind(secret_key, iroh::RelayMode::Default)
+        ShoalTransport::bind_with_alpn(secret_key, iroh::RelayMode::Default, cluster_alpn)
             .await
             .context("failed to bind iroh endpoint")?,
     );

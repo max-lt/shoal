@@ -3524,6 +3524,7 @@ dependencies = [
 name = "shoal-net"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "iroh",
  "iroh-quinn",
