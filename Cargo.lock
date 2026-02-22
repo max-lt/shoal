@@ -3417,11 +3417,18 @@ name = "shoal-s3"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "blake3",
+ "bytes",
+ "http-body-util",
  "serde",
+ "shoal-cluster",
  "shoal-engine",
+ "shoal-meta",
+ "shoal-store",
  "shoal-types",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
 ]
 

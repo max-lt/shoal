@@ -7,7 +7,16 @@ edition.workspace = true
 shoal-types = { workspace = true }
 shoal-engine = { workspace = true }
 axum = { workspace = true }
+blake3 = { workspace = true }
+bytes = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+shoal-cluster = { workspace = true }
+shoal-meta = { workspace = true }
+shoal-store = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
