@@ -465,7 +465,7 @@ Connect store + cas + erasure + placement + meta into a working local write/read
 
 Network protocol on top of iroh.
 
-- [ ] Define protocol messages (postcard-serialized):
+- [x] Define protocol messages (postcard-serialized):
 
   ```rust
   pub enum ShoalMessage {
@@ -486,25 +486,25 @@ Network protocol on top of iroh.
   }
   ```
 
-- [ ] Implement `ShoalTransport`:
+- [x] Implement `ShoalTransport`:
   - Wraps an `iroh::Endpoint`
   - `send_message(node_id, message)` — opens a QUIC stream, sends postcard-encoded message
   - `recv_message(stream)` — reads and decodes
   - Handles connection pooling (reuse connections to same node)
-- [ ] Implement shard transfer:
+- [x] Implement shard transfer:
   - `push_shard(node_id, shard_id, data)` — sends shard to a node
   - `pull_shard(node_id, shard_id)` — requests a shard from a node
   - **End-to-end integrity** (see Production Hardening): Receiver verifies blake3 hash matches shard_id before accepting. Requester verifies pull responses. Manifest gossip verifies ObjectId = blake3(serialized manifest). Reject on mismatch, try another node.
-- [ ] Define ALPN protocol identifier: `b"shoal/0"`
-- [ ] Implement request handler that dispatches incoming messages
+- [x] Define ALPN protocol identifier: `b"shoal/0"`
+- [x] Implement request handler that dispatches incoming messages
 
 **Tests**:
 
-- [ ] Spin up 2 iroh endpoints in-process
-- [ ] Send a shard from node A to node B, verify it arrives intact
-- [ ] Pull a shard from node B, verify it matches
-- [ ] Send corrupted shard (wrong data for the shard_id) → receiver rejects
-- [ ] `cargo test -p shoal-net` passes
+- [x] Spin up 2 iroh endpoints in-process
+- [x] Send a shard from node A to node B, verify it arrives intact
+- [x] Pull a shard from node B, verify it matches
+- [x] Send corrupted shard (wrong data for the shard_id) → receiver rejects
+- [x] `cargo test -p shoal-net` passes
 
 ---
 

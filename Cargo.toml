@@ -44,8 +44,8 @@ fjall = "3"
 reed-solomon-simd = "3"
 
 # Networking
-iroh = "0.35"
-iroh-gossip = { version = "0.35", features = ["net"] }
+iroh = "0.96"
+iroh-gossip = { version = "0.96", features = ["net"] }
 
 # Membership
 foca = "0.17"
