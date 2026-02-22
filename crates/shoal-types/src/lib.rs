@@ -204,17 +204,20 @@ impl Default for ErasureConfig {
         Self {
             k: 4,
             m: 2,
-            chunk_size: 1_048_576, // 1 MB
+            chunk_size: 262_144, // 256 KB
         }
     }
 }
 
 /// Adaptive node configuration that adjusts to available hardware.
+///
+/// Every object goes through the same pipeline regardless of size:
+/// chunking → erasure coding → shard distribution via the placement ring.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Which storage backend to use.
     pub storage_backend: StorageBackend,
-    /// Chunk size in bytes (256 KB on RPi, up to 4 MB on datacenter).
+    /// Chunk size in bytes (128 KB on RPi, 256 KB default, up to 4 MB on datacenter).
     pub chunk_size: u32,
     /// Number of data shards for erasure coding.
     pub erasure_k: u8,
@@ -226,21 +229,18 @@ pub struct NodeConfig {
     pub repair_concurrent_transfers: u16,
     /// Interval in milliseconds between gossip rounds.
     pub gossip_interval_ms: u32,
-    /// Objects smaller than this threshold are stored inline in metadata.
-    pub inline_threshold: u32,
 }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         Self {
             storage_backend: StorageBackend::File,
-            chunk_size: 1_048_576, // 1 MB
+            chunk_size: 262_144, // 256 KB
             erasure_k: 4,
             erasure_m: 2,
             repair_max_bandwidth: 104_857_600, // 100 MB/s
             repair_concurrent_transfers: 8,
             gossip_interval_ms: 1_000,
-            inline_threshold: 4_096, // 4 KB
         }
     }
 }
@@ -522,19 +522,18 @@ mod tests {
         let config = ErasureConfig::default();
         assert_eq!(config.k, 4);
         assert_eq!(config.m, 2);
-        assert_eq!(config.chunk_size, 1_048_576);
+        assert_eq!(config.chunk_size, 262_144);
     }
 
     #[test]
     fn test_node_config_default() {
         let config = NodeConfig::default();
         assert_eq!(config.storage_backend, StorageBackend::File);
-        assert_eq!(config.chunk_size, 1_048_576);
+        assert_eq!(config.chunk_size, 262_144);
         assert_eq!(config.erasure_k, 4);
         assert_eq!(config.erasure_m, 2);
         assert_eq!(config.repair_max_bandwidth, 104_857_600);
         assert_eq!(config.repair_concurrent_transfers, 8);
         assert_eq!(config.gossip_interval_ms, 1_000);
-        assert_eq!(config.inline_threshold, 4_096);
     }
 }
