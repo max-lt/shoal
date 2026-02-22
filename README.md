@@ -110,7 +110,7 @@ Milestones 0–7 are complete. The core data pipeline works end-to-end in local 
 | 8         | `shoal-net`      | Next   | —     |
 | 9–15      | Cluster, repair, engine, S3, CLI | Planned | — |
 
-See [plan.md](plan.md) for the full architecture and implementation roadmap.
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed architecture reference and [plan.md](plan.md) for the implementation roadmap.
 
 ## License
 
