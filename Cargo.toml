@@ -11,7 +11,7 @@ members = [
     "crates/shoal-net",
     "crates/shoal-engine",
     "crates/shoal-s3",
-    "crates/shoal-cli",
+    "crates/shoald",
     "tests",
 ]
 resolver = "3"
@@ -67,8 +67,13 @@ async-trait = "0.1"
 # Buffers
 bytes = "1"
 
+# CLI
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+
 # Observability
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 thiserror = "2"
