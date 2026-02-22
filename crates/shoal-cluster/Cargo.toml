@@ -1,0 +1,18 @@
+[package]
+name = "shoal-cluster"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shoal-types = { workspace = true }
+shoal-meta = { workspace = true }
+shoal-placement = { workspace = true }
+shoal-net = { workspace = true }
+foca = { workspace = true }
+iroh = { workspace = true }
+iroh-gossip = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

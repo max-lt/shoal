@@ -1,0 +1,13 @@
+[package]
+name = "shoal-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shoal-types = { workspace = true }
+iroh = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

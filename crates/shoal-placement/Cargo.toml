@@ -1,0 +1,9 @@
+[package]
+name = "shoal-placement"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shoal-types = { workspace = true }
+blake3 = { workspace = true }
+tracing = { workspace = true }

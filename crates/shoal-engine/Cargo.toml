@@ -1,0 +1,19 @@
+[package]
+name = "shoal-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+shoal-types = { workspace = true }
+shoal-store = { workspace = true }
+shoal-cas = { workspace = true }
+shoal-meta = { workspace = true }
+shoal-erasure = { workspace = true }
+shoal-placement = { workspace = true }
+shoal-cluster = { workspace = true }
+shoal-repair = { workspace = true }
+shoal-net = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
