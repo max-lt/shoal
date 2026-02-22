@@ -1,6 +1,77 @@
-[package]
-name = "shoal"
+[workspace]
+members = [
+    "crates/shoal-types",
+    "crates/shoal-store",
+    "crates/shoal-cas",
+    "crates/shoal-meta",
+    "crates/shoal-erasure",
+    "crates/shoal-placement",
+    "crates/shoal-cluster",
+    "crates/shoal-repair",
+    "crates/shoal-net",
+    "crates/shoal-engine",
+    "crates/shoal-s3",
+    "crates/shoal-cli",
+]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 
-[dependencies]
+[workspace.dependencies]
+# Internal crates
+shoal-types = { path = "crates/shoal-types" }
+shoal-store = { path = "crates/shoal-store" }
+shoal-cas = { path = "crates/shoal-cas" }
+shoal-meta = { path = "crates/shoal-meta" }
+shoal-erasure = { path = "crates/shoal-erasure" }
+shoal-placement = { path = "crates/shoal-placement" }
+shoal-cluster = { path = "crates/shoal-cluster" }
+shoal-repair = { path = "crates/shoal-repair" }
+shoal-net = { path = "crates/shoal-net" }
+shoal-engine = { path = "crates/shoal-engine" }
+shoal-s3 = { path = "crates/shoal-s3" }
+
+# Hashing
+blake3 = "1"
+
+# Metadata DB
+fjall = "3"
+
+# Erasure coding
+reed-solomon-simd = "3"
+
+# Networking
+iroh = "0.35"
+iroh-gossip = { version = "0.35", features = ["net"] }
+
+# Membership
+foca = "0.17"
+
+# Serialization
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+
+# HTTP
+axum = "0.8"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Buffers
+bytes = "1"
+
+# Observability
+tracing = "0.1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# System
+libc = "0.2"
+
+# Testing
+tempfile = "3"

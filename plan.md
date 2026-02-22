@@ -75,7 +75,7 @@ All dependencies are pure Rust:
 
 ### Why these choices?
 
-- **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing when thousands of shard locations update. Keyspaces give clean separation. Key-value separation handles inlined small objects.
+- **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing when thousands of shard locations update. Keyspaces give clean separation. Fjall is a local cache/index, not the source of truth — everything is reconstructible from the cluster.
 - **foca over custom SWIM**: Production-grade SWIM+Inf.+Susp. implementation, `no_std` compatible, pluggable transport. We pipe foca messages over iroh connections.
 - **iroh-gossip over foca for broadcast**: foca handles membership/failure detection; iroh-gossip handles event dissemination (new shard available, repair needed, etc). Different tools for different jobs.
 - **Custom shard transfer over iroh-blobs**: iroh-blobs post-0.35 is marked "not production quality". We build a simple shard transfer protocol on iroh QUIC streams instead.
@@ -149,13 +149,12 @@ pub struct Member {
 // === Adaptive config ===
 pub struct NodeConfig {
     pub storage_backend: StorageBackend,   // Memory | File | Direct(io_uring)
-    pub chunk_size: u32,                    // 256KB (RPi) .. 4MB (datacenter)
+    pub chunk_size: u32,                    // 128KB (RPi) .. 256KB (default) .. 4MB (datacenter)
     pub erasure_k: u8,                      // data shards (2..16)
     pub erasure_m: u8,                      // parity shards (1..8)
     pub repair_max_bandwidth: u64,          // bytes/sec for repair traffic
     pub repair_concurrent_transfers: u16,   // 1 (RPi) .. 64 (datacenter)
     pub gossip_interval_ms: u32,
-    pub inline_threshold: u32,              // objects < this go directly in Fjall
 }
 ```
 
@@ -164,23 +163,24 @@ pub struct NodeConfig {
 ### Write Path
 
 1. Client sends PUT via S3 API
-2. Object is chunked into fixed-size chunks (size depends on config)
-3. If object size < `inline_threshold`, store directly in Fjall metadata — skip erasure/sharding
-4. Each chunk → Reed-Solomon encode → k data shards + m parity shards
-5. Each shard is BLAKE3-hashed to get its ShardId
-6. Placement ring determines which nodes own each shard
-7. Shards are transferred to owner nodes via iroh QUIC streams
-8. Manifest is written to Fjall once all shards are confirmed stored
-9. Manifest is broadcast via gossip so all nodes know about the object
+2. Object data is chunked into fixed-size chunks (size depends on config)
+3. Each chunk → Reed-Solomon encode → k data shards + m parity shards
+4. Each shard is BLAKE3-hashed to get its ShardId
+5. Placement ring determines which nodes own each shard
+6. Shards are transferred to owner nodes via iroh QUIC streams
+7. Manifest is built, serialized with postcard, then itself stored as a regular erasure-coded object (chunked → RS encoded → distributed)
+8. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
+9. Every object, regardless of size, goes through this same pipeline — no inline shortcut
 
 ### Read Path
 
 1. Client sends GET via S3 API
-2. Look up Manifest in Fjall by object key
-3. For each chunk: determine shard locations via placement ring
-4. Fetch k shards (minimum needed) from owner nodes in parallel
-5. Reed-Solomon decode to reconstruct chunk
-6. Stream reconstructed chunks to client
+2. Look up ObjectId in local Fjall index by bucket/key
+3. Fetch manifest shards from cluster → RS decode → deserialize Manifest
+4. For each chunk: determine shard locations via placement ring
+5. Fetch k shards (minimum needed) from owner nodes in parallel
+6. Reed-Solomon decode to reconstruct chunk
+7. Stream reconstructed chunks to client
 
 ### Node Join
 
@@ -189,6 +189,8 @@ pub struct NodeConfig {
 3. All nodes recompute placement ring
 4. Ring diff identifies shards that must move to the new node
 5. Rebalancing transfers shards gradually (throttled)
+6. As manifest shards arrive, node decodes them and populates its local Fjall index
+7. Node is fully operational once rebalancing completes
 
 ### Node Failure
 
@@ -468,46 +470,46 @@ Consistent hashing ring for deterministic shard placement.
 
 Metadata store wrapping Fjall for persistent state.
 
+**Important**: Fjall is a **local cache and index**, never the source of truth for user data.
+Everything in Fjall is reconstructible from the cluster. Manifests are themselves stored
+as regular erasure-coded objects in the cluster. If Fjall is lost, the node can reconstruct
+its index by scanning manifest shards from the cluster.
+
 - [ ] Initialize Fjall `Database` with the following keyspaces:
-  - `manifests` — ObjectId → serialized Manifest
-  - `objects` — user key (bucket/key string) → ObjectId (the S3 key mapping)
-  - `shardmap` — ShardId → serialized list of NodeIds (current owners)
-  - `membership` — NodeId → serialized Member
-  - `repair_queue` — ShardId → priority (u64, lower = more urgent)
-  - `inline_objects` — user key → raw data (for objects below inline threshold)
+  - `objects` — user key (bucket/key string) → ObjectId — **CACHE**, reconstructible from manifests in the cluster
+  - `manifests` — ObjectId → serialized Manifest — **CACHE**, the manifest itself is stored as a regular erasure-coded object in the cluster
+  - `shardmap` — ShardId → serialized list of NodeIds (current owners) — **CACHE**, derived from placement ring computation
+  - `membership` — NodeId → serialized Member — **CACHE**, derived from foca/gossip
+  - `repair_queue` — ShardId → priority (u64, lower = more urgent) — **LOCAL**, transient, rebuilt on restart by anti-entropy scan
 - [ ] Implement typed accessors for each keyspace:
 
   ```rust
   pub struct MetaStore { db: fjall::Database, /* keyspaces */ }
   impl MetaStore {
-      // Manifests
+      // Manifests (local cache)
       pub fn put_manifest(&self, manifest: &Manifest) -> Result<()>;
       pub fn get_manifest(&self, id: &ObjectId) -> Result<Option<Manifest>>;
 
-      // Object key mapping
+      // Object key mapping (local cache)
       pub fn put_object_key(&self, bucket: &str, key: &str, id: &ObjectId) -> Result<()>;
       pub fn get_object_key(&self, bucket: &str, key: &str) -> Result<Option<ObjectId>>;
       pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
       pub fn delete_object_key(&self, bucket: &str, key: &str) -> Result<()>;
 
-      // Shard map
+      // Shard map (local cache)
       pub fn put_shard_owners(&self, id: &ShardId, owners: &[NodeId]) -> Result<()>;
       pub fn get_shard_owners(&self, id: &ShardId) -> Result<Option<Vec<NodeId>>>;
 
-      // Membership
+      // Membership (local cache)
       pub fn put_member(&self, member: &Member) -> Result<()>;
       pub fn get_member(&self, id: &NodeId) -> Result<Option<Member>>;
       pub fn list_members(&self) -> Result<Vec<Member>>;
       pub fn remove_member(&self, id: &NodeId) -> Result<()>;
 
-      // Repair queue
+      // Repair queue (local, transient)
       pub fn enqueue_repair(&self, id: &ShardId, priority: u64) -> Result<()>;
       pub fn dequeue_repair(&self) -> Result<Option<ShardId>>;
       pub fn repair_queue_len(&self) -> Result<usize>;
-
-      // Inline objects
-      pub fn put_inline(&self, bucket: &str, key: &str, data: &[u8]) -> Result<()>;
-      pub fn get_inline(&self, bucket: &str, key: &str) -> Result<Option<Vec<u8>>>;
   }
   ```
 
@@ -522,7 +524,6 @@ Metadata store wrapping Fjall for persistent state.
 - [ ] Shard owners put/get
 - [ ] Member CRUD
 - [ ] Repair queue: enqueue, dequeue in priority order, len
-- [ ] Inline objects put/get
 - [ ] Persistence: write, drop store, reopen, read back
 - [ ] `cargo test -p shoal-meta` passes
 
@@ -707,11 +708,9 @@ The node orchestrator that ties everything together.
   6. Start repair detector + scheduler + executor as background tasks
   7. Start incoming message handler
 - [ ] `ShoalNode::put_object(bucket, key, data, metadata)`:
-  - Full write path: chunk → erasure → distribute → manifest → store key mapping
-  - If data.len() < inline_threshold → store inline in Fjall
+  - Full write path: chunk → erasure → distribute shards → build manifest → store manifest as erasure-coded object → update local Fjall index
 - [ ] `ShoalNode::get_object(bucket, key)`:
-  - Full read path: lookup → fetch shards → decode → return
-  - If inline → read directly from Fjall
+  - Full read path: lookup ObjectId in Fjall → fetch manifest shards → decode manifest → fetch data shards → decode → return
 - [ ] `ShoalNode::delete_object(bucket, key)`:
   - Remove manifest and key mapping
   - Enqueue shard cleanup (background)
@@ -722,7 +721,7 @@ The node orchestrator that ties everything together.
 - [ ] Start a single node, put object, get object → matches
 - [ ] Start 3 nodes, put object, get from any node → matches
 - [ ] Start 3 nodes, put object, stop 1 node, get from surviving node → works (after repair)
-- [ ] Inline objects: small object put/get bypasses erasure coding
+- [ ] Small objects: put/get a tiny object (e.g. 10 bytes) → same pipeline, still works
 - [ ] Delete object: key no longer resolves
 - [ ] Graceful shutdown and restart: data persists
 - [ ] `cargo test -p shoal-engine` passes
@@ -779,8 +778,7 @@ The binary that brings it all together.
 
   [storage]
   backend = "file"  # or "memory"
-  chunk_size = 1048576
-  inline_threshold = 4096
+  chunk_size = 262144
 
   [erasure]
   k = 4
@@ -889,7 +887,7 @@ Full cluster tests with real networking.
 - On writes: pipeline the erasure encoding — start encoding chunk N+1 while chunk N's shards are being distributed
 - On reads: fetch shards in parallel across nodes
 - Repair: always respect the rate limiter, never starve client traffic
-- Small objects (< inline_threshold): bypass the entire erasure pipeline
+- All objects, regardless of size, go through the same pipeline (no inline shortcut)
 
 ### Things NOT to do yet
 

@@ -1,6 +1,6 @@
 # Shoal — Distributed Object Storage Engine
 
-100% pure Rust. Zero C bindings. See @SHOAL.md for full architecture and implementation plan.
+100% pure Rust. Zero C bindings. See @plan.md for full architecture and implementation plan.
 
 ## Build & Test
 
@@ -63,7 +63,7 @@ IMPORTANT: Never add a dependency that requires C/C++ compilation or `cc` build 
 
 ## Workflow
 
-This project is built milestone by milestone. See @SHOAL.md for the full plan with checkboxes.
+This project is built milestone by milestone. See @plan.md for the full plan with checkboxes.
 
 1. Implement only the milestone you are asked to work on
 2. After completing a milestone, run ALL tests for the affected crates
@@ -78,7 +78,7 @@ This project is built milestone by milestone. See @SHOAL.md for the full plan wi
 - Use `tempfile` crate for tests that need filesystem
 - Use `tokio::test` for async tests
 - Name tests descriptively: `test_put_get_roundtrip`, `test_decode_with_missing_shards`
-- Every milestone has explicit test requirements in SHOAL.md — implement ALL of them
+- Every milestone has explicit test requirements in plan.md — implement ALL of them
 
 ## Common Patterns
 
