@@ -3309,6 +3309,8 @@ name = "shoal-engine"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "iroh",
  "shoal-cas",
  "shoal-cluster",
  "shoal-erasure",
@@ -3318,6 +3320,7 @@ dependencies = [
  "shoal-repair",
  "shoal-store",
  "shoal-types",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
