@@ -17,6 +17,7 @@ shoal-types = { workspace = true }
 anyhow = { workspace = true }
 blake3 = { workspace = true }
 clap = { workspace = true }
+dirs = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
