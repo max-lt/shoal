@@ -12,6 +12,7 @@ members = [
     "crates/shoal-engine",
     "crates/shoal-s3",
     "crates/shoal-cli",
+    "tests",
 ]
 resolver = "3"
 

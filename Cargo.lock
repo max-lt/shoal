@@ -3392,6 +3392,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "shoal-integration-tests"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "shoal-cas",
+ "shoal-erasure",
+ "shoal-meta",
+ "shoal-placement",
+ "shoal-store",
+ "shoal-types",
+ "tokio",
+]
+
+[[package]]
 name = "shoal-meta"
 version = "0.1.0"
 dependencies = [

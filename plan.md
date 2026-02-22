@@ -358,7 +358,7 @@ Consistent hashing ring for deterministic shard placement (~150 lines).
 
 ---
 
-## Milestone 6 — `shoal-meta`
+## Milestone 6 — `shoal-meta` ✅
 
 Metadata store wrapping Fjall for persistent state.
 
@@ -367,13 +367,13 @@ Everything in Fjall is reconstructible from the cluster. Manifests are themselve
 as regular erasure-coded objects in the cluster. If Fjall is lost, the node can reconstruct
 its index by scanning manifest shards from the cluster.
 
-- [ ] Initialize Fjall `Database` with the following keyspaces:
+- [x] Initialize Fjall `Database` with the following keyspaces:
   - `objects` — user key (bucket/key string) → ObjectId — **CACHE**, reconstructible from manifests in the cluster
   - `manifests` — ObjectId → serialized Manifest — **CACHE**, the manifest itself is stored as a regular erasure-coded object in the cluster
   - `shardmap` — ShardId → serialized list of NodeIds (current owners) — **CACHE**, derived from placement ring computation
   - `membership` — NodeId → serialized Member — **CACHE**, derived from foca/gossip
   - `repair_queue` — ShardId → priority (u64, lower = more urgent) — **LOCAL**, transient, rebuilt on restart by anti-entropy scan
-- [ ] Implement typed accessors for each keyspace:
+- [x] Implement typed accessors for each keyspace:
 
   ```rust
   pub struct MetaStore { db: fjall::Database, /* keyspaces */ }
@@ -405,27 +405,27 @@ its index by scanning manifest shards from the cluster.
   }
   ```
 
-- [ ] All serialization via postcard
-- [ ] `MetaStore::open(path)` and `MetaStore::open_temporary()` (in-memory for tests)
+- [x] All serialization via postcard
+- [x] `MetaStore::open(path)` and `MetaStore::open_temporary()` (in-memory for tests)
 
 **Tests**:
 
-- [ ] Manifest put/get round-trip
-- [ ] Object key put/get/list/delete
-- [ ] List objects with prefix filtering
-- [ ] Shard owners put/get
-- [ ] Member CRUD
-- [ ] Repair queue: enqueue, dequeue in priority order, len
-- [ ] Persistence: write, drop store, reopen, read back
-- [ ] `cargo test -p shoal-meta` passes
+- [x] Manifest put/get round-trip
+- [x] Object key put/get/list/delete
+- [x] List objects with prefix filtering
+- [x] Shard owners put/get
+- [x] Member CRUD
+- [x] Repair queue: enqueue, dequeue in priority order, len
+- [x] Persistence: write, drop store, reopen, read back
+- [x] `cargo test -p shoal-meta` passes
 
 ---
 
-## Milestone 7 — Full Local Pipeline (Integration)
+## Milestone 7 — Full Local Pipeline (Integration) ✅
 
 Connect store + cas + erasure + placement + meta into a working local write/read pipeline. No networking yet.
 
-- [ ] Create an integration test in `tests/integration/local_pipeline.rs`:
+- [x] Create an integration test in `tests/integration/local_pipeline.rs`:
   1. Create a `NodeConfig` with chunk_size=1024, k=2, m=1
   2. Create 3 `MemoryStore` instances (simulating 3 nodes)
   3. Create a `Ring` with 3 nodes
@@ -446,8 +446,8 @@ Connect store + cas + erasure + placement + meta into a working local write/read
   8. **Total failure**: delete 2 shards per chunk
      - Read should fail gracefully (fewer than k shards)
 
-- [ ] All assertions pass
-- [ ] `cargo test --test local_pipeline` passes
+- [x] All assertions pass
+- [x] `cargo test --test local_pipeline` passes
 
 ---
 
