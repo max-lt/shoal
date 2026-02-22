@@ -15,6 +15,9 @@ use crate::traits::{ShardStore, StorageCapacity};
 ///
 /// Each shard is stored as a file at:
 /// `{base_dir}/{hex(id)[0..2]}/{hex(id)[2..4]}/{hex(id)}`.
+///
+/// Writes are atomic: data is written to a temporary file first, then
+/// renamed into place. This prevents corrupted shards from partial writes.
 pub struct FileStore {
     base_dir: PathBuf,
 }
@@ -43,8 +46,14 @@ impl ShardStore for FileStore {
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        debug!(%id, path = %path.display(), size = data.len(), "storing shard to file");
-        tokio::fs::write(&path, data).await?;
+
+        // Atomic write: write to a temp file in the same directory, then rename.
+        // This ensures we never leave a half-written shard on disk.
+        let tmp_path = path.with_extension("tmp");
+        tokio::fs::write(&tmp_path, data).await?;
+        tokio::fs::rename(&tmp_path, &path).await?;
+
+        debug!(%id, path = %path.display(), size = data.len(), "stored shard to file");
         Ok(())
     }
 
@@ -71,7 +80,11 @@ impl ShardStore for FileStore {
 
     async fn contains(&self, id: ShardId) -> Result<bool, StoreError> {
         let path = self.shard_path(&id);
-        Ok(path.exists())
+        match tokio::fs::metadata(&path).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StoreError::Io(e)),
+        }
     }
 
     async fn list(&self) -> Result<Vec<ShardId>, StoreError> {
@@ -107,8 +120,10 @@ impl ShardStore for FileStore {
     }
 
     async fn capacity(&self) -> Result<StorageCapacity, StoreError> {
-        let stat = statvfs(&self.base_dir)?;
-        Ok(stat)
+        let path = self.base_dir.clone();
+        tokio::task::spawn_blocking(move || statvfs(&path))
+            .await
+            .map_err(|e| StoreError::Io(std::io::Error::other(e)))?
     }
 
     async fn verify(&self, id: ShardId) -> Result<bool, StoreError> {
@@ -156,6 +171,9 @@ fn statvfs(path: &Path) -> Result<StorageCapacity, StoreError> {
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
+    // SAFETY: `c_path` is a valid null-terminated C string pointing to an existing directory.
+    // `stat` is zero-initialized and passed as an out-parameter. The libc::statvfs call
+    // only writes to `stat` and reads from `c_path`; both are valid for the duration of the call.
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(c_path.as_ptr(), &mut stat) != 0 {
@@ -165,7 +183,7 @@ fn statvfs(path: &Path) -> Result<StorageCapacity, StoreError> {
         let block_size = stat.f_frsize;
         let total = stat.f_blocks * block_size;
         let available = stat.f_bavail * block_size;
-        // used = total - free (f_bfree includes reserved blocks)
+        // f_bfree includes blocks reserved for root; f_bavail is what unprivileged users can use.
         let free = stat.f_bfree * block_size;
         let used = total.saturating_sub(free);
 
@@ -328,5 +346,27 @@ mod tests {
         let id = ShardId::from_data(b"never stored");
         // Should not error.
         store.delete(id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_atomic_write_no_tmp_file_left() {
+        let (store, dir) = make_store().await;
+        let data = b"atomic write test";
+        let id = ShardId::from_data(data);
+
+        store.put(id, data).await.unwrap();
+
+        // Verify no .tmp file remains after successful write.
+        let hex = id.to_string();
+        let tmp_path = dir
+            .path()
+            .join(&hex[0..2])
+            .join(&hex[2..4])
+            .join(format!("{hex}.tmp"));
+        assert!(
+            !tmp_path.exists(),
+            "temp file should not remain after write: {}",
+            tmp_path.display()
+        );
     }
 }

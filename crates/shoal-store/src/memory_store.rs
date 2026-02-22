@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use shoal_types::ShardId;
 use tracing::debug;
@@ -13,9 +14,11 @@ use crate::traits::{ShardStore, StorageCapacity};
 ///
 /// Useful for testing and for nodes configured to run in memory-only mode.
 /// Tracks total bytes stored against a configurable maximum.
+/// Used bytes are maintained incrementally via an atomic counter (O(1) per operation).
 pub struct MemoryStore {
     shards: RwLock<HashMap<ShardId, Vec<u8>>>,
     max_bytes: u64,
+    used_bytes: AtomicU64,
 }
 
 impl MemoryStore {
@@ -24,6 +27,7 @@ impl MemoryStore {
         Self {
             shards: RwLock::new(HashMap::new()),
             max_bytes,
+            used_bytes: AtomicU64::new(0),
         }
     }
 
@@ -32,18 +36,14 @@ impl MemoryStore {
     pub(crate) fn inner(&self) -> &RwLock<HashMap<ShardId, Vec<u8>>> {
         &self.shards
     }
-
-    fn used_bytes_unlocked(map: &HashMap<ShardId, Vec<u8>>) -> u64 {
-        map.values().map(|v| v.len() as u64).sum()
-    }
 }
 
 #[async_trait::async_trait]
 impl ShardStore for MemoryStore {
     async fn put(&self, id: ShardId, data: &[u8]) -> Result<(), StoreError> {
         let mut map = self.shards.write().expect("lock poisoned");
-        let used = Self::used_bytes_unlocked(&map);
         let data_len = data.len() as u64;
+        let used = self.used_bytes.load(Ordering::Relaxed);
 
         // If we're replacing an existing shard, account for freed space.
         let existing_len = map.get(&id).map_or(0, |v| v.len() as u64);
@@ -58,6 +58,9 @@ impl ShardStore for MemoryStore {
 
         debug!(%id, size = data.len(), "storing shard in memory");
         map.insert(id, data.to_vec());
+        // Update used bytes: add new size, subtract old size.
+        self.used_bytes
+            .store(used - existing_len + data_len, Ordering::Relaxed);
         Ok(())
     }
 
@@ -68,7 +71,10 @@ impl ShardStore for MemoryStore {
 
     async fn delete(&self, id: ShardId) -> Result<(), StoreError> {
         let mut map = self.shards.write().expect("lock poisoned");
-        map.remove(&id);
+        if let Some(removed) = map.remove(&id) {
+            self.used_bytes
+                .fetch_sub(removed.len() as u64, Ordering::Relaxed);
+        }
         debug!(%id, "deleted shard from memory");
         Ok(())
     }
@@ -84,8 +90,7 @@ impl ShardStore for MemoryStore {
     }
 
     async fn capacity(&self) -> Result<StorageCapacity, StoreError> {
-        let map = self.shards.read().expect("lock poisoned");
-        let used = Self::used_bytes_unlocked(&map);
+        let used = self.used_bytes.load(Ordering::Relaxed);
         Ok(StorageCapacity {
             total_bytes: self.max_bytes,
             used_bytes: used,
@@ -238,5 +243,33 @@ mod tests {
             result.unwrap_err(),
             StoreError::CapacityExceeded { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn test_capacity_after_delete() {
+        let store = MemoryStore::new(1024);
+        let data = b"track me"; // 8 bytes
+        let id = ShardId::from_data(data);
+
+        store.put(id, data).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 8);
+
+        store.delete(id).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn test_put_overwrite_updates_capacity() {
+        let store = MemoryStore::new(1024);
+        let data_small = b"small";
+        let data_big = b"bigger data here";
+
+        // Use a synthetic ID so we can overwrite with different data.
+        let fixed_id = ShardId::from([0xAA; 32]);
+        store.put(fixed_id, data_small).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 5);
+
+        store.put(fixed_id, data_big).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 16);
     }
 }
