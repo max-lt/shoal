@@ -10,6 +10,12 @@ shoal-meta = { workspace = true }
 shoal-erasure = { workspace = true }
 shoal-placement = { workspace = true }
 shoal-net = { workspace = true }
+shoal-cluster = { workspace = true }
+bytes = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
