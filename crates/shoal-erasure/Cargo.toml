@@ -6,6 +6,10 @@ edition.workspace = true
 [dependencies]
 shoal-types = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 reed-solomon-simd = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
