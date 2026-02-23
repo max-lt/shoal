@@ -118,6 +118,18 @@ pub trait ShardStore: Send + Sync {
 }
 ```
 
+## Bug Fix Workflow
+
+When fixing a reported bug:
+
+1. **Write a failing test first** that reproduces the bug
+2. Run the test to confirm it fails
+3. Apply the fix
+4. Run the test to confirm it passes
+5. Run the full test suite to ensure no regressions
+
+This ensures every bug fix comes with a regression test that prevents the bug from recurring.
+
 ## Things to Avoid
 
 - No `unwrap()` in library code. Use proper error propagation

@@ -12,7 +12,7 @@ use shoal_cas::{Chunker, build_manifest};
 use shoal_cluster::ClusterState;
 use shoal_erasure::ErasureEncoder;
 use shoal_meta::MetaStore;
-use shoal_net::{ShoalMessage, ShoalTransport};
+use shoal_net::{ShoalMessage, Transport};
 use shoal_store::ShardStore;
 use shoal_types::*;
 use tokio::sync::RwLock;
@@ -79,7 +79,7 @@ pub struct ShoalNode {
     /// Per-shard replication factor (how many ring owners per shard).
     shard_replication: usize,
     /// Network transport (None in tests / single-node mode).
-    transport: Option<Arc<ShoalTransport>>,
+    transport: Option<Arc<dyn Transport>>,
     /// NodeId → EndpointAddr mapping for remote nodes.
     address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>,
 }
@@ -109,7 +109,7 @@ impl ShoalNode {
     }
 
     /// Set the network transport for distributed operations.
-    pub fn with_transport(mut self, transport: Arc<ShoalTransport>) -> Self {
+    pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
         self
     }
@@ -313,9 +313,21 @@ impl ShoalNode {
                     continue;
                 }
                 // Try remote if transport available.
-                if let Some(transport) = &self.transport
-                    && let Some(owners) = self.meta.get_shard_owners(&shard_meta.shard_id)?
-                {
+                if let Some(transport) = &self.transport {
+                    // Prefer shard owners from metadata (populated by the
+                    // writer). Fall back to computing from the placement
+                    // ring when metadata is absent — this happens on nodes
+                    // that received the manifest via broadcast without
+                    // shard owner data. The ring is deterministic: every
+                    // node with the same membership computes the same
+                    // placement.
+                    let owners = match self.meta.get_shard_owners(&shard_meta.shard_id)? {
+                        Some(owners) => owners,
+                        None => {
+                            let ring = self.cluster.ring().await;
+                            ring.owners(&shard_meta.shard_id, self.shard_replication)
+                        }
+                    };
                     for owner in &owners {
                         if *owner == self.node_id {
                             continue;

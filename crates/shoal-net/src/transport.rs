@@ -455,3 +455,40 @@ impl ShoalTransport {
         self.endpoint.close().await;
     }
 }
+
+#[async_trait::async_trait]
+impl crate::Transport for ShoalTransport {
+    async fn push_shard(
+        &self,
+        addr: EndpointAddr,
+        shard_id: ShardId,
+        data: Bytes,
+    ) -> Result<(), crate::NetError> {
+        self.push_shard(addr, shard_id, data).await
+    }
+
+    async fn pull_shard(
+        &self,
+        addr: EndpointAddr,
+        shard_id: ShardId,
+    ) -> Result<Option<Bytes>, crate::NetError> {
+        self.pull_shard(addr, shard_id).await
+    }
+
+    async fn send_to(
+        &self,
+        addr: EndpointAddr,
+        msg: &crate::ShoalMessage,
+    ) -> Result<(), crate::NetError> {
+        self.send_to(addr, msg).await
+    }
+
+    async fn pull_manifest(
+        &self,
+        addr: EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, crate::NetError> {
+        self.pull_manifest(addr, bucket, key).await
+    }
+}
