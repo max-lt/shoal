@@ -1,6 +1,6 @@
 # Shoal — Distributed Object Storage Engine
 
-100% pure Rust. Zero C bindings. See @plan.md for full architecture and implementation plan.
+100% pure Rust. Zero C bindings. See @docs/plan.md for full architecture and implementation plan.
 
 ## Build & Test
 
@@ -63,7 +63,7 @@ IMPORTANT: Never add a dependency that requires C/C++ compilation or `cc` build 
 
 ## Workflow
 
-This project is built milestone by milestone. See @plan.md for the full plan with checkboxes.
+This project is built milestone by milestone. See @docs/plan.md for the full plan with checkboxes.
 
 1. Implement only the milestone you are asked to work on
 2. After completing a milestone, run ALL tests for the affected crates
