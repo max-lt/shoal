@@ -76,6 +76,14 @@ enum Commands {
         #[arg(short, long)]
         seed: Vec<String>,
 
+        /// Cluster secret for authentication (nodes must share the same secret).
+        ///
+        /// If not set, falls back to the config file value or the default.
+        /// WARNING: The default secret is public — always set a unique secret
+        /// in production to prevent unauthorized nodes from joining your cluster.
+        #[arg(long)]
+        secret: Option<String>,
+
         /// Run fully in-memory (no disk persistence).
         #[arg(short, long)]
         memory: bool,
@@ -124,6 +132,7 @@ async fn main() -> Result<()> {
             data_dir,
             s3_listen_addr,
             seed,
+            secret,
             memory,
         } => {
             // CLI args override config file values.
@@ -136,6 +145,9 @@ async fn main() -> Result<()> {
             // Merge CLI seeds with config seeds.
             if !seed.is_empty() {
                 config.cluster.seeds = seed;
+            }
+            if let Some(s) = secret {
+                config.cluster.secret = s;
             }
             if memory {
                 config.storage.backend = "memory".to_string();
@@ -198,6 +210,16 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     let public_key = secret_key.public();
     let node_id = NodeId::from(*public_key.as_bytes());
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
+
+    // --- Cluster secret ---
+    if config.cluster.secret == "shoal-default-secret" {
+        warn!(
+            "using default cluster secret — any node on the internet with the same default can join this cluster via relay"
+        );
+        warn!(
+            "set a unique secret with: --secret <your-secret> or [cluster] secret in config file"
+        );
+    }
 
     // --- Network transport (iroh QUIC) ---
     // Derive a cluster-specific ALPN from the shared secret so that nodes
@@ -822,6 +844,42 @@ mod tests {
     fn test_parse_seed_invalid() {
         assert!(parse_seed("not-a-valid-key").is_err());
         assert!(parse_seed("abc123@not-a-valid-addr").is_err());
+    }
+
+    #[test]
+    fn test_cli_secret_flag_overrides_config() {
+        // The --secret flag should override the config file's cluster secret.
+        use clap::Parser;
+
+        // Parse CLI args with --secret flag.
+        let cli = Cli::try_parse_from(["shoald", "start", "--secret", "my-unique-secret"])
+            .expect("CLI should parse with --secret flag");
+
+        match cli.command {
+            Commands::Start { secret, .. } => {
+                assert_eq!(
+                    secret.as_deref(),
+                    Some("my-unique-secret"),
+                    "--secret flag should be captured"
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_default_secret_is_not_empty() {
+        // The default cluster secret should be set but should trigger a warning
+        // when used in production.
+        let config = CliConfig::auto_detect();
+        assert!(
+            !config.cluster.secret.is_empty(),
+            "default cluster secret should not be empty"
+        );
+        // Default secret is known, so nodes without explicit secrets
+        // could join each other via relay — this is the root cause of
+        // phantom node appearances.
+        assert_eq!(config.cluster.secret, "shoal-default-secret");
     }
 
     #[test]

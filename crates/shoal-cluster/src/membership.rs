@@ -14,6 +14,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::panic::AssertUnwindSafe;
+
 use foca::{AccumulatingRuntime, Config, Notification, PostcardCodec, Timer};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -190,8 +192,19 @@ async fn membership_loop(
         tokio::select! {
             // --- Incoming SWIM protocol data from the network ---
             Some(data) = incoming_rx.recv() => {
-                if let Err(e) = foca.handle_data(&data, &mut runtime) {
-                    debug!("foca handle_data error: {e}");
+                // Workaround for foca 0.17.2 bug: handle_data can trigger a
+                // debug_assert panic when processing a Suspect update about
+                // ourselves (handle_self_update → gossip → choose_and_send
+                // writes to member_buf while it's been taken by handle_data).
+                // The foca state remains valid after this — in release builds
+                // the assert is absent and it continues fine.
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    foca.handle_data(&data, &mut runtime)
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => debug!("foca handle_data error: {e}"),
+                    Err(_) => warn!("foca handle_data panicked (foca 0.17.2 member_buf bug), continuing"),
                 }
                 drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
             }

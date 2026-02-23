@@ -563,6 +563,192 @@ mod tests {
         network.shutdown().await;
     }
 
+    // -----------------------------------------------------------------------
+    // Foca member_buf panic reproduction (foca 0.17.2 bug)
+    // -----------------------------------------------------------------------
+
+    /// Encode a foca SWIM message using PostcardCodec.
+    ///
+    /// This crafts raw bytes that can be fed to a foca instance via handle_data.
+    fn encode_swim_message(
+        header: foca::Header<ClusterIdentity>,
+        updates: &[foca::Member<ClusterIdentity>],
+    ) -> Vec<u8> {
+        use bytes::BufMut;
+        use foca::Codec;
+
+        let mut codec = foca::PostcardCodec;
+        let mut buf = bytes::BytesMut::new();
+
+        codec
+            .encode_header(&header, &mut buf)
+            .expect("encode header");
+
+        if !updates.is_empty() {
+            buf.put_u16(updates.len() as u16);
+            for member in updates {
+                codec
+                    .encode_member(member, &mut buf)
+                    .expect("encode member");
+            }
+        }
+
+        buf.to_vec()
+    }
+
+    /// Demonstrate the foca 0.17.2 `member_buf modified while taken` bug.
+    ///
+    /// When a node receives a SWIM message containing a piggybacked Suspect
+    /// update about itself, foca's `handle_data` takes `member_buf` via
+    /// `mem::take`, then calls `apply_many` which triggers
+    /// `handle_self_update(Suspect)` → `gossip()` → `choose_and_send()`.
+    /// `choose_and_send` writes to `self.member_buf` (the one already taken),
+    /// causing the debug_assert to fire.
+    #[tokio::test]
+    async fn test_foca_member_buf_bug_triggers_on_suspect_self() {
+        use foca::{AccumulatingRuntime, PostcardCodec};
+        use rand::SeedableRng;
+        use rand::rngs::SmallRng;
+
+        let id_a = test_identity(1);
+        let id_b = test_identity(2);
+        let id_c = test_identity(3);
+
+        // Create a foca instance for Node B.
+        let rng = SmallRng::from_entropy();
+        let codec = PostcardCodec;
+        let config = membership::test_config();
+        let mut foca = foca::Foca::new(id_b.clone(), config, rng, codec);
+        let mut runtime = AccumulatingRuntime::new();
+
+        // Add two peers so gossip() has targets to send to.
+        foca.apply_many(
+            [
+                foca::Member::alive(id_a.clone()),
+                foca::Member::alive(id_c.clone()),
+            ]
+            .into_iter(),
+            &mut runtime,
+        )
+        .expect("apply");
+        // Drain runtime to clear accumulated events.
+        while runtime.to_send().is_some() {}
+        while runtime.to_schedule().is_some() {}
+        while runtime.to_notify().is_some() {}
+
+        // Craft a SWIM message from Node A to Node B that contains
+        // a piggybacked Suspect update about Node B itself.
+        let msg = encode_swim_message(
+            foca::Header {
+                src: id_a.clone(),
+                src_incarnation: 0,
+                dst: id_b.clone(),
+                message: foca::Message::Gossip,
+            },
+            &[foca::Member::new(
+                id_b.clone(),
+                0, // incarnation
+                foca::State::Suspect,
+            )],
+        );
+
+        // Feed this message to Node B's foca.
+        // In debug builds, this triggers a panic in handle_data:
+        //   handle_data → apply_many → handle_self_update(Suspect) → gossip()
+        //   → choose_and_send() → writes to member_buf (already taken)
+        // Our catch_unwind workaround in the membership service handles this.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            foca.handle_data(&msg, &mut runtime)
+        }));
+
+        // In debug builds, foca panics with member_buf assertion.
+        // In release builds, it silently continues.
+        assert!(
+            result.is_err(),
+            "foca 0.17.2 should panic on suspect-self in debug builds"
+        );
+    }
+
+    /// Verify our catch_unwind workaround: the membership service should
+    /// survive the foca member_buf panic and continue operating.
+    #[tokio::test]
+    async fn test_membership_survives_suspect_self_panic() {
+        // Set up a 3-node network.
+        let (network, identities) = TestNetwork::create(3).await;
+
+        let seed = identities[0].clone();
+        network
+            .handle(&identities[1].node_id)
+            .await
+            .join(seed.clone())
+            .expect("join");
+        network
+            .handle(&identities[2].node_id)
+            .await
+            .join(seed)
+            .expect("join");
+
+        // Wait for convergence.
+        let net = &network;
+        let ids = &identities;
+        wait_for(
+            Duration::from_secs(5),
+            Duration::from_millis(50),
+            || async {
+                for id in ids {
+                    if net.state(&id.node_id).await.member_count().await < 2 {
+                        return false;
+                    }
+                }
+                true
+            },
+        )
+        .await;
+
+        // Craft a Suspect message about Node 1 and feed it to Node 1.
+        // This triggers the foca member_buf bug, but our workaround
+        // should keep the service alive.
+        let suspect_msg = encode_swim_message(
+            foca::Header {
+                src: identities[1].clone(),
+                src_incarnation: 0,
+                dst: identities[0].clone(),
+                message: foca::Message::Gossip,
+            },
+            &[foca::Member::new(
+                identities[0].clone(),
+                0,
+                foca::State::Suspect,
+            )],
+        );
+
+        let handle = network.handle(&identities[0].node_id).await;
+        // Feed the suspect message — should trigger the bug but not crash.
+        handle.feed_data(suspect_msg).expect("feed_data");
+
+        // Give it time to process.
+        time::sleep(Duration::from_millis(200)).await;
+
+        // The service should still be running.
+        assert!(
+            handle.is_running(),
+            "membership service should survive the foca bug"
+        );
+
+        // The node should still respond to SWIM messages (cluster is still functional).
+        let count = network
+            .state(&identities[0].node_id)
+            .await
+            .member_count()
+            .await;
+        assert!(
+            count >= 1,
+            "node should still have members after surviving the panic"
+        );
+
+        network.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_membership_service_leave() {
         let (network, identities) = TestNetwork::create(2).await;
