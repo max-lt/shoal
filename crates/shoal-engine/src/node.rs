@@ -101,6 +101,8 @@ pub struct ShoalNode {
     /// Prevents `lookup_manifest` from re-fetching deleted objects from
     /// peers when `pull_manifest` is available.
     deleted_keys: RwLock<HashSet<(String, String)>>,
+    /// Hybrid Logical Clock for ordering concurrent writes.
+    hlc: HybridClock,
 }
 
 impl ShoalNode {
@@ -126,6 +128,7 @@ impl ShoalNode {
             address_book: Arc::new(RwLock::new(HashMap::new())),
             shard_cache: ShardCache::new(config.cache_max_bytes),
             deleted_keys: RwLock::new(HashSet::new()),
+            hlc: HybridClock::new(),
         }
     }
 
@@ -264,13 +267,17 @@ impl ShoalNode {
             }
         }
 
-        // Step 3: build manifest.
-        let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
+        // Step 3: build manifest with HLC timestamp.
+        let mut manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
+        manifest.hlc = self.hlc.tick();
+        manifest.writer_node = self.node_id;
         let object_id = manifest.object_id;
 
-        // Step 4: persist manifest and key mapping locally.
+        // Step 4: persist manifest, key mapping, and version locally.
         self.meta.put_manifest(&manifest)?;
         self.meta.put_object_key(bucket, key, &object_id)?;
+        self.meta
+            .put_version(bucket, key, manifest.hlc, &object_id)?;
 
         // Step 5: broadcast manifest to all known peers in parallel.
         if let Some(transport) = &self.transport {
@@ -342,16 +349,27 @@ impl ShoalNode {
                 });
             }
         };
-        let object_id = manifest.object_id;
 
-        debug!(
-            %object_id,
-            num_chunks = manifest.chunks.len(),
-            total_size = manifest.total_size,
-            "get_object: reading"
+        let data = self.reconstruct_from_manifest(&manifest).await?;
+
+        info!(
+            bucket, key, object_id = %manifest.object_id,
+            size = data.len(),
+            "get_object: read complete"
         );
 
-        // Step 3: for each chunk, fetch k shards and decode.
+        Ok((data, manifest))
+    }
+
+    /// Reconstruct object data from a manifest by fetching and decoding shards.
+    async fn reconstruct_from_manifest(&self, manifest: &Manifest) -> Result<Vec<u8>, EngineError> {
+        debug!(
+            object_id = %manifest.object_id,
+            num_chunks = manifest.chunks.len(),
+            total_size = manifest.total_size,
+            "reconstruct_from_manifest: reading"
+        );
+
         let mut result = Vec::with_capacity(manifest.total_size as usize);
 
         for (ci, chunk_meta) in manifest.chunks.iter().enumerate() {
@@ -373,11 +391,6 @@ impl ShoalNode {
                 }
                 // Try remote if transport available.
                 if let Some(transport) = &self.transport {
-                    // Build candidate list: start with known/computed owners,
-                    // then fall back to all cluster members. This handles
-                    // ring changes after node failures — the current ring
-                    // may point to nodes that don't hold the shard because
-                    // placement changed since write time.
                     let owners = match self.meta.get_shard_owners(&shard_meta.shard_id)? {
                         Some(owners) => owners,
                         None => {
@@ -386,8 +399,6 @@ impl ShoalNode {
                         }
                     };
 
-                    // Collect all members as fallback candidates (excluding
-                    // the owners we'll try first and ourselves).
                     let members = self.cluster.members().await;
                     let owner_set: std::collections::HashSet<NodeId> =
                         owners.iter().copied().collect();
@@ -410,7 +421,6 @@ impl ShoalNode {
                                         from = %owner,
                                         "pulled shard from remote"
                                     );
-                                    // Cache in bounded LRU (not the main store).
                                     self.shard_cache.put(shard_meta.shard_id, data.clone());
                                     collected.push((shard_meta.index, data.to_vec()));
                                     found = true;
@@ -462,34 +472,57 @@ impl ShoalNode {
             result.extend_from_slice(&chunk_data);
         }
 
-        info!(
-            bucket, key, %object_id,
-            size = result.len(),
-            "get_object: read complete"
-        );
-
-        Ok((result, manifest))
+        Ok(result)
     }
 
     // ------------------------------------------------------------------
     // Delete path
     // ------------------------------------------------------------------
 
-    /// Delete an object by removing its key mapping and manifest.
+    /// Delete an object by adding a delete marker.
     ///
-    /// Shard data is left in place for now; a background GC pass would
-    /// clean up orphaned shards (post-milestone optimization).
+    /// Instead of physically removing the manifest, this creates a special
+    /// delete-marker manifest with `is_delete_marker = true` and an HLC
+    /// timestamp. This preserves version history for S3-compatible versioning.
+    /// Previous versions remain accessible via `?versionId=`.
+    ///
+    /// Shard data from previous versions is left in place; a background GC
+    /// pass would clean up orphaned shards (post-milestone optimization).
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
         // Look up to verify it exists.
-        let object_id =
-            self.meta
-                .get_object_key(bucket, key)?
-                .ok_or_else(|| EngineError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                })?;
+        if self.meta.get_object_key(bucket, key)?.is_none() {
+            return Err(EngineError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
 
-        // Remove key mapping.
+        // Build a delete marker manifest.
+        let hlc = self.hlc.tick();
+        let delete_marker = Manifest {
+            version: MANIFEST_VERSION,
+            object_id: ObjectId::from_data(
+                &postcard::to_allocvec(&(bucket, key, hlc)).unwrap_or_default(),
+            ),
+            total_size: 0,
+            chunk_size: 0,
+            chunks: vec![],
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            metadata: BTreeMap::new(),
+            hlc,
+            writer_node: self.node_id,
+            is_delete_marker: true,
+        };
+
+        // Store the delete marker as a version.
+        self.meta.put_manifest(&delete_marker)?;
+        self.meta
+            .put_version(bucket, key, hlc, &delete_marker.object_id)?;
+
+        // Remove the "current" key mapping so normal GET returns 404.
         self.meta.delete_object_key(bucket, key)?;
 
         // Track deletion so lookup_manifest won't re-fetch from peers.
@@ -498,8 +531,57 @@ impl ShoalNode {
             .await
             .insert((bucket.to_string(), key.to_string()));
 
-        info!(bucket, key, %object_id, "delete_object: key mapping removed");
+        info!(bucket, key, hlc, "delete_object: delete marker added");
 
+        Ok(())
+    }
+
+    /// Delete a specific version of an object.
+    ///
+    /// This physically removes the version entry. If the deleted version was
+    /// the latest, the `objects` keyspace is updated to point to the previous
+    /// version (or removed if no versions remain).
+    pub async fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_hlc: u64,
+    ) -> Result<(), EngineError> {
+        // Verify the version exists.
+        if self.meta.get_version(bucket, key, version_hlc)?.is_none() {
+            return Err(EngineError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        // Remove the version.
+        self.meta.delete_version(bucket, key, version_hlc)?;
+
+        // Update the "current" pointer: find the latest non-delete-marker version.
+        let remaining = self.meta.list_versions(bucket, key)?;
+        let latest_non_delete = remaining.iter().rev().find(|(_, oid)| {
+            self.meta
+                .get_manifest(oid)
+                .ok()
+                .flatten()
+                .is_some_and(|m| !m.is_delete_marker)
+        });
+
+        match latest_non_delete {
+            Some((_, oid)) => {
+                self.meta.put_object_key(bucket, key, oid)?;
+            }
+            None => {
+                // No non-delete versions remain — remove the key mapping.
+                let _ = self.meta.delete_object_key(bucket, key);
+            }
+        }
+
+        info!(
+            bucket,
+            key, version_hlc, "delete_object_version: version removed"
+        );
         Ok(())
     }
 
@@ -529,6 +611,63 @@ impl ShoalNode {
                 bucket: bucket.to_string(),
                 key: key.to_string(),
             })
+    }
+
+    /// Get a specific version of an object by HLC timestamp.
+    pub async fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_hlc: u64,
+    ) -> Result<(Vec<u8>, Manifest), EngineError> {
+        let object_id = self
+            .meta
+            .get_version(bucket, key, version_hlc)?
+            .ok_or_else(|| EngineError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            })?;
+
+        let manifest =
+            self.meta
+                .get_manifest(&object_id)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                })?;
+
+        if manifest.is_delete_marker {
+            return Err(EngineError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            });
+        }
+
+        let data = self.reconstruct_from_manifest(&manifest).await?;
+        Ok((data, manifest))
+    }
+
+    /// List all versions of an object, returning `(hlc, ObjectId, is_delete_marker)`.
+    pub fn list_object_versions(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<(u64, ObjectId, bool)>, EngineError> {
+        let versions = self.meta.list_versions(bucket, key)?;
+        let mut result = Vec::with_capacity(versions.len());
+        for (hlc, oid) in versions {
+            let is_delete = self
+                .meta
+                .get_manifest(&oid)?
+                .is_some_and(|m| m.is_delete_marker);
+            result.push((hlc, oid, is_delete));
+        }
+        Ok(result)
+    }
+
+    /// Return this node's HLC (for external use, e.g. gossip reception).
+    pub fn hlc(&self) -> &HybridClock {
+        &self.hlc
     }
 
     // ------------------------------------------------------------------

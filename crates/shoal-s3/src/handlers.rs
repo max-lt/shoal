@@ -57,12 +57,42 @@ pub(crate) async fn create_bucket(
 // -----------------------------------------------------------------------
 
 /// List objects in a bucket, optionally filtered by prefix.
+///
+/// If `?versions` is present, lists all versions of all objects instead.
 pub(crate) async fn list_objects(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
     let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
+
+    // If ?versions is present, return version listing.
+    if params.contains_key("versions") {
+        tracing::debug!(bucket = %bucket, prefix, "list_object_versions");
+
+        let keys = state.engine.list_objects(&bucket, prefix)?;
+        let mut all_versions = Vec::new();
+        for key in &keys {
+            if let Ok(versions) = state.engine.list_object_versions(&bucket, key) {
+                for (hlc, oid, is_delete) in versions {
+                    all_versions.push((key.clone(), hlc, oid, is_delete));
+                }
+            }
+        }
+
+        // Also check deleted keys that might have versions.
+        // (They won't appear in list_objects since the current pointer was removed.)
+        // We rely on the versions keyspace for that, which is key-specific.
+        // For now, only list versions of keys that have a current pointer.
+
+        let body = xml::list_object_versions(&bucket, prefix, &all_versions);
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/xml")
+            .body(Body::from(body))
+            .unwrap());
+    }
+
     tracing::debug!(bucket = %bucket, prefix, "list_objects");
 
     let keys = state.engine.list_objects(&bucket, prefix)?;
@@ -120,11 +150,20 @@ pub(crate) async fn put_object_handler(
         .await?;
     let etag = format!("\"{object_id}\"");
 
+    // Look up the manifest to get the HLC for the version-id header.
+    let version_id = state
+        .engine
+        .head_object(&bucket, &key)
+        .ok()
+        .map(|m| m.hlc.to_string())
+        .unwrap_or_default();
+
     info!(bucket = %bucket, key = %key, %object_id, "put_object");
 
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("etag", etag)
+        .header("x-amz-version-id", version_id)
         .body(Body::empty())
         .unwrap())
 }
@@ -177,22 +216,37 @@ async fn upload_part(
 // -----------------------------------------------------------------------
 
 /// Retrieve an object and return it in the response body.
+///
+/// Supports `?versionId={hlc}` to retrieve a specific version.
 pub(crate) async fn get_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
-    let (data, manifest) = state
-        .engine
-        .get_object(&bucket, &key)
-        .await
-        .map_err(|e| engine_to_s3(e, &bucket, &key))?;
+    let (data, manifest) = if let Some(version_id) = params.get("versionId") {
+        let hlc: u64 = version_id.parse().map_err(|_| S3Error::InvalidRequest {
+            message: format!("invalid versionId: {version_id}"),
+        })?;
+        state
+            .engine
+            .get_object_version(&bucket, &key, hlc)
+            .await
+            .map_err(|e| engine_to_s3(e, &bucket, &key))?
+    } else {
+        state
+            .engine
+            .get_object(&bucket, &key)
+            .await
+            .map_err(|e| engine_to_s3(e, &bucket, &key))?
+    };
 
     let etag = format!("\"{0}\"", manifest.object_id);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
         .header("etag", &etag)
-        .header("content-length", data.len().to_string());
+        .header("content-length", data.len().to_string())
+        .header("x-amz-version-id", manifest.hlc.to_string());
 
     if let Some(ct) = manifest.metadata.get("content-type") {
         builder = builder.header("content-type", ct);
@@ -211,18 +265,35 @@ pub(crate) async fn get_object_handler(
 // DELETE /{bucket}/{*key} — DeleteObject
 // -----------------------------------------------------------------------
 
-/// Delete an object.
+/// Delete an object or a specific version.
+///
+/// Without `?versionId`: adds a delete marker (preserves previous versions).
+/// With `?versionId={hlc}`: physically removes that specific version.
 pub(crate) async fn delete_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
-    state
-        .engine
-        .delete_object(&bucket, &key)
-        .await
-        .map_err(|e| engine_to_s3(e, &bucket, &key))?;
+    if let Some(version_id) = params.get("versionId") {
+        let hlc: u64 = version_id.parse().map_err(|_| S3Error::InvalidRequest {
+            message: format!("invalid versionId: {version_id}"),
+        })?;
+        state
+            .engine
+            .delete_object_version(&bucket, &key, hlc)
+            .await
+            .map_err(|e| engine_to_s3(e, &bucket, &key))?;
 
-    info!(bucket = %bucket, key = %key, "delete_object");
+        info!(bucket = %bucket, key = %key, version_id = %hlc, "delete_object_version");
+    } else {
+        state
+            .engine
+            .delete_object(&bucket, &key)
+            .await
+            .map_err(|e| engine_to_s3(e, &bucket, &key))?;
+
+        info!(bucket = %bucket, key = %key, "delete_object (delete marker)");
+    }
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

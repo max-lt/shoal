@@ -67,6 +67,48 @@ pub(crate) fn complete_multipart_upload(bucket: &str, key: &str, etag: &str) -> 
     )
 }
 
+/// Build a ListObjectVersions XML response.
+///
+/// Each entry is `(key, hlc, object_id, is_delete_marker)`.
+pub(crate) fn list_object_versions(
+    bucket: &str,
+    prefix: &str,
+    versions: &[(String, u64, shoal_types::ObjectId, bool)],
+) -> String {
+    let bucket = xml_escape(bucket);
+    let prefix = xml_escape(prefix);
+
+    let mut entries = String::new();
+    for (key, hlc, oid, is_delete) in versions {
+        let key = xml_escape(key);
+        if *is_delete {
+            entries.push_str(&format!(
+                "  <DeleteMarker>\n\
+                 \x20   <Key>{key}</Key>\n\
+                 \x20   <VersionId>{hlc}</VersionId>\n\
+                 \x20 </DeleteMarker>\n"
+            ));
+        } else {
+            entries.push_str(&format!(
+                "  <Version>\n\
+                 \x20   <Key>{key}</Key>\n\
+                 \x20   <VersionId>{hlc}</VersionId>\n\
+                 \x20   <ETag>\"{oid}\"</ETag>\n\
+                 \x20 </Version>\n"
+            ));
+        }
+    }
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
+         \x20 <Name>{bucket}</Name>\n\
+         \x20 <Prefix>{prefix}</Prefix>\n\
+         {entries}\
+         </ListVersionsResult>"
+    )
+}
+
 /// Parse part numbers from a CompleteMultipartUpload XML request body.
 ///
 /// Handles both single-line and multi-line XML by searching for

@@ -443,6 +443,10 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         cluster.clone(),
     );
 
+    // --- Hybrid Logical Clock ---
+    // Shared between the engine (writes) and the protocol handler (gossip reception).
+    let hlc = Arc::new(shoal_types::HybridClock::new());
+
     // --- Incoming connection handler (iroh Router) ---
     // A single Router handles both our custom protocol (cluster_alpn) and
     // the iroh-gossip protocol (GOSSIP_ALPN).
@@ -451,6 +455,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         meta.clone(),
         membership_handle.clone(),
         address_book.clone(),
+        hlc.clone(),
     );
     let router = Router::builder(endpoint.clone())
         .accept(cluster_alpn, protocol)

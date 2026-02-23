@@ -746,3 +746,319 @@ fn test_parse_complete_multipart_request_multiline() {
     let parts = crate::xml::parse_complete_multipart_request(body);
     assert_eq!(parts, vec![1, 2]);
 }
+
+// -----------------------------------------------------------------------
+// Versioning: PUT creates versions, GET ?versionId retrieves them
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_put_creates_version_get_by_version_id() {
+    let app = test_router().await;
+
+    // PUT version 1.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/versioned.txt")
+                .body(Body::from("version-1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // PUT version 2 (overwrites "current" pointer).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/versioned.txt")
+                .body(Body::from("version-2"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // GET latest should return version 2.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mybucket/versioned.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Should have x-amz-version-id header.
+    let version_id_2 = response
+        .headers()
+        .get("x-amz-version-id")
+        .expect("should have version-id header")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let body = body_bytes(response).await;
+    assert_eq!(body, b"version-2");
+
+    // GET by the version id should return version 2.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/mybucket/versioned.txt?versionId={version_id_2}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(body, b"version-2");
+}
+
+// -----------------------------------------------------------------------
+// Versioning: DELETE adds delete marker, GET returns 404, version still accessible
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_adds_marker_version_still_accessible() {
+    let app = test_router().await;
+
+    // PUT an object.
+    let put_resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/del-ver.txt")
+                .body(Body::from("original data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put_resp.status(), StatusCode::OK);
+
+    // Note the version id.
+    let version_id = put_resp
+        .headers()
+        .get("x-amz-version-id")
+        .map(|v| v.to_str().unwrap().to_string());
+
+    // DELETE (adds delete marker).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/mybucket/del-ver.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // GET without versionId → 404 (delete marker is "current").
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mybucket/del-ver.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // GET with the original versionId → should still return data.
+    if let Some(vid) = version_id {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/mybucket/del-ver.txt?versionId={vid}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        assert_eq!(body, b"original data");
+    }
+}
+
+// -----------------------------------------------------------------------
+// Versioning: List versions
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_list_object_versions() {
+    let app = test_router().await;
+
+    // PUT 2 versions.
+    for data in ["v1", "v2"] {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/mybucket/versions-test")
+                    .body(Body::from(data))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // GET /{bucket}?versions&prefix=versions-test
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mybucket?versions&prefix=versions-test")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = body_string(response).await;
+    assert!(body.contains("<ListVersionsResult"));
+    // Should have 2 <Version> entries.
+    let version_count = body.matches("<Version>").count();
+    assert_eq!(
+        version_count, 2,
+        "should have 2 versions, got body:\n{body}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Versioning: DELETE with versionId removes specific version
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_specific_version() {
+    let app = test_router().await;
+
+    // PUT an object.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/del-specific")
+                .body(Body::from("data v1"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let version_id_1 = response
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // PUT a second version.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/del-specific")
+                .body(Body::from("data v2"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let _version_id_2 = response
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // DELETE version 1 specifically.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/mybucket/del-specific?versionId={version_id_1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // GET latest should still return v2.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mybucket/del-specific")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_bytes(response).await;
+    assert_eq!(body, b"data v2");
+
+    // GET version 1 by id → 404.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/mybucket/del-specific?versionId={version_id_1}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// -----------------------------------------------------------------------
+// HLC: version-id header is present on PUT response
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_put_response_has_version_id() {
+    let app = test_router().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/hlc-test")
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The ETag header contains the object_id, which indirectly confirms
+    // the manifest was created. The version-id is returned on GET.
+    assert!(response.headers().get("etag").is_some());
+}

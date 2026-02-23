@@ -22,6 +22,8 @@ enum Backend {
         shardmap: Keyspace,
         membership: Keyspace,
         repair_queue: Keyspace,
+        /// `bucket/key/hlc` → ObjectId for versioned object storage.
+        versions: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -38,6 +40,8 @@ struct MemoryBackend {
     membership: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// priority (8 bytes BE) ++ ShardId → ShardId bytes.
     repair_queue: RwLock<BTreeMap<Vec<u8>, [u8; 32]>>,
+    /// `bucket/key/hlc` → ObjectId bytes for versioned storage.
+    versions: RwLock<BTreeMap<String, [u8; 32]>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -75,6 +79,7 @@ impl MetaStore {
                 shardmap: RwLock::new(HashMap::new()),
                 membership: RwLock::new(HashMap::new()),
                 repair_queue: RwLock::new(BTreeMap::new()),
+                versions: RwLock::new(BTreeMap::new()),
             })),
         }
     }
@@ -85,6 +90,7 @@ impl MetaStore {
         let shardmap = db.keyspace("shardmap", KeyspaceCreateOptions::default)?;
         let membership = db.keyspace("membership", KeyspaceCreateOptions::default)?;
         let repair_queue = db.keyspace("repair_queue", KeyspaceCreateOptions::default)?;
+        let versions = db.keyspace("versions", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -92,6 +98,7 @@ impl MetaStore {
             shardmap,
             membership,
             repair_queue,
+            versions,
         })
     }
 
@@ -266,6 +273,154 @@ impl MetaStore {
                     }
                 }
                 Ok(entries)
+            }
+        }
+    }
+
+    // ----- Versioned object storage -----
+
+    /// Store a version of an object, keyed by `(bucket, key, hlc)`.
+    ///
+    /// This preserves all versions of an object for S3-compatible versioning.
+    /// The `objects` keyspace still points to the latest version (highest HLC).
+    pub fn put_version(&self, bucket: &str, key: &str, hlc: u64, id: &ObjectId) -> Result<()> {
+        let storage_key = version_storage_key(bucket, key, hlc);
+        match &self.backend {
+            Backend::Fjall { versions, .. } => {
+                versions.insert(storage_key.as_bytes(), id.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.versions
+                    .write()
+                    .unwrap()
+                    .insert(storage_key, *id.as_bytes());
+            }
+        }
+        debug!(bucket, key, hlc, object_id = %id, "stored object version");
+        Ok(())
+    }
+
+    /// Get a specific version of an object by HLC.
+    pub fn get_version(&self, bucket: &str, key: &str, hlc: u64) -> Result<Option<ObjectId>> {
+        let storage_key = version_storage_key(bucket, key, hlc);
+        match &self.backend {
+            Backend::Fjall { versions, .. } => match versions.get(storage_key.as_bytes())? {
+                Some(bytes) => {
+                    let arr: [u8; 32] = bytes[..32].try_into().map_err(|_| {
+                        MetaError::CorruptData(format!(
+                            "ObjectId expected 32 bytes, got {}",
+                            bytes.len()
+                        ))
+                    })?;
+                    Ok(Some(ObjectId::from(arr)))
+                }
+                None => Ok(None),
+            },
+            Backend::Memory(m) => Ok(m
+                .versions
+                .read()
+                .unwrap()
+                .get(&storage_key)
+                .map(|arr| ObjectId::from(*arr))),
+        }
+    }
+
+    /// List all versions of an object, returning `(hlc, ObjectId)` pairs.
+    ///
+    /// Results are sorted by HLC ascending (oldest first).
+    pub fn list_versions(&self, bucket: &str, key: &str) -> Result<Vec<(u64, ObjectId)>> {
+        let prefix = format!("{bucket}/{key}/");
+        match &self.backend {
+            Backend::Fjall { versions, .. } => {
+                let mut result = Vec::new();
+                for guard in versions.prefix(prefix.as_bytes()) {
+                    let (k, v) = guard.into_inner()?;
+                    let full_key = std::str::from_utf8(&k).map_err(|e| {
+                        MetaError::CorruptData(format!("version key is not valid UTF-8: {e}"))
+                    })?;
+                    if let Some(hlc_str) = full_key.strip_prefix(&prefix)
+                        && let Ok(hlc) = hlc_str.parse::<u64>()
+                    {
+                        let arr: [u8; 32] = v[..32].try_into().map_err(|_| {
+                            MetaError::CorruptData(format!(
+                                "ObjectId expected 32 bytes, got {}",
+                                v.len()
+                            ))
+                        })?;
+                        result.push((hlc, ObjectId::from(arr)));
+                    }
+                }
+                Ok(result)
+            }
+            Backend::Memory(m) => {
+                let map = m.versions.read().unwrap();
+                let mut result = Vec::new();
+                for (full_key, arr) in map.range(prefix.clone()..) {
+                    if !full_key.starts_with(&prefix) {
+                        break;
+                    }
+                    if let Some(hlc_str) = full_key.strip_prefix(&prefix)
+                        && let Ok(hlc) = hlc_str.parse::<u64>()
+                    {
+                        result.push((hlc, ObjectId::from(*arr)));
+                    }
+                }
+                Ok(result)
+            }
+        }
+    }
+
+    /// Get the latest (highest HLC) version of an object.
+    ///
+    /// Returns `None` if no versions exist.
+    pub fn get_latest_version(&self, bucket: &str, key: &str) -> Result<Option<(u64, ObjectId)>> {
+        let versions = self.list_versions(bucket, key)?;
+        Ok(versions.into_iter().last())
+    }
+
+    /// Delete a specific version of an object by HLC.
+    pub fn delete_version(&self, bucket: &str, key: &str, hlc: u64) -> Result<()> {
+        let storage_key = version_storage_key(bucket, key, hlc);
+        match &self.backend {
+            Backend::Fjall { versions, .. } => {
+                versions.remove(storage_key.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.versions.write().unwrap().remove(&storage_key);
+            }
+        }
+        debug!(bucket, key, hlc, "deleted object version");
+        Ok(())
+    }
+
+    /// Compare a new manifest against the current latest for a key.
+    ///
+    /// Returns `true` if the new manifest should replace the current latest
+    /// (either because there is no existing version, or the new HLC is higher,
+    /// or on equal HLC the tiebreak favors the new manifest).
+    pub fn should_accept_manifest(
+        &self,
+        bucket: &str,
+        key: &str,
+        new_manifest: &Manifest,
+    ) -> Result<bool> {
+        let latest = self.get_latest_version(bucket, key)?;
+        match latest {
+            None => Ok(true),
+            Some((existing_hlc, existing_oid)) => {
+                if new_manifest.hlc > existing_hlc {
+                    return Ok(true);
+                }
+                if new_manifest.hlc < existing_hlc {
+                    return Ok(false);
+                }
+                // Equal HLC: tiebreak on writer_node (largest NodeId wins).
+                if let Some(existing_manifest) = self.get_manifest(&existing_oid)? {
+                    Ok(new_manifest.writer_node > existing_manifest.writer_node)
+                } else {
+                    // Existing manifest not found in store — accept the new one.
+                    Ok(true)
+                }
             }
         }
     }
@@ -448,6 +603,14 @@ fn object_storage_key(bucket: &str, key: &str) -> String {
     format!("{bucket}/{key}")
 }
 
+/// Build the storage key for the versions keyspace: `"bucket/key/hlc"`.
+///
+/// HLC is zero-padded to 20 digits to ensure lexicographic ordering matches
+/// numeric ordering (u64::MAX is 20 digits).
+fn version_storage_key(bucket: &str, key: &str, hlc: u64) -> String {
+    format!("{bucket}/{key}/{hlc:020}")
+}
+
 /// Build the repair queue key: `priority (8 bytes big-endian) ++ shard_id (32 bytes)`.
 ///
 /// Big-endian ensures lexicographic ordering matches numeric ordering.
@@ -487,6 +650,9 @@ mod tests {
                 "content-type".to_string(),
                 "application/octet-stream".to_string(),
             )]),
+            hlc: 0,
+            writer_node: NodeId::from([0u8; 32]),
+            is_delete_marker: false,
         }
     }
 
@@ -1153,12 +1319,199 @@ mod tests {
                 chunks,
                 created_at: 1700000000,
                 metadata: BTreeMap::new(),
+                hlc: 0,
+                writer_node: NodeId::from([0u8; 32]),
+                is_delete_marker: false,
             };
 
             store.put_manifest(&manifest).unwrap();
             let got = store.get_manifest(&manifest.object_id).unwrap().unwrap();
             assert_eq!(got.chunks.len(), 50);
             assert_eq!(got.chunks[0].shards.len(), 6);
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Versioning tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_version_put_get() {
+        with_both_backends(|store| {
+            let oid = ObjectId::from_data(b"v1");
+            store.put_version("mybucket", "mykey", 100, &oid).unwrap();
+            let got = store.get_version("mybucket", "mykey", 100).unwrap();
+            assert_eq!(got, Some(oid));
+        });
+    }
+
+    #[test]
+    fn test_version_get_nonexistent() {
+        with_both_backends(|store| {
+            let got = store.get_version("mybucket", "mykey", 999).unwrap();
+            assert_eq!(got, None);
+        });
+    }
+
+    #[test]
+    fn test_version_list_ordered() {
+        with_both_backends(|store| {
+            let oid1 = ObjectId::from_data(b"v1");
+            let oid2 = ObjectId::from_data(b"v2");
+            let oid3 = ObjectId::from_data(b"v3");
+
+            // Insert out of order.
+            store.put_version("b", "k", 300, &oid3).unwrap();
+            store.put_version("b", "k", 100, &oid1).unwrap();
+            store.put_version("b", "k", 200, &oid2).unwrap();
+
+            let versions = store.list_versions("b", "k").unwrap();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(versions[0], (100, oid1));
+            assert_eq!(versions[1], (200, oid2));
+            assert_eq!(versions[2], (300, oid3));
+        });
+    }
+
+    #[test]
+    fn test_version_get_latest() {
+        with_both_backends(|store| {
+            let oid1 = ObjectId::from_data(b"v1");
+            let oid2 = ObjectId::from_data(b"v2");
+            store.put_version("b", "k", 100, &oid1).unwrap();
+            store.put_version("b", "k", 200, &oid2).unwrap();
+
+            let latest = store.get_latest_version("b", "k").unwrap();
+            assert_eq!(latest, Some((200, oid2)));
+        });
+    }
+
+    #[test]
+    fn test_version_get_latest_empty() {
+        with_both_backends(|store| {
+            let latest = store.get_latest_version("b", "k").unwrap();
+            assert_eq!(latest, None);
+        });
+    }
+
+    #[test]
+    fn test_version_delete() {
+        with_both_backends(|store| {
+            let oid = ObjectId::from_data(b"v1");
+            store.put_version("b", "k", 100, &oid).unwrap();
+            assert!(store.get_version("b", "k", 100).unwrap().is_some());
+
+            store.delete_version("b", "k", 100).unwrap();
+            assert!(store.get_version("b", "k", 100).unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn test_version_isolation_across_keys() {
+        with_both_backends(|store| {
+            let oid1 = ObjectId::from_data(b"v1");
+            let oid2 = ObjectId::from_data(b"v2");
+            store.put_version("b", "key1", 100, &oid1).unwrap();
+            store.put_version("b", "key2", 200, &oid2).unwrap();
+
+            let v1 = store.list_versions("b", "key1").unwrap();
+            assert_eq!(v1.len(), 1);
+            assert_eq!(v1[0], (100, oid1));
+
+            let v2 = store.list_versions("b", "key2").unwrap();
+            assert_eq!(v2.len(), 1);
+            assert_eq!(v2[0], (200, oid2));
+        });
+    }
+
+    #[test]
+    fn test_should_accept_manifest_no_existing() {
+        with_both_backends(|store| {
+            let mut manifest = test_manifest();
+            manifest.hlc = 100;
+            manifest.writer_node = NodeId::from([1u8; 32]);
+            assert!(store.should_accept_manifest("b", "k", &manifest).unwrap());
+        });
+    }
+
+    #[test]
+    fn test_should_accept_manifest_higher_hlc_wins() {
+        with_both_backends(|store| {
+            let mut m1 = test_manifest();
+            m1.hlc = 100;
+            m1.writer_node = NodeId::from([1u8; 32]);
+            m1.object_id = ObjectId::from_data(b"manifest-v1");
+            store.put_manifest(&m1).unwrap();
+            store.put_version("b", "k", 100, &m1.object_id).unwrap();
+
+            let mut m2 = test_manifest();
+            m2.hlc = 200;
+            m2.writer_node = NodeId::from([2u8; 32]);
+            m2.object_id = ObjectId::from_data(b"manifest-v2");
+
+            assert!(
+                store.should_accept_manifest("b", "k", &m2).unwrap(),
+                "higher HLC should win"
+            );
+        });
+    }
+
+    #[test]
+    fn test_should_accept_manifest_lower_hlc_rejected() {
+        with_both_backends(|store| {
+            let mut m1 = test_manifest();
+            m1.hlc = 200;
+            m1.writer_node = NodeId::from([1u8; 32]);
+            m1.object_id = ObjectId::from_data(b"manifest-v1");
+            store.put_manifest(&m1).unwrap();
+            store.put_version("b", "k", 200, &m1.object_id).unwrap();
+
+            let mut m2 = test_manifest();
+            m2.hlc = 100;
+            m2.writer_node = NodeId::from([2u8; 32]);
+            m2.object_id = ObjectId::from_data(b"manifest-v2");
+
+            assert!(
+                !store.should_accept_manifest("b", "k", &m2).unwrap(),
+                "lower HLC should be rejected"
+            );
+        });
+    }
+
+    #[test]
+    fn test_should_accept_manifest_tiebreak_by_node_id() {
+        with_both_backends(|store| {
+            let mut m1 = test_manifest();
+            m1.hlc = 100;
+            m1.writer_node = NodeId::from([1u8; 32]); // Smaller NodeId.
+            m1.object_id = ObjectId::from_data(b"manifest-v1");
+            store.put_manifest(&m1).unwrap();
+            store.put_version("b", "k", 100, &m1.object_id).unwrap();
+
+            let mut m2 = test_manifest();
+            m2.hlc = 100; // Same HLC.
+            m2.writer_node = NodeId::from([2u8; 32]); // Larger NodeId wins.
+            m2.object_id = ObjectId::from_data(b"manifest-v2");
+
+            assert!(
+                store.should_accept_manifest("b", "k", &m2).unwrap(),
+                "larger NodeId should win on equal HLC"
+            );
+
+            // Reverse: smaller NodeId should NOT win.
+            let mut m3 = test_manifest();
+            m3.hlc = 100;
+            m3.writer_node = NodeId::from([0u8; 32]); // Even smaller.
+            m3.object_id = ObjectId::from_data(b"manifest-v3");
+
+            // Update so latest version has m2's NodeId.
+            store.put_manifest(&m2).unwrap();
+            store.put_version("b", "k", 100, &m2.object_id).unwrap();
+
+            assert!(
+                !store.should_accept_manifest("b", "k", &m3).unwrap(),
+                "smaller NodeId should lose on equal HLC"
+            );
         });
     }
 }

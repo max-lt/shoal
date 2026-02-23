@@ -16,7 +16,7 @@ use shoal_cluster::membership::MembershipHandle;
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
-use shoal_types::NodeId;
+use shoal_types::{HybridClock, NodeId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -31,6 +31,8 @@ pub struct ShoalProtocol {
     meta: Arc<MetaStore>,
     membership: Arc<MembershipHandle>,
     address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
+    /// Hybrid Logical Clock for causal ordering of manifest updates.
+    hlc: Arc<HybridClock>,
 }
 
 impl fmt::Debug for ShoalProtocol {
@@ -46,12 +48,14 @@ impl ShoalProtocol {
         meta: Arc<MetaStore>,
         membership: Arc<MembershipHandle>,
         address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
+        hlc: Arc<HybridClock>,
     ) -> Self {
         Self {
             store,
             meta,
             membership,
             address_book,
+            hlc,
         }
     }
 }
@@ -72,11 +76,13 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         let membership = self.membership.clone();
         let store_uni = self.store.clone();
         let meta_uni = self.meta.clone();
+        let hlc_uni = self.hlc.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
                 let store = store_uni.clone();
                 let meta = meta_uni.clone();
+                let hlc = hlc_uni.clone();
                 async move {
                     match msg {
                         ShoalMessage::SwimData(data) => {
@@ -96,21 +102,74 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             manifest_bytes,
                         } => match postcard::from_bytes::<shoal_types::Manifest>(&manifest_bytes) {
                             Ok(manifest) => {
-                                debug!(
-                                    %bucket, %key,
-                                    object_id = %manifest.object_id,
-                                    "received manifest broadcast"
-                                );
-                                if let Err(e) = meta.put_manifest(&manifest) {
-                                    warn!(%e, "failed to store broadcast manifest");
-                                }
-                                if let Err(e) =
-                                    meta.put_object_key(&bucket, &key, &manifest.object_id)
-                                {
-                                    warn!(
-                                        %e,
-                                        "failed to store broadcast object key"
+                                // Update local HLC to maintain causal ordering.
+                                hlc.update(manifest.hlc);
+
+                                // Check if we should accept this manifest based on HLC ordering.
+                                let should_accept =
+                                    match meta.should_accept_manifest(&bucket, &key, &manifest) {
+                                        Ok(accept) => accept,
+                                        Err(e) => {
+                                            warn!(%e, "failed to check manifest acceptance");
+                                            true // Accept on error to avoid data loss.
+                                        }
+                                    };
+
+                                if should_accept {
+                                    debug!(
+                                        %bucket, %key,
+                                        object_id = %manifest.object_id,
+                                        hlc = manifest.hlc,
+                                        "accepted manifest broadcast (HLC wins)"
                                     );
+                                    if let Err(e) = meta.put_manifest(&manifest) {
+                                        warn!(%e, "failed to store broadcast manifest");
+                                    }
+                                    // Store the version entry.
+                                    if let Err(e) = meta.put_version(
+                                        &bucket,
+                                        &key,
+                                        manifest.hlc,
+                                        &manifest.object_id,
+                                    ) {
+                                        warn!(%e, "failed to store broadcast version");
+                                    }
+                                    // Update the "current" pointer only if not a delete marker.
+                                    if manifest.is_delete_marker {
+                                        if let Err(e) = meta.delete_object_key(&bucket, &key) {
+                                            warn!(
+                                                %e,
+                                                "failed to remove key for delete marker"
+                                            );
+                                        }
+                                    } else if let Err(e) =
+                                        meta.put_object_key(&bucket, &key, &manifest.object_id)
+                                    {
+                                        warn!(
+                                            %e,
+                                            "failed to store broadcast object key"
+                                        );
+                                    }
+                                } else {
+                                    debug!(
+                                        %bucket, %key,
+                                        object_id = %manifest.object_id,
+                                        hlc = manifest.hlc,
+                                        "ignored manifest broadcast (HLC loses)"
+                                    );
+                                    // Still store the manifest and version for history,
+                                    // but don't update the "current" pointer.
+                                    if let Err(e) = meta.put_manifest(&manifest) {
+                                        warn!(%e, "failed to store non-winning manifest");
+                                    }
+                                    if let Err(e) = meta.put_version(
+                                        &bucket,
+                                        &key,
+                                        manifest.hlc,
+                                        &manifest.object_id,
+                                    ) {
+                                        warn!(%e, "failed to store non-winning version");
+                                    }
                                 }
                             }
                             Err(e) => {

@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -18,7 +20,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+        #[derive(Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Default, Serialize, Deserialize)]
         pub struct $name([u8; 32]);
 
         impl $name {
@@ -83,6 +85,96 @@ define_id!(
 );
 
 // ---------------------------------------------------------------------------
+// Hybrid Logical Clock
+// ---------------------------------------------------------------------------
+
+/// A Hybrid Logical Clock (HLC) for deterministic manifest ordering.
+///
+/// Combines wall-clock time with a logical counter to provide a monotonically
+/// increasing timestamp that respects causality. Each write and each received
+/// manifest advances the clock, ensuring that concurrent writes on different
+/// nodes can be deterministically ordered.
+///
+/// The HLC value is `max(local_wall_clock_ms, last_seen_hlc) + 1`.
+pub struct HybridClock {
+    /// The current HLC value (milliseconds-scale, but always strictly increasing).
+    value: AtomicU64,
+}
+
+impl HybridClock {
+    /// Create a new HLC initialized to the current wall-clock time.
+    pub fn new() -> Self {
+        Self {
+            value: AtomicU64::new(Self::wall_clock_ms()),
+        }
+    }
+
+    /// Create an HLC with an explicit initial value (for testing).
+    pub fn with_value(initial: u64) -> Self {
+        Self {
+            value: AtomicU64::new(initial),
+        }
+    }
+
+    /// Tick the clock for a local event (e.g. a write).
+    ///
+    /// Returns a new HLC value that is guaranteed to be strictly greater than
+    /// the previous value and at least as large as the current wall clock.
+    pub fn tick(&self) -> u64 {
+        let wall = Self::wall_clock_ms();
+        loop {
+            let current = self.value.load(Ordering::Acquire);
+            let next = wall.max(current) + 1;
+            if self
+                .value
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
+
+    /// Update the clock upon receiving a remote HLC value.
+    ///
+    /// Advances the local clock to `max(local, remote, wall_clock) + 1`,
+    /// maintaining the causal ordering invariant.
+    pub fn update(&self, remote_hlc: u64) -> u64 {
+        let wall = Self::wall_clock_ms();
+        loop {
+            let current = self.value.load(Ordering::Acquire);
+            let next = wall.max(current).max(remote_hlc) + 1;
+            if self
+                .value
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
+
+    /// Read the current HLC value without advancing it.
+    pub fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    /// Return the current wall-clock time in milliseconds since UNIX epoch.
+    fn wall_clock_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+    }
+}
+
+impl Default for HybridClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------
 
@@ -113,6 +205,24 @@ pub struct Manifest {
     pub created_at: u64,
     /// User-supplied metadata (e.g. content-type, custom headers).
     pub metadata: BTreeMap<String, String>,
+    /// Hybrid Logical Clock timestamp for ordering concurrent writes.
+    ///
+    /// When two nodes write to the same key concurrently, the manifest with
+    /// the higher HLC wins. On equal HLC, tiebreak by `writer_node` (largest
+    /// NodeId wins).
+    #[serde(default)]
+    pub hlc: u64,
+    /// The node that created this manifest version.
+    ///
+    /// Used as tiebreaker when two manifests have the same HLC value.
+    #[serde(default)]
+    pub writer_node: NodeId,
+    /// Whether this manifest is a delete marker (no chunk data).
+    ///
+    /// A delete marker records the deletion of an object at a specific HLC
+    /// timestamp, preserving version history for S3-compatible versioning.
+    #[serde(default)]
+    pub is_delete_marker: bool,
 }
 
 /// Metadata for a single chunk within a manifest.
@@ -512,6 +622,9 @@ mod tests {
                 "content-type".to_string(),
                 "application/octet-stream".to_string(),
             )]),
+            hlc: 42,
+            writer_node: NodeId::from_data(b"writer-node"),
+            is_delete_marker: false,
         };
 
         let encoded = postcard::to_allocvec(&manifest).unwrap();
@@ -726,11 +839,108 @@ mod tests {
             chunks: vec![],
             created_at: 0,
             metadata: BTreeMap::new(),
+            hlc: 0,
+            writer_node: NodeId::from([0u8; 32]),
+            is_delete_marker: false,
         };
         assert_eq!(manifest.version, 1);
         let encoded = postcard::to_allocvec(&manifest).unwrap();
         let decoded: Manifest = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.version, 1);
+    }
+
+    // --- HybridClock tests ---
+
+    #[test]
+    fn test_hlc_tick_monotonically_increasing() {
+        let clock = HybridClock::with_value(100);
+        let t1 = clock.tick();
+        let t2 = clock.tick();
+        let t3 = clock.tick();
+        assert!(t1 > 100);
+        assert!(t2 > t1);
+        assert!(t3 > t2);
+    }
+
+    #[test]
+    fn test_hlc_update_advances_on_remote() {
+        let clock = HybridClock::with_value(100);
+        // Remote HLC is much higher.
+        let new_val = clock.update(999);
+        assert!(new_val > 999, "clock should advance past remote HLC");
+        // Subsequent tick should be even higher.
+        let t = clock.tick();
+        assert!(t > new_val);
+    }
+
+    #[test]
+    fn test_hlc_update_preserves_local_if_higher() {
+        let clock = HybridClock::with_value(5000);
+        // Tick once to get above 5000.
+        let t1 = clock.tick();
+        // Remote is lower than local.
+        let new_val = clock.update(100);
+        assert!(new_val > t1, "clock should advance past its own value");
+    }
+
+    #[test]
+    fn test_hlc_current_does_not_advance() {
+        let clock = HybridClock::with_value(42);
+        let c1 = clock.current();
+        let c2 = clock.current();
+        assert_eq!(c1, c2, "current() should not change the HLC");
+        assert_eq!(c1, 42);
+    }
+
+    #[test]
+    fn test_hlc_concurrent_ticks() {
+        use std::sync::Arc;
+        let clock = Arc::new(HybridClock::with_value(0));
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let c = clock.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut values = Vec::new();
+                for _ in 0..100 {
+                    values.push(c.tick());
+                }
+                values
+            }));
+        }
+
+        let mut all_values: Vec<u64> = Vec::new();
+        for h in handles {
+            all_values.extend(h.join().unwrap());
+        }
+
+        // All values must be unique (strict monotonic per thread, globally unique).
+        let set: std::collections::HashSet<u64> = all_values.iter().copied().collect();
+        assert_eq!(
+            set.len(),
+            all_values.len(),
+            "all HLC values from concurrent ticks must be unique"
+        );
+    }
+
+    #[test]
+    fn test_manifest_delete_marker_roundtrip() {
+        let manifest = Manifest {
+            version: MANIFEST_VERSION,
+            object_id: ObjectId::from_data(b"deleted"),
+            total_size: 0,
+            chunk_size: 0,
+            chunks: vec![],
+            created_at: 1700000000,
+            metadata: BTreeMap::new(),
+            hlc: 500,
+            writer_node: NodeId::from_data(b"deleter"),
+            is_delete_marker: true,
+        };
+        let encoded = postcard::to_allocvec(&manifest).unwrap();
+        let decoded: Manifest = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(manifest, decoded);
+        assert!(decoded.is_delete_marker);
     }
 
     #[test]

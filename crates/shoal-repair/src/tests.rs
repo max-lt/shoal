@@ -172,6 +172,9 @@ impl TestCluster {
             chunks,
             created_at: 1700000000,
             metadata: std::collections::BTreeMap::new(),
+            hlc: 0,
+            writer_node: NodeId::from([0u8; 32]),
+            is_delete_marker: false,
         };
         meta.put_manifest(&manifest).unwrap();
         meta.put_object_key("__all__", "test-object", &manifest.object_id)

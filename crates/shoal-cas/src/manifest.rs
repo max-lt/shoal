@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use shoal_types::{ChunkMeta, MANIFEST_VERSION, Manifest, ObjectId};
+use shoal_types::{ChunkMeta, MANIFEST_VERSION, Manifest, NodeId, ObjectId};
 
 use crate::error::CasError;
 
@@ -72,6 +72,9 @@ pub fn build_manifest_with_timestamp(
         chunks: chunks.to_vec(),
         created_at,
         metadata,
+        hlc: 0,
+        writer_node: NodeId::from([0u8; 32]),
+        is_delete_marker: false,
     })
 }
 
