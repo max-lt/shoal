@@ -75,20 +75,42 @@ impl Transport for FailableMockTransport {
         Ok(None)
     }
 
-    async fn send_to(
-        &self,
-        _addr: iroh::EndpointAddr,
-        _msg: &ShoalMessage,
-    ) -> Result<(), NetError> {
+    async fn send_to(&self, addr: iroh::EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        if let ShoalMessage::ManifestPut {
+            bucket,
+            key,
+            manifest_bytes,
+        } = msg
+            && let Some(meta) = self.metas.get(&node_id)
+            && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
+        {
+            let _ = meta.put_manifest(&manifest);
+            let _ = meta.put_object_key(bucket, key, &manifest.object_id);
+        }
         Ok(())
     }
 
     async fn pull_manifest(
         &self,
-        _addr: iroh::EndpointAddr,
-        _bucket: &str,
-        _key: &str,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
     ) -> Result<Option<Vec<u8>>, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        if let Some(meta) = self.metas.get(&node_id)
+            && let Ok(Some(oid)) = meta.get_object_key(bucket, key)
+            && let Ok(Some(manifest)) = meta.get_manifest(&oid)
+            && let Ok(bytes) = postcard::to_allocvec(&manifest)
+        {
+            return Ok(Some(bytes));
+        }
         Ok(None)
     }
 
@@ -1272,6 +1294,10 @@ async fn test_list_objects_after_broadcast() {
 async fn test_new_node_lists_objects_after_manifest_sync() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
 
+    // Kill node 2 to simulate it joining AFTER the objects are stored.
+    // put_object's broadcast via send_to will skip the dead node.
+    c.kill_node(2).await;
+
     // Write 2 objects from different nodes.
     let data1 = test_data(2000);
     let data2 = test_data(3000);
@@ -1285,12 +1311,10 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
         .await
         .unwrap();
 
-    // Broadcast manifests to nodes 0 and 1 only — simulating that
-    // node 2 joined the cluster AFTER the objects were stored.
-    simulate_manifest_broadcast(c.node(0), c.node(1), "b", "key.txt");
-    simulate_manifest_broadcast(c.node(1), c.node(0), "b", "w.txt");
+    // Revive node 2 — simulating a late join.
+    c.revive_node(2).await;
 
-    // Node 2 has NO manifests.
+    // Node 2 has NO manifests (was dead during writes).
     let keys_before = c.node(2).list_objects("b", "").unwrap();
     assert_eq!(
         keys_before.len(),
@@ -1323,11 +1347,15 @@ async fn test_manifest_sync_idempotent() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
 
+    // Kill node 2 so it misses the broadcast.
+    c.kill_node(2).await;
+
     c.node(0)
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    simulate_manifest_broadcast(c.node(0), c.node(1), "b", "k");
+
+    c.revive_node(2).await;
 
     // First sync: picks up the manifest.
     let synced1 = c.node(2).sync_manifests_from_peers().await.unwrap();
@@ -1346,6 +1374,9 @@ async fn test_manifest_sync_idempotent() {
 async fn test_manifest_sync_multiple_buckets() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
 
+    // Kill node 2 so it misses the broadcasts.
+    c.kill_node(2).await;
+
     c.node(0)
         .put_object("photos", "cat.jpg", &test_data(1000), BTreeMap::new())
         .await
@@ -1354,8 +1385,8 @@ async fn test_manifest_sync_multiple_buckets() {
         .put_object("docs", "readme.md", &test_data(500), BTreeMap::new())
         .await
         .unwrap();
-    simulate_manifest_broadcast(c.node(0), c.node(1), "photos", "cat.jpg");
-    simulate_manifest_broadcast(c.node(0), c.node(1), "docs", "readme.md");
+
+    c.revive_node(2).await;
 
     // Node 2 syncs.
     let synced = c.node(2).sync_manifests_from_peers().await.unwrap();

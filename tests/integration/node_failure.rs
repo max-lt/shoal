@@ -193,6 +193,68 @@ async fn test_mass_failure_and_recovery() {
     }
 }
 
+/// 4-node cluster: write on node 0, kill node 2, write on node 1,
+/// respawn node 2. Verify node 2 catches up on the missed write
+/// transparently via manifest pull from peers.
+///
+/// This test does NOT use `broadcast_manifest` — it relies on
+/// `put_object`'s built-in manifest broadcast (via `send_to`) and
+/// the `pull_manifest` fallback for the respawned node.
+#[tokio::test]
+async fn test_4_nodes_kill_write_respawn_catches_up() {
+    // k=2, m=1, shard_replication=2: each shard on 2 nodes.
+    let c = IntegrationCluster::with_replication(4, 1024, 2, 1, 2).await;
+
+    // Step 1: write on node 0. Manifest propagates to all 4 nodes
+    // via put_object's built-in send_to broadcast.
+    let data1 = test_data_seeded(5000, 1);
+    c.node(0)
+        .put_object("b", "key1", &data1, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // All 4 nodes can read key1.
+    for i in 0..4 {
+        let (got, _) = c.node(i).get_object("b", "key1").await.unwrap();
+        assert_eq!(got, data1, "node {i} should read key1 before kill");
+    }
+
+    // Step 2: kill node 2.
+    c.kill_node(2).await;
+
+    // Step 3: write on node 1 while node 2 is dead.
+    // send_to for node 2 will fail (down), so node 2 misses this manifest.
+    let data2 = test_data_seeded(3000, 2);
+    c.node(1)
+        .put_object("b", "key2", &data2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Surviving nodes can read key2.
+    for reader in [0, 1, 3] {
+        let (got, _) = c.node(reader).get_object("b", "key2").await.unwrap();
+        assert_eq!(
+            got, data2,
+            "node {reader} should read key2 while node 2 down"
+        );
+    }
+
+    // Step 4: respawn node 2.
+    c.revive_node(2).await;
+
+    // Node 2 still reads key1 (had it before death).
+    let (got, _) = c.node(2).get_object("b", "key1").await.unwrap();
+    assert_eq!(got, data1, "node 2 reads key1 after revive");
+
+    // Node 2 reads key2 — it missed the manifest broadcast, but
+    // lookup_manifest falls back to pull_manifest from living peers.
+    let (got, _) = c.node(2).get_object("b", "key2").await.unwrap();
+    assert_eq!(
+        got, data2,
+        "node 2 reads key2 after revive via peer fallback"
+    );
+}
+
 /// Delete object, verify it's gone.
 #[tokio::test]
 async fn test_delete_object_after_node_failure() {

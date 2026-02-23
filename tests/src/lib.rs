@@ -72,20 +72,43 @@ impl Transport for MockTransport {
         Ok(None)
     }
 
-    async fn send_to(
-        &self,
-        _addr: iroh::EndpointAddr,
-        _msg: &ShoalMessage,
-    ) -> Result<(), NetError> {
+    async fn send_to(&self, addr: iroh::EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        // Deliver ManifestPut messages to the peer's MetaStore.
+        if let ShoalMessage::ManifestPut {
+            bucket,
+            key,
+            manifest_bytes,
+        } = msg
+            && let Some(meta) = self.metas.get(&node_id)
+            && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
+        {
+            let _ = meta.put_manifest(&manifest);
+            let _ = meta.put_object_key(bucket, key, &manifest.object_id);
+        }
         Ok(())
     }
 
     async fn pull_manifest(
         &self,
-        _addr: iroh::EndpointAddr,
-        _bucket: &str,
-        _key: &str,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
     ) -> Result<Option<Vec<u8>>, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        if let Some(meta) = self.metas.get(&node_id)
+            && let Ok(Some(oid)) = meta.get_object_key(bucket, key)
+            && let Ok(Some(manifest)) = meta.get_manifest(&oid)
+            && let Ok(bytes) = postcard::to_allocvec(&manifest)
+        {
+            return Ok(Some(bytes));
+        }
         Ok(None)
     }
 
