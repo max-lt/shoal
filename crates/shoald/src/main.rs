@@ -203,7 +203,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let secret_key = if memory_mode {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let key = SecretKey::from(bytes);
         info!("generated ephemeral node key (memory mode)");
         key
@@ -221,7 +221,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     if generated_secret {
         use rand::RngCore;
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         config.cluster.secret = bytes.iter().map(|b| format!("{b:02x}")).collect();
     }
 
@@ -496,7 +496,7 @@ fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
         // Generate a new random ed25519 key.
         use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let key = SecretKey::from(bytes);
         std::fs::write(&key_path, key.to_bytes()).context("failed to write node.key")?;
         info!(
@@ -732,7 +732,7 @@ mod tests {
         let key = {
             use rand::RngCore;
             let mut b = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut b);
+            rand::rng().fill_bytes(&mut b);
             SecretKey::from(b)
         };
         let id_str = key.public().to_string();
@@ -747,7 +747,7 @@ mod tests {
         let key = {
             use rand::RngCore;
             let mut b = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut b);
+            rand::rng().fill_bytes(&mut b);
             SecretKey::from(b)
         };
         let id_str = key.public().to_string();

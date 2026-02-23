@@ -17,7 +17,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
-rand = "0.9"
+rand = { workspace = true }
 iroh-quinn = "0.16"
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

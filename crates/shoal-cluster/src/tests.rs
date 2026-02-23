@@ -596,16 +596,13 @@ mod tests {
         buf.to_vec()
     }
 
-    /// Demonstrate the foca 0.17.2 `member_buf modified while taken` bug.
+    /// Verify that foca 1.0 handles suspect-self correctly without panicking.
     ///
-    /// When a node receives a SWIM message containing a piggybacked Suspect
-    /// update about itself, foca's `handle_data` takes `member_buf` via
-    /// `mem::take`, then calls `apply_many` which triggers
-    /// `handle_self_update(Suspect)` → `gossip()` → `choose_and_send()`.
-    /// `choose_and_send` writes to `self.member_buf` (the one already taken),
-    /// causing the debug_assert to fire.
+    /// foca 0.17.2 had a bug where receiving a Suspect update about the local
+    /// node triggered a debug_assert panic (member_buf modified while taken).
+    /// foca 1.0 fixes this — handle_data should succeed.
     #[tokio::test]
-    async fn test_foca_member_buf_bug_triggers_on_suspect_self() {
+    async fn test_foca_handles_suspect_self_without_panic() {
         use foca::{AccumulatingRuntime, PostcardCodec};
         use rand::SeedableRng;
         use rand::rngs::SmallRng;
@@ -615,7 +612,7 @@ mod tests {
         let id_c = test_identity(3);
 
         // Create a foca instance for Node B.
-        let rng = SmallRng::from_entropy();
+        let rng = SmallRng::from_os_rng();
         let codec = PostcardCodec;
         let config = membership::test_config();
         let mut foca = foca::Foca::new(id_b.clone(), config, rng, codec);
@@ -628,6 +625,7 @@ mod tests {
                 foca::Member::alive(id_c.clone()),
             ]
             .into_iter(),
+            true,
             &mut runtime,
         )
         .expect("apply");
@@ -652,27 +650,17 @@ mod tests {
             )],
         );
 
-        // Feed this message to Node B's foca.
-        // In debug builds, this triggers a panic in handle_data:
-        //   handle_data → apply_many → handle_self_update(Suspect) → gossip()
-        //   → choose_and_send() → writes to member_buf (already taken)
-        // Our catch_unwind workaround in the membership service handles this.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            foca.handle_data(&msg, &mut runtime)
-        }));
-
-        // In debug builds, foca panics with member_buf assertion.
-        // In release builds, it silently continues.
-        assert!(
-            result.is_err(),
-            "foca 0.17.2 should panic on suspect-self in debug builds"
-        );
+        // In foca 1.0, this should succeed without panic.
+        foca.handle_data(&msg, &mut runtime)
+            .expect("handle_data should succeed for suspect-self in foca 1.0");
     }
 
-    /// Verify our catch_unwind workaround: the membership service should
-    /// survive the foca member_buf panic and continue operating.
+    /// Verify the membership service handles suspect-self messages correctly.
+    ///
+    /// In foca 1.0, this is handled cleanly (no panic). The service should
+    /// remain running and functional after processing the message.
     #[tokio::test]
-    async fn test_membership_survives_suspect_self_panic() {
+    async fn test_membership_handles_suspect_self() {
         // Set up a 3-node network.
         let (network, identities) = TestNetwork::create(3).await;
 
@@ -723,7 +711,7 @@ mod tests {
         );
 
         let handle = network.handle(&identities[0].node_id).await;
-        // Feed the suspect message — should trigger the bug but not crash.
+        // Feed the suspect message — foca 1.0 handles this cleanly.
         handle.feed_data(suspect_msg).expect("feed_data");
 
         // Give it time to process.
@@ -743,7 +731,7 @@ mod tests {
             .await;
         assert!(
             count >= 1,
-            "node should still have members after surviving the panic"
+            "node should still have members after processing suspect-self"
         );
 
         network.shutdown().await;

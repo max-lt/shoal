@@ -314,13 +314,11 @@ impl ShoalNode {
                 }
                 // Try remote if transport available.
                 if let Some(transport) = &self.transport {
-                    // Prefer shard owners from metadata (populated by the
-                    // writer). Fall back to computing from the placement
-                    // ring when metadata is absent — this happens on nodes
-                    // that received the manifest via broadcast without
-                    // shard owner data. The ring is deterministic: every
-                    // node with the same membership computes the same
-                    // placement.
+                    // Build candidate list: start with known/computed owners,
+                    // then fall back to all cluster members. This handles
+                    // ring changes after node failures — the current ring
+                    // may point to nodes that don't hold the shard because
+                    // placement changed since write time.
                     let owners = match self.meta.get_shard_owners(&shard_meta.shard_id)? {
                         Some(owners) => owners,
                         None => {
@@ -328,7 +326,20 @@ impl ShoalNode {
                             ring.owners(&shard_meta.shard_id, self.shard_replication)
                         }
                     };
-                    for owner in &owners {
+
+                    // Collect all members as fallback candidates (excluding
+                    // the owners we'll try first and ourselves).
+                    let members = self.cluster.members().await;
+                    let owner_set: std::collections::HashSet<NodeId> =
+                        owners.iter().copied().collect();
+                    let fallback: Vec<NodeId> = members
+                        .iter()
+                        .map(|m| m.node_id)
+                        .filter(|nid| *nid != self.node_id && !owner_set.contains(nid))
+                        .collect();
+
+                    let mut found = false;
+                    for owner in owners.iter().chain(fallback.iter()) {
                         if *owner == self.node_id {
                             continue;
                         }
@@ -343,6 +354,7 @@ impl ShoalNode {
                                     // Cache locally for future reads.
                                     let _ = self.store.put(shard_meta.shard_id, data.clone()).await;
                                     collected.push((shard_meta.index, data.to_vec()));
+                                    found = true;
                                     break;
                                 }
                                 Ok(None) => {
@@ -363,16 +375,13 @@ impl ShoalNode {
                             }
                         }
                     }
-                }
-
-                if collected.len() < self.erasure_k
-                    && !collected.iter().any(|(idx, _)| *idx == shard_meta.index)
-                {
-                    debug!(
-                        shard_id = %shard_meta.shard_id,
-                        index = shard_meta.index,
-                        "shard not found locally or remotely"
-                    );
+                    if !found {
+                        debug!(
+                            shard_id = %shard_meta.shard_id,
+                            index = shard_meta.index,
+                            "shard not found on any node"
+                        );
+                    }
                 }
             }
 

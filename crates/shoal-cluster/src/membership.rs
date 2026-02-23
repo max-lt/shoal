@@ -14,9 +14,7 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::panic::AssertUnwindSafe;
-
-use foca::{AccumulatingRuntime, Config, Notification, PostcardCodec, Timer};
+use foca::{AccumulatingRuntime, Config, OwnedNotification, PostcardCodec, Timer};
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use shoal_meta::MetaStore;
@@ -178,7 +176,7 @@ async fn membership_loop(
     outgoing_tx: mpsc::UnboundedSender<(ClusterIdentity, Vec<u8>)>,
     mut command_rx: mpsc::UnboundedReceiver<MembershipCommand>,
 ) {
-    let rng = SmallRng::from_entropy();
+    let rng = SmallRng::from_os_rng();
     let codec = PostcardCodec;
     let mut foca = foca::Foca::new(identity, config, rng, codec);
     let mut runtime = AccumulatingRuntime::new();
@@ -192,19 +190,8 @@ async fn membership_loop(
         tokio::select! {
             // --- Incoming SWIM protocol data from the network ---
             Some(data) = incoming_rx.recv() => {
-                // Workaround for foca 0.17.2 bug: handle_data can trigger a
-                // debug_assert panic when processing a Suspect update about
-                // ourselves (handle_self_update → gossip → choose_and_send
-                // writes to member_buf while it's been taken by handle_data).
-                // The foca state remains valid after this — in release builds
-                // the assert is absent and it continues fine.
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    foca.handle_data(&data, &mut runtime)
-                }));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => debug!("foca handle_data error: {e}"),
-                    Err(_) => warn!("foca handle_data panicked (foca 0.17.2 member_buf bug), continuing"),
+                if let Err(e) = foca.handle_data(&data, &mut runtime) {
+                    debug!("foca handle_data error: {e}");
                 }
                 drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
             }
@@ -282,13 +269,13 @@ async fn drain_runtime(
 
 /// Process a single foca membership notification.
 async fn handle_notification(
-    notification: Notification<ClusterIdentity>,
+    notification: OwnedNotification<ClusterIdentity>,
     state: &Arc<ClusterState>,
     meta: &Option<Arc<MetaStore>>,
 ) {
     match notification {
-        Notification::MemberUp(identity) => {
-            let member: Member = (&identity).into();
+        OwnedNotification::MemberUp(identity) => {
+            let member = Member::from(&identity);
             info!(node_id = %member.node_id, "foca: member up");
 
             // Persist to meta store if available.
@@ -301,12 +288,12 @@ async fn handle_notification(
             state.add_member(member).await;
         }
 
-        Notification::MemberDown(identity) => {
+        OwnedNotification::MemberDown(identity) => {
             info!(node_id = %identity.node_id, "foca: member down");
 
             // Update meta store.
             if let Some(meta) = meta {
-                let mut member: Member = (&identity).into();
+                let mut member = Member::from(&identity);
                 member.state = MemberState::Dead;
                 if let Err(e) = meta.put_member(&member) {
                     error!("failed to persist dead member state: {e}");
@@ -316,7 +303,7 @@ async fn handle_notification(
             state.mark_dead(&identity.node_id).await;
         }
 
-        Notification::Rename(old, new) => {
+        OwnedNotification::Rename(old, new) => {
             info!(
                 old_node = %old.node_id,
                 new_gen = new.generation,
@@ -324,23 +311,23 @@ async fn handle_notification(
             );
             // Remove old, add new.
             state.remove_member(&old.node_id).await;
-            let member: Member = (&new).into();
+            let member = Member::from(&new);
             state.add_member(member).await;
         }
 
-        Notification::Active => {
+        OwnedNotification::Active => {
             debug!("foca: this node is now active in the cluster");
         }
 
-        Notification::Idle => {
+        OwnedNotification::Idle => {
             debug!("foca: this node is now idle (no known peers)");
         }
 
-        Notification::Defunct => {
+        OwnedNotification::Defunct => {
             warn!("foca: this node has been declared defunct");
         }
 
-        Notification::Rejoin(new_identity) => {
+        OwnedNotification::Rejoin(new_identity) => {
             info!(
                 gen = new_identity.generation,
                 "foca: auto-rejoined with new generation"
