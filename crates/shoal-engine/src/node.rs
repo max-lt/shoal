@@ -18,6 +18,7 @@ use shoal_types::*;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::cache::ShardCache;
 use crate::error::EngineError;
 
 /// Configuration for creating a [`ShoalNode`].
@@ -39,7 +40,17 @@ pub struct ShoalNodeConfig {
     /// nodes) provides the redundancy. Set to 2+ for belt-and-suspenders
     /// replication on top of erasure coding.
     pub shard_replication: usize,
+    /// Maximum bytes for the read-through shard cache (non-owned shards).
+    ///
+    /// When a node pulls a shard from a remote peer during a read, the
+    /// shard is cached in a bounded LRU instead of the main store. This
+    /// prevents unbounded storage growth. Set to 0 to disable caching.
+    /// Default: 100 MB.
+    pub cache_max_bytes: u64,
 }
+
+/// Default cache size: 100 MB.
+const DEFAULT_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl Default for ShoalNodeConfig {
     fn default() -> Self {
@@ -50,6 +61,7 @@ impl Default for ShoalNodeConfig {
             erasure_m: 2,
             vnodes_per_node: 128,
             shard_replication: 1,
+            cache_max_bytes: DEFAULT_CACHE_MAX_BYTES,
         }
     }
 }
@@ -82,6 +94,8 @@ pub struct ShoalNode {
     transport: Option<Arc<dyn Transport>>,
     /// NodeId → EndpointAddr mapping for remote nodes.
     address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>,
+    /// LRU cache for non-owned shards pulled during reads.
+    shard_cache: ShardCache,
     /// Keys explicitly deleted on this node.
     ///
     /// Prevents `lookup_manifest` from re-fetching deleted objects from
@@ -110,6 +124,7 @@ impl ShoalNode {
             shard_replication: config.shard_replication.max(1),
             transport: None,
             address_book: Arc::new(RwLock::new(HashMap::new())),
+            shard_cache: ShardCache::new(config.cache_max_bytes),
             deleted_keys: RwLock::new(HashSet::new()),
         }
     }
@@ -144,6 +159,11 @@ impl ShoalNode {
     /// Return a reference to the shard store.
     pub fn store(&self) -> &Arc<dyn ShardStore> {
         &self.store
+    }
+
+    /// Return a reference to the read-through shard cache.
+    pub fn shard_cache(&self) -> &ShardCache {
+        &self.shard_cache
     }
 
     // ------------------------------------------------------------------
@@ -341,8 +361,13 @@ impl ShoalNode {
                 if collected.len() >= self.erasure_k {
                     break;
                 }
-                // Try local first.
+                // Try local store first (owned shards).
                 if let Some(data) = self.store.get(shard_meta.shard_id).await? {
+                    collected.push((shard_meta.index, data.to_vec()));
+                    continue;
+                }
+                // Try read-through cache (non-owned, previously pulled shards).
+                if let Some(data) = self.shard_cache.get(&shard_meta.shard_id) {
                     collected.push((shard_meta.index, data.to_vec()));
                     continue;
                 }
@@ -385,8 +410,8 @@ impl ShoalNode {
                                         from = %owner,
                                         "pulled shard from remote"
                                     );
-                                    // Cache locally for future reads.
-                                    let _ = self.store.put(shard_meta.shard_id, data.clone()).await;
+                                    // Cache in bounded LRU (not the main store).
+                                    self.shard_cache.put(shard_meta.shard_id, data.clone());
                                     collected.push((shard_meta.index, data.to_vec()));
                                     found = true;
                                     break;

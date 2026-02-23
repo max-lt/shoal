@@ -252,6 +252,7 @@ impl TestCluster {
                     erasure_m: m,
                     vnodes_per_node: 128,
                     shard_replication,
+                    cache_max_bytes: u64::MAX,
                 },
                 stores[i].clone(),
                 metas[i].clone(),
@@ -383,6 +384,7 @@ async fn writer_reader_pair_with_transport(
             erasure_m: m,
             vnodes_per_node: 128,
             shard_replication: 1,
+            cache_max_bytes: u64::MAX,
         },
         store_a,
         meta_a,
@@ -399,6 +401,7 @@ async fn writer_reader_pair_with_transport(
             erasure_m: m,
             vnodes_per_node: 128,
             shard_replication: 1,
+            cache_max_bytes: u64::MAX,
         },
         store_b,
         meta_b,
@@ -1154,7 +1157,7 @@ async fn test_5_node_concurrent_writes() {
 // =========================================================================
 
 /// After a non-writer reads an object, the pulled shards should be cached
-/// in its local store for future reads.
+/// in the bounded LRU shard cache for future reads.
 #[tokio::test]
 async fn test_pulled_shards_cached_locally() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
@@ -1166,19 +1169,18 @@ async fn test_pulled_shards_cached_locally() {
         .unwrap();
     c.broadcast_manifest(0, "b", "k");
 
-    // Before read: node 2 might have some shards (placed by ring) but
-    // likely not all.
-    let before = c.local_shard_count(2).await;
+    // Before read: the shard cache on node 2 should be empty.
+    let cache_before = c.node(2).shard_cache().len();
 
-    // Read triggers remote pulls.
+    // Read triggers remote pulls — pulled shards go to the LRU cache.
     let (got, _) = c.node(2).get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
 
-    // After read: node 2 should have more shards cached.
-    let after = c.local_shard_count(2).await;
+    // After read: node 2's shard cache should hold the pulled shards.
+    let cache_after = c.node(2).shard_cache().len();
     assert!(
-        after >= before,
-        "shard count should not decrease after read: before={before} after={after}"
+        cache_after > cache_before,
+        "shard cache should grow after read: before={cache_before} after={cache_after}"
     );
 }
 

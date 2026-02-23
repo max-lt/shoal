@@ -73,6 +73,12 @@ pub struct StorageSection {
     pub backend: String,
     /// Chunk size in bytes. Auto-detected if omitted.
     pub chunk_size: Option<u32>,
+    /// Maximum bytes for the read-through shard cache.
+    ///
+    /// When a node pulls a shard from a remote peer during a read, it is
+    /// cached in a bounded LRU instead of the main store. Set to 0 to
+    /// disable caching. Defaults to 100 MB.
+    pub cache_max_bytes: Option<u64>,
 }
 
 impl Default for StorageSection {
@@ -80,6 +86,7 @@ impl Default for StorageSection {
         Self {
             backend: "file".to_string(),
             chunk_size: None,
+            cache_max_bytes: None,
         }
     }
 }
@@ -224,6 +231,13 @@ impl CliConfig {
     /// Defaults to 8.
     pub fn repair_concurrent_transfers(&self) -> u16 {
         self.repair.concurrent_transfers.unwrap_or(8)
+    }
+
+    /// Effective read-through shard cache size in bytes.
+    ///
+    /// Defaults to 100 MB.
+    pub fn cache_max_bytes(&self) -> u64 {
+        self.storage.cache_max_bytes.unwrap_or(100 * 1024 * 1024)
     }
 }
 
