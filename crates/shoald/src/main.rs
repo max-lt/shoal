@@ -270,6 +270,19 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     // --- Cluster state ---
     let cluster = ClusterState::new(node_id, 128);
 
+    // Add self to the ring immediately so shard placement includes this node
+    // from the first write. Without this, the local node wouldn't appear in
+    // the ring until foca considers it "active" (after a peer exchange).
+    cluster
+        .add_member(Member {
+            node_id,
+            capacity: u64::MAX,
+            state: MemberState::Alive,
+            generation: 1,
+            topology: NodeTopology::default(),
+        })
+        .await;
+
     // --- Address book: NodeId → EndpointAddr for routing ---
     let address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>> =
         Arc::new(RwLock::new(HashMap::new()));

@@ -176,10 +176,14 @@ impl ShoalNode {
                 // Determine owners via placement ring.
                 let owners = ring.owners(&shard.id, self.shard_replication);
 
-                // Always store locally (writer keeps a copy).
-                self.store.put(shard.id, shard.data.clone()).await?;
+                // Store locally only if this node is an owner (or if there
+                // is no transport — single-node / test mode).
+                let local_is_owner = owners.contains(&self.node_id);
+                if local_is_owner || self.transport.is_none() {
+                    self.store.put(shard.id, shard.data.clone()).await?;
+                }
 
-                // Push to remote owners if transport is available.
+                // Push to remote owners.
                 if let Some(transport) = &self.transport {
                     for owner in &owners {
                         if *owner == self.node_id {
