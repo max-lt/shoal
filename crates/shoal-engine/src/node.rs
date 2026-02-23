@@ -32,6 +32,13 @@ pub struct ShoalNodeConfig {
     pub erasure_m: usize,
     /// Virtual nodes per physical node in the placement ring.
     pub vnodes_per_node: u16,
+    /// Shard replication factor — how many nodes store each individual shard.
+    ///
+    /// Defaults to 1: each shard is placed on exactly one node, and the
+    /// erasure coding (k data + m parity shards distributed across different
+    /// nodes) provides the redundancy. Set to 2+ for belt-and-suspenders
+    /// replication on top of erasure coding.
+    pub shard_replication: usize,
 }
 
 impl Default for ShoalNodeConfig {
@@ -42,6 +49,7 @@ impl Default for ShoalNodeConfig {
             erasure_k: 4,
             erasure_m: 2,
             vnodes_per_node: 128,
+            shard_replication: 1,
         }
     }
 }
@@ -68,8 +76,8 @@ pub struct ShoalNode {
     /// Erasure coding parameters.
     erasure_k: usize,
     erasure_m: usize,
-    /// Replication factor (k + m).
-    replication_factor: usize,
+    /// Per-shard replication factor (how many ring owners per shard).
+    shard_replication: usize,
     /// Network transport (None in tests / single-node mode).
     transport: Option<Arc<ShoalTransport>>,
     /// NodeId → EndpointAddr mapping for remote nodes.
@@ -84,7 +92,6 @@ impl ShoalNode {
         meta: Arc<MetaStore>,
         cluster: Arc<ClusterState>,
     ) -> Self {
-        let replication_factor = config.erasure_k + config.erasure_m;
         Self {
             node_id: config.node_id,
             store,
@@ -95,7 +102,7 @@ impl ShoalNode {
             encoder: ErasureEncoder::new(config.erasure_k, config.erasure_m),
             erasure_k: config.erasure_k,
             erasure_m: config.erasure_m,
-            replication_factor,
+            shard_replication: config.shard_replication.max(1),
             transport: None,
             address_book: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -167,7 +174,7 @@ impl ShoalNode {
 
             for shard in &shards {
                 // Determine owners via placement ring.
-                let owners = ring.owners(&shard.id, self.replication_factor);
+                let owners = ring.owners(&shard.id, self.shard_replication);
 
                 // Always store locally (writer keeps a copy).
                 self.store.put(shard.id, shard.data.clone()).await?;
