@@ -16,6 +16,7 @@
 //! ```
 
 mod config;
+mod handler;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -25,7 +26,8 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use iroh::{EndpointAddr, SecretKey};
+use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr, SecretKey};
 use shoal_cluster::{ClusterIdentity, ClusterState, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
@@ -37,6 +39,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use config::CliConfig;
+use handler::ShoalProtocol;
 
 // -----------------------------------------------------------------------
 // CLI definition
@@ -230,15 +233,26 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
         "cluster identity derived from secret"
     );
-    let transport = Arc::new(
-        ShoalTransport::bind_with_alpn(secret_key, iroh::RelayMode::Default, cluster_alpn)
-            .await
-            .context("failed to bind iroh endpoint")?,
-    );
 
-    let local_addr = transport.addr();
+    // Create the iroh endpoint directly. The Router will manage the accept
+    // loop for incoming connections; the ShoalTransport is used only for
+    // outgoing connections (push/pull shards, SWIM routing).
+    let endpoint = Endpoint::builder()
+        .secret_key(secret_key)
+        .alpns(vec![cluster_alpn.clone()])
+        .relay_mode(iroh::RelayMode::Default)
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+
+    let transport = Arc::new(ShoalTransport::from_endpoint_with_alpn(
+        endpoint.clone(),
+        cluster_alpn.clone(),
+    ));
+
+    let local_addr = endpoint.addr();
     info!(
-        endpoint_id = %transport.endpoint_id().fmt_short(),
+        endpoint_id = %endpoint.id().fmt_short(),
         "iroh endpoint ready"
     );
     for addr in local_addr.ip_addrs() {
@@ -362,140 +376,18 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         });
     }
 
-    // --- Incoming connection handler ---
-    // Accepts iroh connections and dispatches messages to the membership service.
-    {
-        let transport = transport.clone();
-        let handle = membership_handle.clone();
-        let store = store.clone();
-        let meta = meta.clone();
-        let address_book = address_book.clone();
-        tokio::spawn(async move {
-            loop {
-                match transport.accept().await {
-                    Some(conn) => {
-                        // Learn the remote peer's address for future routing.
-                        let remote_id = conn.remote_id();
-                        let remote_node_id = NodeId::from(*remote_id.as_bytes());
-                        let remote_addr = EndpointAddr::new(remote_id);
-                        address_book
-                            .write()
-                            .await
-                            .insert(remote_node_id, remote_addr);
-
-                        // Spawn a handler for each connection.
-                        let handle = handle.clone();
-                        let store = store.clone();
-                        let meta = meta.clone();
-
-                        // Handle uni-directional streams (SWIM data, shard push, manifest).
-                        let conn_uni = conn.clone();
-                        let handle_uni = handle.clone();
-                        let store_uni = store.clone();
-                        let meta_uni = meta.clone();
-                        tokio::spawn(async move {
-                            ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
-                                let handle = handle_uni.clone();
-                                let store = store_uni.clone();
-                                let meta = meta_uni.clone();
-                                async move {
-                                    match msg {
-                                        ShoalMessage::SwimData(data) => {
-                                            if let Err(e) = handle.feed_data(data) {
-                                                warn!(%e, "failed to feed SWIM data");
-                                            }
-                                        }
-                                        ShoalMessage::ShardPush { shard_id, data } => {
-                                            debug!(%shard_id, len = data.len(), "received shard push");
-                                            if let Err(e) = store
-                                                .put(shard_id, bytes::Bytes::from(data))
-                                                .await
-                                            {
-                                                warn!(%shard_id, %e, "failed to store pushed shard");
-                                            }
-                                        }
-                                        ShoalMessage::ManifestPut {
-                                            bucket,
-                                            key,
-                                            manifest_bytes,
-                                        } => {
-                                            match postcard::from_bytes::<shoal_types::Manifest>(
-                                                &manifest_bytes,
-                                            ) {
-                                                Ok(manifest) => {
-                                                    debug!(
-                                                        %bucket, %key,
-                                                        object_id = %manifest.object_id,
-                                                        "received manifest broadcast"
-                                                    );
-                                                    if let Err(e) = meta.put_manifest(&manifest) {
-                                                        warn!(%e, "failed to store broadcast manifest");
-                                                    }
-                                                    if let Err(e) =
-                                                        meta.put_object_key(&bucket, &key, &manifest.object_id)
-                                                    {
-                                                        warn!(%e, "failed to store broadcast object key");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(%e, "failed to deserialize broadcast manifest");
-                                                }
-                                            }
-                                        }
-                                        other => {
-                                            debug!("unhandled uni-stream message: {other:?}");
-                                        }
-                                    }
-                                }
-                            })
-                            .await;
-                        });
-
-                        // Handle bi-directional streams (shard pull, manifest pull).
-                        let meta_bi = meta.clone();
-                        tokio::spawn(async move {
-                            ShoalTransport::handle_bi_streams(conn, move |msg| {
-                                let store = store.clone();
-                                let meta = meta_bi.clone();
-                                async move {
-                                    match msg {
-                                        ShoalMessage::ShardRequest { shard_id } => {
-                                            let data = store.get(shard_id).await.ok().flatten();
-                                            Some(ShoalMessage::ShardResponse {
-                                                shard_id,
-                                                data: data.map(|b| b.to_vec()),
-                                            })
-                                        }
-                                        ShoalMessage::ManifestRequest { bucket, key } => {
-                                            let manifest_bytes = meta
-                                                .get_object_key(&bucket, &key)
-                                                .ok()
-                                                .flatten()
-                                                .and_then(|oid| {
-                                                    meta.get_manifest(&oid).ok().flatten()
-                                                })
-                                                .and_then(|m| postcard::to_allocvec(&m).ok());
-                                            Some(ShoalMessage::ManifestResponse {
-                                                bucket,
-                                                key,
-                                                manifest_bytes,
-                                            })
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                            })
-                            .await;
-                        });
-                    }
-                    None => {
-                        info!("transport shut down, exiting accept loop");
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    // --- Incoming connection handler (iroh Router) ---
+    // The Router manages the accept loop and dispatches incoming connections
+    // to our ShoalProtocol handler based on the ALPN.
+    let protocol = ShoalProtocol::new(
+        store.clone(),
+        meta.clone(),
+        membership_handle.clone(),
+        address_book.clone(),
+    );
+    let router = Router::builder(endpoint.clone())
+        .accept(cluster_alpn, protocol)
+        .spawn();
 
     // Print join command for other nodes.
     if generated_secret {
@@ -504,7 +396,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     info!(
         "to join this node: shoald start --secret {} --peer {}",
         config.cluster.secret,
-        transport.endpoint_id()
+        endpoint.id()
     );
 
     // --- Engine ---
@@ -537,6 +429,11 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         .serve(&config.node.s3_listen_addr)
         .await
         .context("S3 server failed")?;
+
+    // Gracefully shut down the iroh router (stops accepting new connections,
+    // waits for in-flight handlers, then closes the endpoint).
+    info!("shutting down iroh router");
+    router.shutdown().await.context("router shutdown failed")?;
 
     Ok(())
 }

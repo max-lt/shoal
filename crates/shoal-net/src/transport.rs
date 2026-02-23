@@ -81,6 +81,20 @@ impl ShoalTransport {
         }
     }
 
+    /// Create a transport wrapping an existing endpoint with a custom ALPN.
+    ///
+    /// Use this when the endpoint is shared with an iroh [`Router`] and the
+    /// transport is only used for *outgoing* connections.
+    ///
+    /// [`Router`]: iroh::protocol::Router
+    pub fn from_endpoint_with_alpn(endpoint: Endpoint, alpn: Vec<u8>) -> Self {
+        Self {
+            endpoint,
+            connections: Arc::new(RwLock::new(HashMap::new())),
+            alpn,
+        }
+    }
+
     /// Return a reference to the underlying iroh endpoint.
     pub fn endpoint(&self) -> &Endpoint {
         &self.endpoint
