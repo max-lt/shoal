@@ -461,7 +461,7 @@ Connect store + cas + erasure + placement + meta into a working local write/read
 
 ---
 
-## Milestone 8 — `shoal-net`
+## Milestone 8 — `shoal-net` ✅
 
 Network protocol on top of iroh.
 
@@ -508,22 +508,22 @@ Network protocol on top of iroh.
 
 ---
 
-## Milestone 9 — `shoal-cluster`
+## Milestone 9 — `shoal-cluster` ✅
 
 Membership management combining foca (SWIM) and iroh-gossip.
 
-- [ ] Implement foca integration:
+- [x] Implement foca integration:
   - Implement foca's `Identity` trait for `Member`
   - Implement foca's `Runtime` trait using tokio timers + iroh transport
   - Wrap foca in a `MembershipService` that:
     - Runs the SWIM protocol loop
     - Emits `ClusterEvent::NodeJoined`, `NodeLeft`, `NodeDead` when membership changes
     - Persists membership state to MetaStore
-- [ ] Implement gossip integration:
+- [x] Implement gossip integration:
   - Create a gossip topic for the cluster (derived from a shared cluster secret/key)
   - Broadcast `ClusterEvent`s via iroh-gossip
   - Receive and process events from other nodes
-- [ ] Implement `ClusterState`:
+- [x] Implement `ClusterState`:
 
   ```rust
   pub struct ClusterState {
@@ -539,45 +539,45 @@ Membership management combining foca (SWIM) and iroh-gossip.
 
 **Tests**:
 
-- [ ] Spin up 3 nodes in-process, verify they discover each other via foca
-- [ ] All 3 nodes have consistent membership view within 5 seconds
-- [ ] Kill one node → other 2 detect it as Dead within configurable timeout
-- [ ] New node joins → all existing nodes learn about it
-- [ ] ClusterState ring is recomputed on membership change
-- [ ] Events are received by subscribers
-- [ ] `cargo test -p shoal-cluster` passes
+- [x] Spin up 3 nodes in-process, verify they discover each other via foca
+- [x] All 3 nodes have consistent membership view within 5 seconds
+- [x] Kill one node → other 2 detect it as Dead within configurable timeout
+- [x] New node joins → all existing nodes learn about it
+- [x] ClusterState ring is recomputed on membership change
+- [x] Events are received by subscribers
+- [x] `cargo test -p shoal-cluster` passes
 
 ---
 
-## Milestone 10 — `shoal-repair`
+## Milestone 10 — `shoal-repair` ✅
 
 Auto-repair and rebalancing.
 
-- [ ] Implement `RepairDetector`:
+- [x] Implement `RepairDetector`:
   - Subscribes to `ClusterEvent`s
   - On `NodeDead`: compute which shards were owned by dead node → enqueue in repair queue
   - Periodically: scan local shards, verify they match ring placement, report anomalies
-- [ ] Implement `RepairScheduler`:
+- [x] Implement `RepairScheduler`:
   - Reads from repair queue (MetaStore)
   - Prioritizes: shards with fewer surviving copies get higher priority
   - Respects rate limits: `repair_max_bandwidth`, `repair_concurrent_transfers`
   - On RPi: 1 concurrent transfer, 1MB/s max
   - On datacenter: 64 concurrent transfers, 1GB/s max
-- [ ] Implement `RepairExecutor`:
+- [x] Implement `RepairExecutor`:
   - For each shard to repair:
     1. Find nodes that still have copies (from shard map)
     2. Fetch the shard (or reconstruct via erasure decoding from sibling shards of the same chunk)
     3. Push to new owner (determined by current ring)
     4. Update shard map in MetaStore
-- [ ] Implement `Throttle`:
+- [x] Implement `Throttle`:
   - Token bucket rate limiter for repair bandwidth
   - Adaptive: reduce repair rate when node is under read/write load
-- [ ] Implement `RepairCircuitBreaker` logic (see `NodeConfig.repair_circuit_breaker`):
+- [x] Implement `RepairCircuitBreaker` logic (see `NodeConfig.repair_circuit_breaker`):
   - If ≥`max_down_fraction` of nodes are down → STOP all repair, log CRITICAL
   - If a node was down < `rebalance_cooldown_secs` → don't rebalance its shards
   - Exponential backoff on repair rate when multiple nodes are flapping
   - Queue pressure: throttle aggressively when queue exceeds `queue_pressure_threshold`
-- [ ] Implement majority-vote deep scrub:
+- [x] Implement majority-vote deep scrub:
   - For each local shard, compute blake3 hash
   - Ask N peers who also hold this shard for their hash (lightweight RPC, 32 bytes)
   - If local hash matches majority → shard is good
@@ -586,23 +586,23 @@ Auto-repair and rebalancing.
 
 **Tests**:
 
-- [ ] 3 nodes, store an object, kill 1 node → repair detector enqueues shards
-- [ ] Scheduler dequeues in priority order
-- [ ] Executor successfully repairs a shard by fetching from surviving node
-- [ ] Executor successfully repairs a shard by RS reconstruction when direct copy unavailable
-- [ ] Rate limiting: repair doesn't exceed configured bandwidth
-- [ ] Circuit breaker: repair stops when ≥50% of nodes are down
-- [ ] Circuit breaker: no rebalance during cooldown period after node restart
-- [ ] After repair: object is fully readable again
-- [ ] `cargo test -p shoal-repair` passes
+- [x] 3 nodes, store an object, kill 1 node → repair detector enqueues shards
+- [x] Scheduler dequeues in priority order
+- [x] Executor successfully repairs a shard by fetching from surviving node
+- [x] Executor successfully repairs a shard by RS reconstruction when direct copy unavailable
+- [x] Rate limiting: repair doesn't exceed configured bandwidth
+- [x] Circuit breaker: repair stops when ≥50% of nodes are down
+- [x] Circuit breaker: no rebalance during cooldown period after node restart
+- [x] After repair: object is fully readable again
+- [x] `cargo test -p shoal-repair` passes
 
 ---
 
-## Milestone 11 — `shoal-engine`
+## Milestone 11 — `shoal-engine` ✅
 
 The node orchestrator that ties everything together.
 
-- [ ] Implement `ShoalNode`:
+- [x] Implement `ShoalNode`:
   ```rust
   pub struct ShoalNode {
       config: NodeConfig,
@@ -614,7 +614,7 @@ The node orchestrator that ties everything together.
       // background task handles
   }
   ```
-- [ ] `ShoalNode::start(config)`:
+- [x] `ShoalNode::start(config)`:
   1. Initialize iroh endpoint
   2. Open MetaStore
   3. Initialize ShardStore (Memory or File based on config)
@@ -622,64 +622,64 @@ The node orchestrator that ties everything together.
   5. Start gossip
   6. Start repair detector + scheduler + executor as background tasks
   7. Start incoming message handler
-- [ ] `ShoalNode::put_object(bucket, key, data, metadata)`:
+- [x] `ShoalNode::put_object(bucket, key, data, metadata)`:
   - Full write path: chunk → erasure → distribute shards → build manifest → store manifest as erasure-coded object → update local Fjall index
-- [ ] `ShoalNode::get_object(bucket, key)`:
+- [x] `ShoalNode::get_object(bucket, key)`:
   - Full read path: lookup ObjectId in Fjall → fetch manifest shards → decode manifest → fetch data shards → decode → return
-- [ ] `ShoalNode::delete_object(bucket, key)`:
+- [x] `ShoalNode::delete_object(bucket, key)`:
   - Remove manifest and key mapping
   - Enqueue shard cleanup (background)
-- [ ] Graceful shutdown: persist state, notify cluster of departure
+- [x] Graceful shutdown: persist state, notify cluster of departure
 
 **Tests**:
 
-- [ ] Start a single node, put object, get object → matches
-- [ ] Start 3 nodes, put object, get from any node → matches
-- [ ] Start 3 nodes, put object, stop 1 node, get from surviving node → works (after repair)
-- [ ] Small objects: put/get a tiny object (e.g. 10 bytes) → same pipeline, still works
-- [ ] Delete object: key no longer resolves
-- [ ] Graceful shutdown and restart: data persists
-- [ ] `cargo test -p shoal-engine` passes
+- [x] Start a single node, put object, get object → matches
+- [x] Start 3 nodes, put object, get from any node → matches
+- [x] Start 3 nodes, put object, stop 1 node, get from surviving node → works (after repair)
+- [x] Small objects: put/get a tiny object (e.g. 10 bytes) → same pipeline, still works
+- [x] Delete object: key no longer resolves
+- [x] Graceful shutdown and restart: data persists
+- [x] `cargo test -p shoal-engine` passes
 
 ---
 
-## Milestone 12 — `shoal-s3`
+## Milestone 12 — `shoal-s3` ✅
 
 S3-compatible HTTP API.
 
-- [ ] Implement axum router with S3 endpoints:
+- [x] Implement axum router with S3 endpoints:
   - `PUT /{bucket}/{key}` → PutObject
   - `GET /{bucket}/{key}` → GetObject
   - `DELETE /{bucket}/{key}` → DeleteObject
   - `HEAD /{bucket}/{key}` → HeadObject (metadata only)
   - `GET /{bucket}?list-type=2&prefix=...` → ListObjectsV2
   - `PUT /{bucket}` → CreateBucket (just a namespace in the key mapping)
-- [ ] Implement AWS SigV4 authentication (or start with a simple shared-secret auth)
-- [ ] Proper S3 XML responses (ListObjectsV2 result, error responses)
-- [ ] Multipart upload support:
+- [x] Implement AWS SigV4 authentication (or start with a simple shared-secret auth)
+- [x] Proper S3 XML responses (ListObjectsV2 result, error responses)
+- [x] Multipart upload support:
   - `POST /{bucket}/{key}?uploads` → InitiateMultipartUpload
   - `PUT /{bucket}/{key}?partNumber=N&uploadId=X` → UploadPart
   - `POST /{bucket}/{key}?uploadId=X` → CompleteMultipartUpload
-- [ ] Content-Type and user metadata pass-through
-- [ ] ETags (blake3 hex of object)
+- [x] Content-Type and user metadata pass-through
+- [x] ETags (blake3 hex of object)
 
 **Tests**:
 
-- [ ] PutObject + GetObject via HTTP client (reqwest)
-- [ ] HeadObject returns correct content-length and metadata
-- [ ] ListObjectsV2 with prefix filtering
-- [ ] DeleteObject then GetObject → 404
-- [ ] Multipart upload: 3-part upload → complete → get → matches
+- [x] PutObject + GetObject via HTTP client (reqwest)
+- [x] HeadObject returns correct content-length and metadata
+- [x] ListObjectsV2 with prefix filtering
+- [x] DeleteObject then GetObject → 404
+- [x] Multipart upload: 3-part upload → complete → get → matches
 - [ ] Test with `aws-cli` or `s3cmd` against the running server
-- [ ] `cargo test -p shoal-s3` passes
+- [x] `cargo test -p shoal-s3` passes
 
 ---
 
-## Milestone 13 — `shoal-cli`
+## Milestone 13 — `shoal-cli` ✅
 
 The binary that brings it all together.
 
-- [ ] TOML config file:
+- [x] TOML config file:
 
   ```toml
   [node]
@@ -708,19 +708,19 @@ The binary that brings it all together.
   secret_key = "shoalsecret"
   ```
 
-- [ ] CLI commands:
+- [x] CLI commands:
   - `shoal start` — start the node
   - `shoal status` — show cluster status (members, shard distribution)
   - `shoal repair status` — show repair queue
   - `shoal benchmark` — run a quick read/write benchmark
-- [ ] Auto-detection: if no config specified, detect available RAM and disk, set sensible defaults
-- [ ] Tracing subscriber setup with configurable log level
+- [x] Auto-detection: if no config specified, detect available RAM and disk, set sensible defaults
+- [x] Tracing subscriber setup with configurable log level
 
 **Tests**:
 
-- [ ] Config parsing from TOML
-- [ ] Start node, verify it binds to ports
-- [ ] `cargo test -p shoal-cli` passes
+- [x] Config parsing from TOML
+- [x] Start node, verify it binds to ports
+- [x] `cargo test -p shoal-cli` passes
 
 ---
 
