@@ -275,4 +275,151 @@ mod tests {
         store.put(fixed_id, data_big).await.unwrap();
         assert_eq!(store.capacity().await.unwrap().used_bytes, 16);
     }
+
+    // -----------------------------------------------------------------------
+    // Concurrent access
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_concurrent_put_different_shards() {
+        let store = std::sync::Arc::new(MemoryStore::new(10 * 1024 * 1024));
+        let mut handles = Vec::new();
+
+        for i in 0..50u32 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                let data = Bytes::from(vec![i as u8; 100]);
+                let id = ShardId::from_data(&data);
+                s.put(id, data.clone()).await.unwrap();
+                let got = s.get(id).await.unwrap();
+                assert_eq!(got, Some(data));
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let listed = store.list().await.unwrap();
+        assert_eq!(listed.len(), 50);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_reads() {
+        let store = std::sync::Arc::new(MemoryStore::new(1024 * 1024));
+        let data = Bytes::from_static(b"shared shard data");
+        let id = ShardId::from_data(&data);
+        store.put(id, data.clone()).await.unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..20 {
+            let s = store.clone();
+            let expected = data.clone();
+            handles.push(tokio::spawn(async move {
+                let got = s.get(id).await.unwrap();
+                assert_eq!(got, Some(expected));
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Delete nonexistent shard (should not error)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_shard() {
+        let store = MemoryStore::new(1024);
+        let id = ShardId::from_data(b"ghost");
+        // Should not error.
+        store.delete(id).await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Capacity: exact boundary
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_capacity_exact_boundary() {
+        let store = MemoryStore::new(10);
+        let data = Bytes::from(vec![0u8; 10]);
+        let id = ShardId::from_data(&data);
+
+        // Exactly 10 bytes in a 10-byte store should succeed.
+        store.put(id, data).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 10);
+        assert_eq!(store.capacity().await.unwrap().available_bytes, 0);
+
+        // Any additional data should fail.
+        let extra = Bytes::from_static(b"x");
+        let extra_id = ShardId::from_data(&extra);
+        let result = store.put(extra_id, extra).await;
+        assert!(matches!(
+            result.unwrap_err(),
+            StoreError::CapacityExceeded { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Capacity freed on overwrite with smaller data
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_overwrite_with_smaller_data_frees_capacity() {
+        let store = MemoryStore::new(1024);
+        let fixed_id = ShardId::from([0xBB; 32]);
+
+        let big = Bytes::from(vec![0; 500]);
+        store.put(fixed_id, big).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 500);
+
+        let small = Bytes::from(vec![0; 100]);
+        store.put(fixed_id, small).await.unwrap();
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty shard (zero bytes)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_put_get_empty_shard() {
+        let store = MemoryStore::new(1024);
+        let data = Bytes::from_static(b"");
+        let id = ShardId::from_data(&data);
+
+        store.put(id, data.clone()).await.unwrap();
+        let got = store.get(id).await.unwrap();
+        assert_eq!(got, Some(data));
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Verify after put (happy path)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_verify_immediately_after_put() {
+        let store = MemoryStore::new(1024 * 1024);
+        for i in 0..10u32 {
+            let data = Bytes::from(i.to_le_bytes().to_vec());
+            let id = ShardId::from_data(&data);
+            store.put(id, data).await.unwrap();
+            assert!(store.verify(id).await.unwrap());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // List empty store
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_list_empty_store() {
+        let store = MemoryStore::new(1024);
+        let listed = store.list().await.unwrap();
+        assert!(listed.is_empty());
+    }
 }
