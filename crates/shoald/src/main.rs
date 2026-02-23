@@ -9,7 +9,7 @@
 //! shoald start                              # start the node
 //! shoald start -c shoal.toml               # start with a config file
 //! shoald start -d ./node2 -l 127.0.0.1:4822  # second instance
-//! shoald start --seed <endpoint_id>         # join an existing cluster
+//! shoald start --peer <endpoint_id>         # join an existing cluster
 //! shoald status                             # show cluster status
 //! shoald repair status                      # show repair queue
 //! shoald benchmark -n 200 -s 65536          # write/read benchmark
@@ -69,19 +69,19 @@ enum Commands {
         #[arg(short = 'l', long)]
         s3_listen_addr: Option<String>,
 
-        /// Seed node(s) to join an existing cluster.
+        /// Peer node(s) to connect to on startup.
         ///
         /// Format: `<endpoint_id>` or `<endpoint_id>@<host:port>`.
         /// Can be specified multiple times.
         #[arg(short, long)]
-        seed: Vec<String>,
+        peer: Vec<String>,
 
         /// Cluster secret for authentication (nodes must share the same secret).
         ///
-        /// If not set, falls back to the config file value or the default.
-        /// WARNING: The default secret is public — always set a unique secret
-        /// in production to prevent unauthorized nodes from joining your cluster.
-        #[arg(long)]
+        /// Can also be set via SHOAL_SECRET env var or `[cluster] secret` in
+        /// the config file. If none is provided, a random secret is generated
+        /// and displayed.
+        #[arg(long, env = "SHOAL_SECRET")]
         secret: Option<String>,
 
         /// Run fully in-memory (no disk persistence).
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
         Commands::Start {
             data_dir,
             s3_listen_addr,
-            seed,
+            peer,
             secret,
             memory,
         } => {
@@ -142,9 +142,9 @@ async fn main() -> Result<()> {
             if let Some(addr) = s3_listen_addr {
                 config.node.s3_listen_addr = addr;
             }
-            // Merge CLI seeds with config seeds.
-            if !seed.is_empty() {
-                config.cluster.seeds = seed;
+            // Merge CLI peers with config peers.
+            if !peer.is_empty() {
+                config.cluster.peers = peer;
             }
             if let Some(s) = secret {
                 config.cluster.secret = s;
@@ -176,7 +176,7 @@ fn setup_tracing(level: &str) {
 // shoald start
 // -----------------------------------------------------------------------
 
-async fn cmd_start(config: CliConfig) -> Result<()> {
+async fn cmd_start(mut config: CliConfig) -> Result<()> {
     info!("starting shoald");
     info!(
         data_dir = %config.node.data_dir.display(),
@@ -212,13 +212,14 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
     // --- Cluster secret ---
-    if config.cluster.secret == "shoal-default-secret" {
-        warn!(
-            "using default cluster secret — any node on the internet with the same default can join this cluster via relay"
-        );
-        warn!(
-            "set a unique secret with: --secret <your-secret> or [cluster] secret in config file"
-        );
+    // If no secret was provided (CLI flag, env var, or config file), generate
+    // a random one and display it so the user can pass it to other nodes.
+    let generated_secret = config.cluster.secret.is_empty();
+    if generated_secret {
+        use rand::RngCore;
+        let mut bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        config.cluster.secret = bytes.iter().map(|b| format!("{b:02x}")).collect();
     }
 
     // --- Network transport (iroh QUIC) ---
@@ -282,24 +283,24 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         Some(meta.clone()),
     ));
 
-    // --- Connect to seed nodes ---
-    for seed_str in &config.cluster.seeds {
-        match parse_seed(seed_str) {
-            Ok((seed_endpoint_addr, seed_node_id)) => {
-                // Store seed address for routing.
+    // --- Connect to peer nodes ---
+    for peer_str in &config.cluster.peers {
+        match parse_peer(peer_str) {
+            Ok((peer_endpoint_addr, peer_node_id)) => {
+                // Store peer address for routing.
                 address_book
                     .write()
                     .await
-                    .insert(seed_node_id, seed_endpoint_addr);
-                let seed_identity =
-                    ClusterIdentity::new(seed_node_id, 1, u64::MAX, NodeTopology::default());
-                info!(seed = %seed_str, "joining cluster via seed");
-                if let Err(e) = membership_handle.join(seed_identity) {
-                    warn!(seed = %seed_str, %e, "failed to announce to seed");
+                    .insert(peer_node_id, peer_endpoint_addr);
+                let peer_identity =
+                    ClusterIdentity::new(peer_node_id, 1, u64::MAX, NodeTopology::default());
+                info!(peer = %peer_str, "joining cluster via peer");
+                if let Err(e) = membership_handle.join(peer_identity) {
+                    warn!(peer = %peer_str, %e, "failed to announce to peer");
                 }
             }
             Err(e) => {
-                warn!(seed = %seed_str, %e, "invalid seed format, skipping");
+                warn!(peer = %peer_str, %e, "invalid peer format, skipping");
             }
         }
     }
@@ -484,8 +485,12 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
     }
 
     // Print join command for other nodes.
+    if generated_secret {
+        info!("cluster secret (generated): {}", config.cluster.secret);
+    }
     info!(
-        "to join this node: shoald start --seed {}",
+        "to join this node: shoald start --secret {} --peer {}",
+        config.cluster.secret,
         transport.endpoint_id()
     );
 
@@ -498,6 +503,7 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
                 erasure_k: config.erasure_k() as usize,
                 erasure_m: config.erasure_m() as usize,
                 vnodes_per_node: 128,
+                shard_replication: config.shard_replication() as usize,
             },
             store,
             meta.clone(),
@@ -526,12 +532,12 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
 // Networking helpers
 // -----------------------------------------------------------------------
 
-/// Parse a seed node string.
+/// Parse a peer node string.
 ///
 /// Formats:
 /// - `<endpoint_id>` — hex-encoded 32-byte public key (iroh relay used for discovery)
 /// - `<endpoint_id>@<host:port>` — with an explicit direct address
-fn parse_seed(s: &str) -> Result<(EndpointAddr, NodeId)> {
+fn parse_peer(s: &str) -> Result<(EndpointAddr, NodeId)> {
     let (id_str, addr_str) = match s.split_once('@') {
         Some((id, addr)) => (id, Some(addr)),
         None => (s, None),
@@ -545,7 +551,7 @@ fn parse_seed(s: &str) -> Result<(EndpointAddr, NodeId)> {
     if let Some(addr) = addr_str {
         let socket_addr: SocketAddr = addr
             .parse()
-            .context("invalid socket address in seed (expected host:port)")?;
+            .context("invalid socket address in peer (expected host:port)")?;
         endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
     }
 
@@ -686,6 +692,7 @@ async fn cmd_benchmark(config: &CliConfig, count: usize, size: usize) -> Result<
             erasure_k: k as usize,
             erasure_m: m as usize,
             vnodes_per_node: 128,
+            shard_replication: 1,
         },
         store,
         meta,
@@ -779,6 +786,7 @@ mod tests {
                 erasure_k: 2,
                 erasure_m: 1,
                 vnodes_per_node: 128,
+                shard_replication: 1,
             },
             store,
             meta,
@@ -809,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_seed_endpoint_id_only() {
+    fn test_parse_peer_endpoint_id_only() {
         // Use a known valid ed25519 public key (all zeros is not valid, use a generated one).
         let key = {
             use rand::RngCore;
@@ -819,13 +827,13 @@ mod tests {
         };
         let id_str = key.public().to_string();
 
-        let (addr, node_id) = parse_seed(&id_str).unwrap();
+        let (addr, node_id) = parse_peer(&id_str).unwrap();
         assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
         assert!(addr.is_empty()); // no direct addresses, relay-only
     }
 
     #[test]
-    fn test_parse_seed_with_address() {
+    fn test_parse_peer_with_address() {
         let key = {
             use rand::RngCore;
             let mut b = [0u8; 32];
@@ -835,15 +843,15 @@ mod tests {
         let id_str = key.public().to_string();
         let seed = format!("{id_str}@127.0.0.1:4820");
 
-        let (addr, node_id) = parse_seed(&seed).unwrap();
+        let (addr, node_id) = parse_peer(&seed).unwrap();
         assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
         assert!(!addr.is_empty()); // has a direct address
     }
 
     #[test]
-    fn test_parse_seed_invalid() {
-        assert!(parse_seed("not-a-valid-key").is_err());
-        assert!(parse_seed("abc123@not-a-valid-addr").is_err());
+    fn test_parse_peer_invalid() {
+        assert!(parse_peer("not-a-valid-key").is_err());
+        assert!(parse_peer("abc123@not-a-valid-addr").is_err());
     }
 
     #[test]
@@ -868,18 +876,29 @@ mod tests {
     }
 
     #[test]
-    fn test_default_secret_is_not_empty() {
-        // The default cluster secret should be set but should trigger a warning
-        // when used in production.
+    fn test_default_secret_is_empty() {
+        // When no secret is configured, the default is empty.
+        // cmd_start will generate a random one at startup.
         let config = CliConfig::auto_detect();
         assert!(
-            !config.cluster.secret.is_empty(),
-            "default cluster secret should not be empty"
+            config.cluster.secret.is_empty(),
+            "default cluster secret should be empty (generated at runtime)"
         );
-        // Default secret is known, so nodes without explicit secrets
-        // could join each other via relay — this is the root cause of
-        // phantom node appearances.
-        assert_eq!(config.cluster.secret, "shoal-default-secret");
+    }
+
+    #[test]
+    fn test_cli_peer_flag() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["shoald", "start", "--peer", "abc123", "--peer", "def456"])
+            .expect("CLI should parse with --peer flags");
+
+        match cli.command {
+            Commands::Start { peer, .. } => {
+                assert_eq!(peer, vec!["abc123", "def456"]);
+            }
+            _ => panic!("expected Start command"),
+        }
     }
 
     #[test]

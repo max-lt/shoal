@@ -68,7 +68,7 @@ async-trait = "0.1"
 bytes = "1"
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
 
 # Observability

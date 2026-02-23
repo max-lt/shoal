@@ -53,22 +53,16 @@ impl Default for NodeSection {
 }
 
 /// `[cluster]` section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct ClusterSection {
     /// Shared secret for cluster authentication.
+    ///
+    /// If not set (empty), a random secret is generated at startup and
+    /// displayed so the user can pass it to other nodes.
     pub secret: String,
-    /// Seed nodes to contact on startup (`"node-id@host:port"`).
-    pub seeds: Vec<String>,
-}
-
-impl Default for ClusterSection {
-    fn default() -> Self {
-        Self {
-            secret: "shoal-default-secret".to_string(),
-            seeds: Vec::new(),
-        }
-    }
+    /// Peer nodes to contact on startup (`"node-id"` or `"node-id@host:port"`).
+    pub peers: Vec<String>,
 }
 
 /// `[storage]` section.
@@ -98,6 +92,12 @@ pub struct ErasureSection {
     pub k: Option<u8>,
     /// Number of parity shards.
     pub m: Option<u8>,
+    /// Per-shard replication factor.
+    ///
+    /// How many nodes store each individual shard. Defaults to 1: erasure
+    /// coding provides redundancy so each shard only needs one home. Set
+    /// higher for belt-and-suspenders replication.
+    pub shard_replication: Option<u8>,
 }
 
 /// `[repair]` section.
@@ -197,6 +197,11 @@ impl CliConfig {
         self.erasure.m.unwrap_or(2)
     }
 
+    /// Effective per-shard replication factor.
+    pub fn shard_replication(&self) -> u8 {
+        self.erasure.shard_replication.unwrap_or(1)
+    }
+
     /// S3 auth secret derived from the configured secret key.
     pub fn s3_auth_secret(&self) -> Option<String> {
         self.s3.secret_key.clone()
@@ -232,7 +237,7 @@ s3_listen_addr = "127.0.0.1:5821"
 
 [cluster]
 secret = "my-cluster-secret"
-seeds = ["abc123@192.168.1.10:4820"]
+peers = ["abc123@192.168.1.10:4820"]
 
 [storage]
 backend = "file"
@@ -259,7 +264,7 @@ level = "debug"
         assert_eq!(config.node.listen_addr, "127.0.0.1:5820");
         assert_eq!(config.node.s3_listen_addr, "127.0.0.1:5821");
         assert_eq!(config.cluster.secret, "my-cluster-secret");
-        assert_eq!(config.cluster.seeds, vec!["abc123@192.168.1.10:4820"]);
+        assert_eq!(config.cluster.peers, vec!["abc123@192.168.1.10:4820"]);
         assert_eq!(config.storage.backend, "file");
         assert_eq!(config.storage.chunk_size, Some(262144));
         assert_eq!(config.erasure.k, Some(4));
