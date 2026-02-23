@@ -16,6 +16,7 @@
 //! ```
 
 mod config;
+mod handler;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -24,19 +25,75 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use iroh::{EndpointAddr, SecretKey};
-use shoal_cluster::{ClusterIdentity, ClusterState, membership};
+use iroh::protocol::Router;
+use iroh::{Endpoint, EndpointAddr, SecretKey};
+use iroh_gossip::net::GOSSIP_ALPN;
+use shoal_cluster::{ClusterIdentity, ClusterState, GossipService, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
 use shoal_net::{ShoalMessage, ShoalTransport};
+use shoal_repair::executor::ShardTransfer;
+use shoal_repair::{CircuitBreaker, RepairDetector, RepairExecutor, RepairScheduler, Throttle};
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
-use shoal_types::{Member, MemberState, NodeId, NodeTopology};
+use shoal_types::{Member, MemberState, NodeId, NodeTopology, RepairCircuitBreaker, ShardId};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use config::CliConfig;
+use handler::ShoalProtocol;
+
+// -----------------------------------------------------------------------
+// Repair transport adapter
+// -----------------------------------------------------------------------
+
+/// Bridges [`ShoalTransport`] to the [`ShardTransfer`] trait used by the
+/// repair executor. Resolves `NodeId` → `EndpointAddr` via the address book.
+struct TransportShardTransfer {
+    transport: Arc<ShoalTransport>,
+    address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>,
+}
+
+impl TransportShardTransfer {
+    /// Resolve a NodeId to an EndpointAddr via the address book, falling back
+    /// to constructing an addr from the public key (iroh relay discovery).
+    async fn resolve(&self, node_id: NodeId) -> Result<EndpointAddr, shoal_repair::RepairError> {
+        let book = self.address_book.read().await;
+        if let Some(addr) = book.get(&node_id) {
+            return Ok(addr.clone());
+        }
+        drop(book);
+        // Fall back to constructing from the public key — iroh will use relay.
+        let eid = iroh::EndpointId::from_bytes(node_id.as_bytes())
+            .map_err(|e| shoal_net::NetError::Connect(e.to_string()))?;
+        Ok(EndpointAddr::new(eid))
+    }
+}
+
+#[async_trait::async_trait]
+impl ShardTransfer for TransportShardTransfer {
+    async fn pull_shard(
+        &self,
+        node_id: NodeId,
+        shard_id: ShardId,
+    ) -> Result<Option<Bytes>, shoal_repair::RepairError> {
+        let addr = self.resolve(node_id).await?;
+        Ok(self.transport.pull_shard(addr, shard_id).await?)
+    }
+
+    async fn push_shard(
+        &self,
+        node_id: NodeId,
+        shard_id: ShardId,
+        data: Bytes,
+    ) -> Result<(), shoal_repair::RepairError> {
+        let addr = self.resolve(node_id).await?;
+        self.transport.push_shard(addr, shard_id, data).await?;
+        Ok(())
+    }
+}
 
 // -----------------------------------------------------------------------
 // CLI definition
@@ -200,7 +257,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let secret_key = if memory_mode {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let key = SecretKey::from(bytes);
         info!("generated ephemeral node key (memory mode)");
         key
@@ -218,7 +275,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     if generated_secret {
         use rand::RngCore;
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         config.cluster.secret = bytes.iter().map(|b| format!("{b:02x}")).collect();
     }
 
@@ -230,15 +287,26 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
         "cluster identity derived from secret"
     );
-    let transport = Arc::new(
-        ShoalTransport::bind_with_alpn(secret_key, iroh::RelayMode::Default, cluster_alpn)
-            .await
-            .context("failed to bind iroh endpoint")?,
-    );
 
-    let local_addr = transport.addr();
+    // Create the iroh endpoint directly. The Router will manage the accept
+    // loop for incoming connections; the ShoalTransport is used only for
+    // outgoing connections (push/pull shards, SWIM routing).
+    let endpoint = Endpoint::builder()
+        .secret_key(secret_key)
+        .alpns(vec![cluster_alpn.clone()])
+        .relay_mode(iroh::RelayMode::Default)
+        .bind()
+        .await
+        .context("failed to bind iroh endpoint")?;
+
+    let transport = Arc::new(ShoalTransport::from_endpoint_with_alpn(
+        endpoint.clone(),
+        cluster_alpn.clone(),
+    ));
+
+    let local_addr = endpoint.addr();
     info!(
-        endpoint_id = %transport.endpoint_id().fmt_short(),
+        endpoint_id = %endpoint.id().fmt_short(),
         "iroh endpoint ready"
     );
     for addr in local_addr.ip_addrs() {
@@ -362,140 +430,32 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         });
     }
 
-    // --- Incoming connection handler ---
-    // Accepts iroh connections and dispatches messages to the membership service.
-    {
-        let transport = transport.clone();
-        let handle = membership_handle.clone();
-        let store = store.clone();
-        let meta = meta.clone();
-        let address_book = address_book.clone();
-        tokio::spawn(async move {
-            loop {
-                match transport.accept().await {
-                    Some(conn) => {
-                        // Learn the remote peer's address for future routing.
-                        let remote_id = conn.remote_id();
-                        let remote_node_id = NodeId::from(*remote_id.as_bytes());
-                        let remote_addr = EndpointAddr::new(remote_id);
-                        address_book
-                            .write()
-                            .await
-                            .insert(remote_node_id, remote_addr);
+    // --- Gossip service (iroh-gossip) ---
+    // Create the Gossip instance and GossipService. The Gossip protocol
+    // handler is registered alongside our custom ShoalProtocol in a single
+    // Router below.
+    let gossip = iroh_gossip::Gossip::builder()
+        .max_message_size(8192)
+        .spawn(endpoint.clone());
+    let gossip_service = GossipService::new(
+        gossip.clone(),
+        config.cluster.secret.as_bytes(),
+        cluster.clone(),
+    );
 
-                        // Spawn a handler for each connection.
-                        let handle = handle.clone();
-                        let store = store.clone();
-                        let meta = meta.clone();
-
-                        // Handle uni-directional streams (SWIM data, shard push, manifest).
-                        let conn_uni = conn.clone();
-                        let handle_uni = handle.clone();
-                        let store_uni = store.clone();
-                        let meta_uni = meta.clone();
-                        tokio::spawn(async move {
-                            ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
-                                let handle = handle_uni.clone();
-                                let store = store_uni.clone();
-                                let meta = meta_uni.clone();
-                                async move {
-                                    match msg {
-                                        ShoalMessage::SwimData(data) => {
-                                            if let Err(e) = handle.feed_data(data) {
-                                                warn!(%e, "failed to feed SWIM data");
-                                            }
-                                        }
-                                        ShoalMessage::ShardPush { shard_id, data } => {
-                                            debug!(%shard_id, len = data.len(), "received shard push");
-                                            if let Err(e) = store
-                                                .put(shard_id, bytes::Bytes::from(data))
-                                                .await
-                                            {
-                                                warn!(%shard_id, %e, "failed to store pushed shard");
-                                            }
-                                        }
-                                        ShoalMessage::ManifestPut {
-                                            bucket,
-                                            key,
-                                            manifest_bytes,
-                                        } => {
-                                            match postcard::from_bytes::<shoal_types::Manifest>(
-                                                &manifest_bytes,
-                                            ) {
-                                                Ok(manifest) => {
-                                                    debug!(
-                                                        %bucket, %key,
-                                                        object_id = %manifest.object_id,
-                                                        "received manifest broadcast"
-                                                    );
-                                                    if let Err(e) = meta.put_manifest(&manifest) {
-                                                        warn!(%e, "failed to store broadcast manifest");
-                                                    }
-                                                    if let Err(e) =
-                                                        meta.put_object_key(&bucket, &key, &manifest.object_id)
-                                                    {
-                                                        warn!(%e, "failed to store broadcast object key");
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    warn!(%e, "failed to deserialize broadcast manifest");
-                                                }
-                                            }
-                                        }
-                                        other => {
-                                            debug!("unhandled uni-stream message: {other:?}");
-                                        }
-                                    }
-                                }
-                            })
-                            .await;
-                        });
-
-                        // Handle bi-directional streams (shard pull, manifest pull).
-                        let meta_bi = meta.clone();
-                        tokio::spawn(async move {
-                            ShoalTransport::handle_bi_streams(conn, move |msg| {
-                                let store = store.clone();
-                                let meta = meta_bi.clone();
-                                async move {
-                                    match msg {
-                                        ShoalMessage::ShardRequest { shard_id } => {
-                                            let data = store.get(shard_id).await.ok().flatten();
-                                            Some(ShoalMessage::ShardResponse {
-                                                shard_id,
-                                                data: data.map(|b| b.to_vec()),
-                                            })
-                                        }
-                                        ShoalMessage::ManifestRequest { bucket, key } => {
-                                            let manifest_bytes = meta
-                                                .get_object_key(&bucket, &key)
-                                                .ok()
-                                                .flatten()
-                                                .and_then(|oid| {
-                                                    meta.get_manifest(&oid).ok().flatten()
-                                                })
-                                                .and_then(|m| postcard::to_allocvec(&m).ok());
-                                            Some(ShoalMessage::ManifestResponse {
-                                                bucket,
-                                                key,
-                                                manifest_bytes,
-                                            })
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                            })
-                            .await;
-                        });
-                    }
-                    None => {
-                        info!("transport shut down, exiting accept loop");
-                        break;
-                    }
-                }
-            }
-        });
-    }
+    // --- Incoming connection handler (iroh Router) ---
+    // A single Router handles both our custom protocol (cluster_alpn) and
+    // the iroh-gossip protocol (GOSSIP_ALPN).
+    let protocol = ShoalProtocol::new(
+        store.clone(),
+        meta.clone(),
+        membership_handle.clone(),
+        address_book.clone(),
+    );
+    let router = Router::builder(endpoint.clone())
+        .accept(cluster_alpn, protocol)
+        .accept(GOSSIP_ALPN, gossip)
+        .spawn();
 
     // Print join command for other nodes.
     if generated_secret {
@@ -504,8 +464,68 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     info!(
         "to join this node: shoald start --secret {} --peer {}",
         config.cluster.secret,
-        transport.endpoint_id()
+        endpoint.id()
     );
+
+    // --- Join gossip topic ---
+    // Collect the EndpointIds of configured peers for gossip bootstrap.
+    let peer_endpoint_ids: Vec<iroh::EndpointId> = config
+        .cluster
+        .peers
+        .iter()
+        .filter_map(|p| {
+            let id_str = p.split_once('@').map(|(id, _)| id).unwrap_or(p);
+            id_str.parse().ok()
+        })
+        .collect();
+
+    let gossip_handle = if !peer_endpoint_ids.is_empty() {
+        match gossip_service.join(peer_endpoint_ids).await {
+            Ok(handle) => {
+                info!("joined gossip topic");
+                Some(handle)
+            }
+            Err(e) => {
+                warn!(%e, "failed to join gossip topic — continuing without gossip");
+                None
+            }
+        }
+    } else {
+        // First node — subscribe to topic without bootstrap peers.
+        match gossip_service.join(vec![]).await {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                warn!(%e, "failed to create gossip topic");
+                None
+            }
+        }
+    };
+
+    // --- Gossip broadcast bridge ---
+    // Forwards local cluster events (from foca/membership) to gossip so
+    // other nodes learn about membership changes and shard events.
+    if let Some(gossip_handle) = gossip_handle.as_ref() {
+        let handle = gossip_handle.clone();
+        let mut events = cluster.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        if let Err(e) = handle.broadcast(&event).await {
+                            debug!(%e, "failed to broadcast cluster event via gossip");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        warn!(skipped = n, "gossip broadcast bridge lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        info!("gossip broadcast bridge shutting down");
+                        break;
+                    }
+                }
+            }
+        });
+    }
 
     // --- Engine ---
     let engine = Arc::new(
@@ -517,14 +537,89 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                 erasure_m: config.erasure_m() as usize,
                 vnodes_per_node: 128,
                 shard_replication: config.shard_replication() as usize,
+                cache_max_bytes: config.cache_max_bytes(),
             },
-            store,
+            store.clone(),
             meta.clone(),
-            cluster,
+            cluster.clone(),
         )
         .with_transport(transport.clone())
         .with_address_book(address_book.clone()),
     );
+
+    // --- Repair subsystem ---
+    // Wire up the repair detector, scheduler, and executor as background
+    // tasks. The detector watches for cluster events (node failures) and
+    // enqueues shards for repair. The scheduler dequeues them respecting
+    // rate limits and the circuit breaker. The executor fetches/reconstructs
+    // missing shards.
+    let replication_factor = config.shard_replication() as usize;
+    let repair_transfer: Arc<dyn ShardTransfer> = Arc::new(TransportShardTransfer {
+        transport: transport.clone(),
+        address_book: address_book.clone(),
+    });
+    let circuit_breaker = Arc::new(CircuitBreaker::new(RepairCircuitBreaker::default()));
+    let throttle = Throttle::new(config.repair_max_bandwidth_bytes());
+    let repair_executor = RepairExecutor::new(
+        cluster.clone(),
+        meta.clone(),
+        store.clone(),
+        repair_transfer,
+        node_id,
+        replication_factor,
+        config.erasure_k() as usize,
+        config.erasure_m() as usize,
+    );
+    let repair_scheduler = RepairScheduler::new(
+        meta.clone(),
+        cluster.clone(),
+        repair_executor,
+        circuit_breaker,
+        throttle,
+        config.repair_concurrent_transfers(),
+        1000, // poll interval: check repair queue every second
+    );
+    let repair_detector = RepairDetector::new(
+        cluster.clone(),
+        meta.clone(),
+        store.clone(),
+        replication_factor,
+    );
+
+    // Spawn repair background tasks.
+    let detector_events = cluster.subscribe();
+    tokio::spawn(async move {
+        repair_detector.run(detector_events).await;
+    });
+    tokio::spawn(async move {
+        repair_scheduler.run().await;
+    });
+    info!(
+        concurrent = config.repair_concurrent_transfers(),
+        bandwidth = config.repair_max_bandwidth_bytes(),
+        "repair subsystem started"
+    );
+
+    // --- Manifest sync (catch up on historical manifests from peers) ---
+    // This is necessary because manifest broadcasts are point-in-time: if
+    // this node is joining an existing cluster, it missed all previous
+    // broadcasts. We pull all manifests from one peer to populate our local
+    // Fjall index, so that list_objects returns a complete view.
+    if !config.cluster.peers.is_empty() {
+        let engine_sync = engine.clone();
+        tokio::spawn(async move {
+            // Small delay to let SWIM handshake establish connections.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match engine_sync.sync_manifests_from_peers().await {
+                Ok(0) => debug!("manifest sync: nothing new from peers"),
+                Ok(n) => info!(
+                    count = n,
+                    "manifest sync: caught up on historical manifests"
+                ),
+                Err(e) => warn!(%e, "manifest sync failed (will retry on next restart)"),
+            }
+        });
+    }
 
     // --- S3 HTTP API ---
     let server = S3Server::new(S3ServerConfig {
@@ -537,6 +632,11 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         .serve(&config.node.s3_listen_addr)
         .await
         .context("S3 server failed")?;
+
+    // Gracefully shut down the iroh router (stops accepting new connections,
+    // waits for in-flight handlers, then closes the endpoint).
+    info!("shutting down iroh router");
+    router.shutdown().await.context("router shutdown failed")?;
 
     Ok(())
 }
@@ -599,7 +699,7 @@ fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
         // Generate a new random ed25519 key.
         use rand::RngCore;
         let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
+        rand::rng().fill_bytes(&mut bytes);
         let key = SecretKey::from(bytes);
         std::fs::write(&key_path, key.to_bytes()).context("failed to write node.key")?;
         info!(
@@ -706,6 +806,7 @@ async fn cmd_benchmark(config: &CliConfig, count: usize, size: usize) -> Result<
             erasure_m: m as usize,
             vnodes_per_node: 128,
             shard_replication: 1,
+            cache_max_bytes: config.cache_max_bytes(),
         },
         store,
         meta,
@@ -800,6 +901,7 @@ mod tests {
                 erasure_m: 1,
                 vnodes_per_node: 128,
                 shard_replication: 1,
+                cache_max_bytes: u64::MAX,
             },
             store,
             meta,
@@ -835,7 +937,7 @@ mod tests {
         let key = {
             use rand::RngCore;
             let mut b = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut b);
+            rand::rng().fill_bytes(&mut b);
             SecretKey::from(b)
         };
         let id_str = key.public().to_string();
@@ -850,7 +952,7 @@ mod tests {
         let key = {
             use rand::RngCore;
             let mut b = [0u8; 32];
-            rand::thread_rng().fill_bytes(&mut b);
+            rand::rng().fill_bytes(&mut b);
             SecretKey::from(b)
         };
         let id_str = key.public().to_string();

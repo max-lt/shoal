@@ -48,10 +48,10 @@ iroh = "0.96"
 iroh-gossip = { version = "0.96", features = ["net"] }
 
 # Membership
-foca = { version = "0.17", features = ["postcard-codec", "std", "tracing"] }
+foca = { version = "1", features = ["postcard-codec", "std", "tracing"] }
 
 # Random
-rand = { version = "0.8", features = ["small_rng"] }
+rand = "0.9"
 
 # Serialization
 postcard = { version = "1", features = ["alloc"] }
@@ -69,7 +69,7 @@ bytes = "1"
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
-toml = "0.8"
+toml = "1"
 
 # Observability
 tracing = "0.1"

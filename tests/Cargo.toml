@@ -11,9 +11,54 @@ shoal-cas = { workspace = true }
 shoal-meta = { workspace = true }
 shoal-erasure = { workspace = true }
 shoal-placement = { workspace = true }
+shoal-cluster = { workspace = true }
+shoal-net = { workspace = true }
+shoal-engine = { workspace = true }
+iroh = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+async-trait = { workspace = true }
+postcard = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+futures-lite = "2"
+
+[lib]
+name = "shoal_integration_tests"
+path = "src/lib.rs"
 
 [[test]]
 name = "local_pipeline"
 path = "integration/local_pipeline.rs"
+
+[[test]]
+name = "cluster_formation"
+path = "integration/cluster_formation.rs"
+
+[[test]]
+name = "write_read"
+path = "integration/write_read.rs"
+
+[[test]]
+name = "node_failure"
+path = "integration/node_failure.rs"
+
+[[test]]
+name = "rebalancing"
+path = "integration/rebalancing.rs"
+
+[[test]]
+name = "stress"
+path = "integration/stress.rs"
+
+[[test]]
+name = "torture"
+path = "integration/torture.rs"
+
+[[test]]
+name = "random_kill"
+path = "chaos/random_kill.rs"
+
+[[test]]
+name = "network_partition"
+path = "chaos/network_partition.rs"

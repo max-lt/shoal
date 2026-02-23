@@ -4,7 +4,7 @@
 //! and network transport, and exposes the write/read/delete pipeline for
 //! objects.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use iroh::EndpointAddr;
@@ -12,12 +12,13 @@ use shoal_cas::{Chunker, build_manifest};
 use shoal_cluster::ClusterState;
 use shoal_erasure::ErasureEncoder;
 use shoal_meta::MetaStore;
-use shoal_net::{ShoalMessage, ShoalTransport};
+use shoal_net::{ShoalMessage, Transport};
 use shoal_store::ShardStore;
 use shoal_types::*;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::cache::ShardCache;
 use crate::error::EngineError;
 
 /// Configuration for creating a [`ShoalNode`].
@@ -39,7 +40,17 @@ pub struct ShoalNodeConfig {
     /// nodes) provides the redundancy. Set to 2+ for belt-and-suspenders
     /// replication on top of erasure coding.
     pub shard_replication: usize,
+    /// Maximum bytes for the read-through shard cache (non-owned shards).
+    ///
+    /// When a node pulls a shard from a remote peer during a read, the
+    /// shard is cached in a bounded LRU instead of the main store. This
+    /// prevents unbounded storage growth. Set to 0 to disable caching.
+    /// Default: 100 MB.
+    pub cache_max_bytes: u64,
 }
+
+/// Default cache size: 100 MB.
+const DEFAULT_CACHE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
 impl Default for ShoalNodeConfig {
     fn default() -> Self {
@@ -50,6 +61,7 @@ impl Default for ShoalNodeConfig {
             erasure_m: 2,
             vnodes_per_node: 128,
             shard_replication: 1,
+            cache_max_bytes: DEFAULT_CACHE_MAX_BYTES,
         }
     }
 }
@@ -79,9 +91,16 @@ pub struct ShoalNode {
     /// Per-shard replication factor (how many ring owners per shard).
     shard_replication: usize,
     /// Network transport (None in tests / single-node mode).
-    transport: Option<Arc<ShoalTransport>>,
+    transport: Option<Arc<dyn Transport>>,
     /// NodeId → EndpointAddr mapping for remote nodes.
     address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>,
+    /// LRU cache for non-owned shards pulled during reads.
+    shard_cache: ShardCache,
+    /// Keys explicitly deleted on this node.
+    ///
+    /// Prevents `lookup_manifest` from re-fetching deleted objects from
+    /// peers when `pull_manifest` is available.
+    deleted_keys: RwLock<HashSet<(String, String)>>,
 }
 
 impl ShoalNode {
@@ -105,11 +124,13 @@ impl ShoalNode {
             shard_replication: config.shard_replication.max(1),
             transport: None,
             address_book: Arc::new(RwLock::new(HashMap::new())),
+            shard_cache: ShardCache::new(config.cache_max_bytes),
+            deleted_keys: RwLock::new(HashSet::new()),
         }
     }
 
     /// Set the network transport for distributed operations.
-    pub fn with_transport(mut self, transport: Arc<ShoalTransport>) -> Self {
+    pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
         self
     }
@@ -140,6 +161,11 @@ impl ShoalNode {
         &self.store
     }
 
+    /// Return a reference to the read-through shard cache.
+    pub fn shard_cache(&self) -> &ShardCache {
+        &self.shard_cache
+    }
+
     // ------------------------------------------------------------------
     // Write path
     // ------------------------------------------------------------------
@@ -167,6 +193,11 @@ impl ShoalNode {
 
         let mut chunk_metas = Vec::with_capacity(chunks.len());
 
+        // Remote pushes are fired in parallel to avoid blocking on slow or
+        // dead nodes. Local stores and metadata writes stay sequential
+        // (fast, no network).
+        let mut push_tasks = tokio::task::JoinSet::new();
+
         for chunk in &chunks {
             let (shards, _original_size) = self.encoder.encode(&chunk.data)?;
 
@@ -183,23 +214,27 @@ impl ShoalNode {
                     self.store.put(shard.id, shard.data.clone()).await?;
                 }
 
-                // Push to remote owners.
+                // Push to remote owners (spawned in parallel).
                 if let Some(transport) = &self.transport {
                     for owner in &owners {
                         if *owner == self.node_id {
                             continue;
                         }
-                        if let Some(addr) = self.resolve_addr(owner).await
-                            && let Err(e) = transport
-                                .push_shard(addr, shard.id, shard.data.clone())
-                                .await
-                        {
-                            warn!(
-                                target_node = %owner,
-                                shard_id = %shard.id,
-                                %e,
-                                "failed to push shard to remote owner"
-                            );
+                        if let Some(addr) = self.resolve_addr(owner).await {
+                            let transport = transport.clone();
+                            let owner_id = *owner;
+                            let shard_id = shard.id;
+                            let data = shard.data.clone();
+                            push_tasks.spawn(async move {
+                                if let Err(e) = transport.push_shard(addr, shard_id, data).await {
+                                    warn!(
+                                        target_node = %owner_id,
+                                        shard_id = %shard_id,
+                                        %e,
+                                        "failed to push shard to remote owner"
+                                    );
+                                }
+                            });
                         }
                     }
                 }
@@ -222,6 +257,13 @@ impl ShoalNode {
             });
         }
 
+        // Wait for all remote shard pushes to complete.
+        while let Some(res) = push_tasks.join_next().await {
+            if let Err(e) = res {
+                warn!(%e, "shard push task panicked");
+            }
+        }
+
         // Step 3: build manifest.
         let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
         let object_id = manifest.object_id;
@@ -230,27 +272,39 @@ impl ShoalNode {
         self.meta.put_manifest(&manifest)?;
         self.meta.put_object_key(bucket, key, &object_id)?;
 
-        // Step 5: broadcast manifest to all known peers.
+        // Step 5: broadcast manifest to all known peers in parallel.
         if let Some(transport) = &self.transport {
             let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
-            let msg = ShoalMessage::ManifestPut {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                manifest_bytes,
-            };
             let peers = self.cluster.members().await;
+            let mut broadcast_tasks = tokio::task::JoinSet::new();
+
             for peer in &peers {
                 if peer.node_id == self.node_id {
                     continue;
                 }
-                if let Some(addr) = self.resolve_addr(&peer.node_id).await
-                    && let Err(e) = transport.send_to(addr, &msg).await
-                {
-                    warn!(
-                        peer = %peer.node_id,
-                        %e,
-                        "failed to broadcast manifest"
-                    );
+                if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                    let transport = transport.clone();
+                    let peer_id = peer.node_id;
+                    let msg = ShoalMessage::ManifestPut {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        manifest_bytes: manifest_bytes.clone(),
+                    };
+                    broadcast_tasks.spawn(async move {
+                        if let Err(e) = transport.send_to(addr, &msg).await {
+                            warn!(
+                                peer = %peer_id,
+                                %e,
+                                "failed to broadcast manifest"
+                            );
+                        }
+                    });
+                }
+            }
+
+            while let Some(res) = broadcast_tasks.join_next().await {
+                if let Err(e) = res {
+                    warn!(%e, "manifest broadcast task panicked");
                 }
             }
         }
@@ -307,16 +361,44 @@ impl ShoalNode {
                 if collected.len() >= self.erasure_k {
                     break;
                 }
-                // Try local first.
+                // Try local store first (owned shards).
                 if let Some(data) = self.store.get(shard_meta.shard_id).await? {
                     collected.push((shard_meta.index, data.to_vec()));
                     continue;
                 }
+                // Try read-through cache (non-owned, previously pulled shards).
+                if let Some(data) = self.shard_cache.get(&shard_meta.shard_id) {
+                    collected.push((shard_meta.index, data.to_vec()));
+                    continue;
+                }
                 // Try remote if transport available.
-                if let Some(transport) = &self.transport
-                    && let Some(owners) = self.meta.get_shard_owners(&shard_meta.shard_id)?
-                {
-                    for owner in &owners {
+                if let Some(transport) = &self.transport {
+                    // Build candidate list: start with known/computed owners,
+                    // then fall back to all cluster members. This handles
+                    // ring changes after node failures — the current ring
+                    // may point to nodes that don't hold the shard because
+                    // placement changed since write time.
+                    let owners = match self.meta.get_shard_owners(&shard_meta.shard_id)? {
+                        Some(owners) => owners,
+                        None => {
+                            let ring = self.cluster.ring().await;
+                            ring.owners(&shard_meta.shard_id, self.shard_replication)
+                        }
+                    };
+
+                    // Collect all members as fallback candidates (excluding
+                    // the owners we'll try first and ourselves).
+                    let members = self.cluster.members().await;
+                    let owner_set: std::collections::HashSet<NodeId> =
+                        owners.iter().copied().collect();
+                    let fallback: Vec<NodeId> = members
+                        .iter()
+                        .map(|m| m.node_id)
+                        .filter(|nid| *nid != self.node_id && !owner_set.contains(nid))
+                        .collect();
+
+                    let mut found = false;
+                    for owner in owners.iter().chain(fallback.iter()) {
                         if *owner == self.node_id {
                             continue;
                         }
@@ -328,9 +410,10 @@ impl ShoalNode {
                                         from = %owner,
                                         "pulled shard from remote"
                                     );
-                                    // Cache locally for future reads.
-                                    let _ = self.store.put(shard_meta.shard_id, data.clone()).await;
+                                    // Cache in bounded LRU (not the main store).
+                                    self.shard_cache.put(shard_meta.shard_id, data.clone());
                                     collected.push((shard_meta.index, data.to_vec()));
+                                    found = true;
                                     break;
                                 }
                                 Ok(None) => {
@@ -351,16 +434,13 @@ impl ShoalNode {
                             }
                         }
                     }
-                }
-
-                if collected.len() < self.erasure_k
-                    && !collected.iter().any(|(idx, _)| *idx == shard_meta.index)
-                {
-                    debug!(
-                        shard_id = %shard_meta.shard_id,
-                        index = shard_meta.index,
-                        "shard not found locally or remotely"
-                    );
+                    if !found {
+                        debug!(
+                            shard_id = %shard_meta.shard_id,
+                            index = shard_meta.index,
+                            "shard not found on any node"
+                        );
+                    }
                 }
             }
 
@@ -412,6 +492,12 @@ impl ShoalNode {
         // Remove key mapping.
         self.meta.delete_object_key(bucket, key)?;
 
+        // Track deletion so lookup_manifest won't re-fetch from peers.
+        self.deleted_keys
+            .write()
+            .await
+            .insert((bucket.to_string(), key.to_string()));
+
         info!(bucket, key, %object_id, "delete_object: key mapping removed");
 
         Ok(())
@@ -446,6 +532,84 @@ impl ShoalNode {
     }
 
     // ------------------------------------------------------------------
+    // Manifest sync
+    // ------------------------------------------------------------------
+
+    /// Sync manifests from cluster peers.
+    ///
+    /// When a node joins (or restarts), it may have missed manifest
+    /// broadcasts for objects stored before it was part of the cluster.
+    /// This method pulls all manifests from each peer and stores them
+    /// locally, ensuring `list_objects` returns a complete view.
+    ///
+    /// Returns the total number of new manifests synced.
+    pub async fn sync_manifests_from_peers(&self) -> Result<usize, EngineError> {
+        let Some(transport) = &self.transport else {
+            return Ok(0);
+        };
+
+        let peers = self.cluster.members().await;
+        let mut total_synced = 0usize;
+
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                continue;
+            };
+
+            match transport.pull_all_manifests(addr).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        match postcard::from_bytes::<Manifest>(&entry.manifest_bytes) {
+                            Ok(manifest) => {
+                                // Only store if we don't already have this key mapping.
+                                if self
+                                    .meta
+                                    .get_object_key(&entry.bucket, &entry.key)?
+                                    .is_none()
+                                {
+                                    self.meta.put_manifest(&manifest)?;
+                                    self.meta.put_object_key(
+                                        &entry.bucket,
+                                        &entry.key,
+                                        &manifest.object_id,
+                                    )?;
+                                    total_synced += 1;
+                                    debug!(
+                                        bucket = %entry.bucket,
+                                        key = %entry.key,
+                                        object_id = %manifest.object_id,
+                                        from = %peer.node_id,
+                                        "synced manifest from peer"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    from = %peer.node_id,
+                                    %e,
+                                    "failed to deserialize synced manifest"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(from = %peer.node_id, %e, "failed to sync manifests from peer");
+                }
+            }
+        }
+
+        if total_synced > 0 {
+            info!(total_synced, "manifest sync complete");
+        }
+
+        Ok(total_synced)
+    }
+
+    // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 
@@ -462,6 +626,16 @@ impl ShoalNode {
             && let Some(manifest) = self.meta.get_manifest(&object_id)?
         {
             return Ok(Some(manifest));
+        }
+
+        // Don't re-fetch from peers if this key was explicitly deleted.
+        if self
+            .deleted_keys
+            .read()
+            .await
+            .contains(&(bucket.to_string(), key.to_string()))
+        {
+            return Ok(None);
         }
 
         // Ask peers if transport is available.

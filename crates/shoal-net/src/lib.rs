@@ -16,8 +16,50 @@ mod tests;
 mod transport;
 
 pub use error::NetError;
-pub use message::ShoalMessage;
+pub use message::{ManifestSyncEntry, ShoalMessage};
 pub use transport::ShoalTransport;
+
+/// Trait abstracting the network transport operations used by the engine.
+///
+/// This allows substituting a mock transport in tests (avoiding the need
+/// for real iroh QUIC endpoints and network access).
+#[async_trait::async_trait]
+pub trait Transport: Send + Sync {
+    /// Push a shard to a remote node.
+    async fn push_shard(
+        &self,
+        addr: iroh::EndpointAddr,
+        shard_id: shoal_types::ShardId,
+        data: bytes::Bytes,
+    ) -> Result<(), NetError>;
+
+    /// Pull a shard from a remote node. Returns `None` if the remote
+    /// node does not have the shard.
+    async fn pull_shard(
+        &self,
+        addr: iroh::EndpointAddr,
+        shard_id: shoal_types::ShardId,
+    ) -> Result<Option<bytes::Bytes>, NetError>;
+
+    /// Send a message to a remote node (uni-directional).
+    async fn send_to(&self, addr: iroh::EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError>;
+
+    /// Pull a manifest from a remote node.
+    async fn pull_manifest(
+        &self,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError>;
+
+    /// Pull all manifests from a remote node (bulk sync for catch-up).
+    ///
+    /// Returns a list of `(bucket, key, manifest_bytes)` entries.
+    async fn pull_all_manifests(
+        &self,
+        addr: iroh::EndpointAddr,
+    ) -> Result<Vec<ManifestSyncEntry>, NetError>;
+}
 
 /// Default ALPN protocol identifier (no cluster secret).
 pub const SHOAL_ALPN: &[u8] = b"shoal/0";
