@@ -64,6 +64,29 @@ impl ErasureEncoder {
         let originals: Vec<&[u8]> = padded.chunks_exact(shard_size).collect();
         debug_assert_eq!(originals.len(), self.k);
 
+        // Fast path: m=0 means no parity shards needed (passthrough).
+        // reed-solomon-simd doesn't support recovery_count=0.
+        if self.m == 0 {
+            let mut shards = Vec::with_capacity(self.k);
+            for (i, original) in originals.iter().enumerate() {
+                let data = Bytes::copy_from_slice(original);
+                let id = ShardId::from_data(&data);
+                shards.push(Shard {
+                    id,
+                    index: i as u8,
+                    data,
+                });
+            }
+            debug!(
+                k = self.k,
+                m = self.m,
+                original_size,
+                shard_size,
+                "encoded chunk into shards (no parity)"
+            );
+            return Ok((shards, original_size));
+        }
+
         // Generate m parity shards.
         let recovery = reed_solomon_simd::encode(self.k, self.m, &originals)?;
 
@@ -173,5 +196,103 @@ mod tests {
         assert_eq!(round_up_even(2), 2);
         assert_eq!(round_up_even(3), 4);
         assert_eq!(round_up_even(4), 4);
+    }
+
+    #[test]
+    fn test_encode_single_byte() {
+        let encoder = ErasureEncoder::new(2, 1);
+        let data = vec![42u8];
+        let (shards, original_size) = encoder.encode(&data).unwrap();
+        assert_eq!(original_size, 1);
+        assert_eq!(shards.len(), 3);
+    }
+
+    #[test]
+    fn test_encode_k1_m0_passthrough() {
+        // k=1, m=0: data goes into 1 shard, no parity.
+        let encoder = ErasureEncoder::new(1, 0);
+        let data = vec![0xAA; 100];
+        let (shards, original_size) = encoder.encode(&data).unwrap();
+        assert_eq!(original_size, 100);
+        assert_eq!(shards.len(), 1);
+        assert_eq!(shards[0].index, 0);
+        // The shard should contain the original data (possibly padded to even).
+        assert!(shards[0].data.len() >= 100);
+    }
+
+    #[test]
+    fn test_encode_k1_m1_mirror() {
+        let encoder = ErasureEncoder::new(1, 1);
+        let data = vec![0xBB; 50];
+        let (shards, _) = encoder.encode(&data).unwrap();
+        assert_eq!(shards.len(), 2);
+        // Data shard and parity shard.
+        assert_eq!(shards[0].index, 0);
+        assert_eq!(shards[1].index, 1);
+    }
+
+    #[test]
+    fn test_encode_k8_m4_production() {
+        let encoder = ErasureEncoder::new(8, 4);
+        let data = vec![0xCC; 8192];
+        let (shards, original_size) = encoder.encode(&data).unwrap();
+        assert_eq!(original_size, 8192);
+        assert_eq!(shards.len(), 12);
+        for (i, s) in shards.iter().enumerate() {
+            assert_eq!(s.index, i as u8);
+        }
+    }
+
+    #[test]
+    fn test_encode_different_data_different_shard_ids() {
+        let encoder = ErasureEncoder::new(2, 1);
+        let (shards1, _) = encoder.encode(&[1u8; 64]).unwrap();
+        let (shards2, _) = encoder.encode(&[2u8; 64]).unwrap();
+        // At least some shard IDs should differ.
+        let different = shards1
+            .iter()
+            .zip(shards2.iter())
+            .any(|(s1, s2)| s1.id != s2.id);
+        assert!(
+            different,
+            "different data should produce different shard IDs"
+        );
+    }
+
+    #[test]
+    fn test_encode_shard_size_even() {
+        // Verify all shard sizes are even (reed-solomon-simd requirement).
+        for k in 1..=8 {
+            for data_len in [1, 2, 3, 7, 15, 31, 64, 127, 255, 1000] {
+                let encoder = ErasureEncoder::new(k, 1);
+                let data = vec![0xAA; data_len];
+                let (shards, _) = encoder.encode(&data).unwrap();
+                for s in &shards {
+                    assert_eq!(
+                        s.data.len() % 2,
+                        0,
+                        "shard size must be even: k={k}, data_len={data_len}, shard_size={}",
+                        s.data.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_all_shards_same_size() {
+        let encoder = ErasureEncoder::new(4, 2);
+        for data_len in [1, 7, 100, 1000, 8191, 8192, 8193] {
+            let data = vec![0xDD; data_len];
+            let (shards, _) = encoder.encode(&data).unwrap();
+            let expected_size = shards[0].data.len();
+            for s in &shards {
+                assert_eq!(
+                    s.data.len(),
+                    expected_size,
+                    "all shards must be same size for data_len={data_len}"
+                );
+            }
+        }
     }
 }

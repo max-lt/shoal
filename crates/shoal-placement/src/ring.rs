@@ -897,4 +897,330 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Ring stability: removing and re-adding should restore placement
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_remove_and_readd_restores_placement() {
+        let mut ring = Ring::new(128);
+        ring.add_node(node(1), 1000, default_topo());
+        ring.add_node(node(2), 1000, default_topo());
+        ring.add_node(node(3), 1000, default_topo());
+
+        let shards: Vec<ShardId> = (0..1000u32)
+            .map(|i| ShardId::from_data(&i.to_le_bytes()))
+            .collect();
+        let before: Vec<Vec<NodeId>> = shards.iter().map(|s| ring.owners(s, 3)).collect();
+
+        // Remove node 2.
+        ring.remove_node(&node(2));
+        // Re-add node 2 with same parameters.
+        ring.add_node(node(2), 1000, default_topo());
+
+        let after: Vec<Vec<NodeId>> = shards.iter().map(|s| ring.owners(s, 3)).collect();
+        assert_eq!(
+            before, after,
+            "re-adding same node should restore placement"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Single node: replication factor > 1 still returns only 1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_single_node_replication_3() {
+        let mut ring = Ring::new(128);
+        ring.add_node(node(1), 1000, default_topo());
+
+        for i in 0..50u8 {
+            let owners = ring.owners(&shard(i), 3);
+            assert_eq!(owners.len(), 1, "single node ring can't produce 3 owners");
+            assert_eq!(owners[0], node(1));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Many nodes: verify all contribute to ownership
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_20_nodes_all_participate() {
+        let mut ring = Ring::new(128);
+        for i in 1..=20u8 {
+            ring.add_node(node(i), 1000, default_topo());
+        }
+
+        let total = 50_000;
+        let mut ownership = std::collections::HashMap::<NodeId, usize>::new();
+
+        for i in 0..total {
+            let s = ShardId::from_data(&(i as u32).to_le_bytes());
+            let owners = ring.owners(&s, 1);
+            *ownership.entry(owners[0]).or_default() += 1;
+        }
+
+        // All 20 nodes should own at least some shards.
+        assert_eq!(
+            ownership.len(),
+            20,
+            "all 20 nodes should own at least one shard"
+        );
+
+        // Check rough balance: each should own ~5% (1/20), allow 1%-15% range.
+        for (&nid, &count) in &ownership {
+            let ratio = count as f64 / total as f64;
+            assert!(
+                (0.01..=0.15).contains(&ratio),
+                "node {} owns {count}/{total} ({ratio:.3}), too unbalanced",
+                nid
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff: no migrations when ring is unchanged
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_no_change_no_migrations() {
+        let mut ring = Ring::new(128);
+        ring.add_node(node(1), 1000, default_topo());
+        ring.add_node(node(2), 1000, default_topo());
+
+        let shards: Vec<ShardId> = (0..500u32)
+            .map(|i| ShardId::from_data(&i.to_le_bytes()))
+            .collect();
+
+        let migrations = Ring::diff(&ring, &ring, &shards, 2);
+        assert!(
+            migrations.is_empty(),
+            "identical rings should have no migrations"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff: remove a node
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_remove_node_shows_migrations() {
+        let mut old_ring = Ring::new(128);
+        old_ring.add_node(node(1), 1000, default_topo());
+        old_ring.add_node(node(2), 1000, default_topo());
+        old_ring.add_node(node(3), 1000, default_topo());
+
+        let shards: Vec<ShardId> = (0..1000u32)
+            .map(|i| ShardId::from_data(&i.to_le_bytes()))
+            .collect();
+
+        let mut new_ring = old_ring.clone();
+        new_ring.remove_node(&node(2));
+
+        let migrations = Ring::diff(&old_ring, &new_ring, &shards, 1);
+
+        // Some shards should migrate away from node 2.
+        assert!(!migrations.is_empty());
+        for m in &migrations {
+            assert_eq!(m.from, node(2), "migration should be FROM the removed node");
+            assert!(
+                m.to == node(1) || m.to == node(3),
+                "migration should be TO one of the remaining nodes"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Extreme weight differences
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_extreme_weight_ratio() {
+        let mut ring = Ring::new(64);
+        // Node 1 has weight 1, node 2 has weight 1000.
+        ring.add_node_with_weight(node(1), 1000, 1, default_topo());
+        ring.add_node_with_weight(node(2), 1000, 1000, default_topo());
+
+        let total = 10_000;
+        let mut count1 = 0;
+        let mut count2 = 0;
+
+        for i in 0..total {
+            let s = ShardId::from_data(&(i as u32).to_le_bytes());
+            let owners = ring.owners(&s, 1);
+            if owners[0] == node(1) {
+                count1 += 1;
+            } else {
+                count2 += 1;
+            }
+        }
+
+        // Node 2 should own the vast majority of shards.
+        let ratio = count2 as f64 / total as f64;
+        assert!(
+            ratio > 0.95,
+            "node2 (weight 1000) should own >95% of shards, got {ratio:.3}"
+        );
+        // But node 1 should still own at least something.
+        assert!(
+            count1 > 0,
+            "node1 (weight 1) should own at least some shards"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Replication factor 1: each shard has exactly 1 owner
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_replication_factor_1() {
+        let mut ring = Ring::new(128);
+        for i in 1..=5u8 {
+            ring.add_node(node(i), 1000, default_topo());
+        }
+
+        for i in 0..100u8 {
+            let owners = ring.owners(&shard(i), 1);
+            assert_eq!(owners.len(), 1);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Node info: verify capacity and weight are stored correctly
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_node_info_stored_correctly() {
+        let mut ring = Ring::new(64);
+        ring.add_node_with_weight(node(1), 5000, 200, topo("us", "dc1", "m1"));
+
+        let info = ring.node_info(&node(1)).unwrap();
+        assert_eq!(info.capacity, 5000);
+        assert_eq!(info.weight, 200);
+        assert_eq!(info.topology.region, "us");
+        assert_eq!(info.topology.datacenter, "dc1");
+        assert_eq!(info.topology.machine, "m1");
+    }
+
+    #[test]
+    fn test_node_info_nonexistent() {
+        let ring = Ring::new(64);
+        assert!(ring.node_info(&node(99)).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // node_ids: returns correct set
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_node_ids() {
+        let mut ring = Ring::new(64);
+        ring.add_node(node(1), 1000, default_topo());
+        ring.add_node(node(2), 1000, default_topo());
+        ring.add_node(node(3), 1000, default_topo());
+
+        let mut ids = ring.node_ids();
+        ids.sort();
+        let mut expected = vec![node(1), node(2), node(3)];
+        expected.sort();
+        assert_eq!(ids, expected);
+    }
+
+    // -----------------------------------------------------------------------
+    // Progressive removal: shards owned by removed node go to remaining
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_progressive_removal_all_shards_covered() {
+        let mut ring = Ring::new(128);
+        for i in 1..=5u8 {
+            ring.add_node(node(i), 1000, default_topo());
+        }
+
+        let shards: Vec<ShardId> = (0..1000u32)
+            .map(|i| ShardId::from_data(&i.to_le_bytes()))
+            .collect();
+
+        // Remove nodes one by one. All shards should still have owners.
+        for remove_idx in [3, 5, 1] {
+            ring.remove_node(&node(remove_idx));
+            for s in &shards {
+                let owners = ring.owners(s, 1);
+                assert!(
+                    !owners.is_empty(),
+                    "shard {} should have an owner after removing node {remove_idx}",
+                    s
+                );
+                assert_ne!(
+                    owners[0],
+                    node(remove_idx),
+                    "removed node shouldn't own shards"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Topology: region boundary with single DC
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_region_boundary_single_dc_relaxes() {
+        // All nodes in the same DC. Region boundary can't spread across DCs,
+        // so it should relax and still return enough owners.
+        let mut ring = Ring::new_with_boundary(128, ReplicationBoundary::Region);
+        ring.add_node(node(1), 1000, topo("eu", "dc1", "m1"));
+        ring.add_node(node(2), 1000, topo("eu", "dc1", "m2"));
+        ring.add_node(node(3), 1000, topo("eu", "dc1", "m3"));
+
+        let owners = ring.owners(&shard(42), 3);
+        assert_eq!(
+            owners.len(),
+            3,
+            "should relax DC constraint and still return 3 owners"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Diff with replication factor > 1
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_replication_factor_3() {
+        let mut old_ring = Ring::new(128);
+        old_ring.add_node(node(1), 1000, default_topo());
+        old_ring.add_node(node(2), 1000, default_topo());
+        old_ring.add_node(node(3), 1000, default_topo());
+
+        let shards: Vec<ShardId> = (0..500u32)
+            .map(|i| ShardId::from_data(&i.to_le_bytes()))
+            .collect();
+
+        let mut new_ring = old_ring.clone();
+        let n4 = node(4);
+        new_ring.add_node(n4, 1000, default_topo());
+
+        let migrations = Ring::diff(&old_ring, &new_ring, &shards, 3);
+
+        // Migrations should exist (node 4 takes over some shard copies).
+        assert!(!migrations.is_empty());
+        // All TO the new node.
+        for m in &migrations {
+            assert_eq!(m.to, n4);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty shard list diff
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_diff_empty_shard_list() {
+        let mut ring = Ring::new(128);
+        ring.add_node(node(1), 1000, default_topo());
+        let migrations = Ring::diff(&ring, &ring, &[], 1);
+        assert!(migrations.is_empty());
+    }
 }

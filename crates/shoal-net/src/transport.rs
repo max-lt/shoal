@@ -31,20 +31,35 @@ pub struct ShoalTransport {
     endpoint: Endpoint,
     /// Cached connections to remote peers, keyed by their iroh endpoint ID.
     connections: Arc<RwLock<HashMap<iroh::EndpointId, Connection>>>,
+    /// ALPN used for outgoing connections. Derived from the cluster secret
+    /// so that nodes with different secrets cannot connect.
+    alpn: Vec<u8>,
 }
 
 impl ShoalTransport {
-    /// Create a new transport by binding an iroh endpoint.
+    /// Create a new transport with the default ALPN (`shoal/0`).
     ///
-    /// The endpoint is configured with the Shoal ALPN and the given secret key.
     /// Use [`iroh::RelayMode::Disabled`] for tests that don't need relay servers.
     pub async fn bind(
         secret_key: SecretKey,
         relay_mode: iroh::RelayMode,
     ) -> Result<Self, NetError> {
+        Self::bind_with_alpn(secret_key, relay_mode, SHOAL_ALPN.to_vec()).await
+    }
+
+    /// Create a new transport with a cluster-specific ALPN.
+    ///
+    /// Use [`crate::cluster_alpn`] to derive the ALPN from a shared secret.
+    /// Nodes with different ALPNs cannot establish QUIC connections — the
+    /// TLS handshake itself rejects the mismatch.
+    pub async fn bind_with_alpn(
+        secret_key: SecretKey,
+        relay_mode: iroh::RelayMode,
+        alpn: Vec<u8>,
+    ) -> Result<Self, NetError> {
         let endpoint = Endpoint::builder()
             .secret_key(secret_key)
-            .alpns(vec![SHOAL_ALPN.to_vec()])
+            .alpns(vec![alpn.clone()])
             .relay_mode(relay_mode)
             .bind()
             .await
@@ -53,6 +68,7 @@ impl ShoalTransport {
         Ok(Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            alpn,
         })
     }
 
@@ -61,6 +77,7 @@ impl ShoalTransport {
         Self {
             endpoint,
             connections: Arc::new(RwLock::new(HashMap::new())),
+            alpn: SHOAL_ALPN.to_vec(),
         }
     }
 
@@ -102,7 +119,7 @@ impl ShoalTransport {
         debug!(remote = %remote_id.fmt_short(), "connecting to peer");
         let conn = self
             .endpoint
-            .connect(addr, SHOAL_ALPN)
+            .connect(addr, &self.alpn)
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
 
@@ -119,6 +136,19 @@ impl ShoalTransport {
     pub async fn remove_connection(&self, id: &iroh::EndpointId) {
         let mut cache = self.connections.write().await;
         cache.remove(id);
+    }
+
+    // -------------------------------------------------------------------
+    // High-level message sending
+    // -------------------------------------------------------------------
+
+    /// Send an arbitrary message to a remote peer.
+    ///
+    /// Opens a new uni-directional stream on a (pooled) connection to the
+    /// given address and sends the postcard-encoded message.
+    pub async fn send_to(&self, addr: EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError> {
+        let conn = self.get_connection(addr).await?;
+        Self::send_message(&conn, msg).await
     }
 
     // -------------------------------------------------------------------
@@ -250,6 +280,54 @@ impl ShoalTransport {
                 Ok(Some(Bytes::from(data)))
             }
             ShoalMessage::ShardResponse { data: None, .. } => Ok(None),
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
+    /// Request a manifest from a remote node by bucket/key.
+    ///
+    /// Opens a bidirectional stream: sends a `ManifestRequest`, receives a
+    /// `ManifestResponse`. Returns the raw manifest bytes if found.
+    pub async fn pull_manifest(
+        &self,
+        addr: EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::ManifestRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::ManifestResponse {
+                manifest_bytes: Some(bytes),
+                ..
+            } => {
+                debug!(%bucket, %key, "pulled manifest from peer");
+                Ok(Some(bytes))
+            }
+            ShoalMessage::ManifestResponse {
+                manifest_bytes: None,
+                ..
+            } => Ok(None),
             other => Err(NetError::Serialization(format!(
                 "unexpected response type: {other:?}"
             ))),

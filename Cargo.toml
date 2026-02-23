@@ -81,6 +81,7 @@ anyhow = "1"
 
 # System
 libc = "0.2"
+dirs = "6"
 
 # Testing
 tempfile = "3"

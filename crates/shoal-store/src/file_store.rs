@@ -194,15 +194,23 @@ fn statvfs(path: &Path) -> Result<StorageCapacity, StoreError> {
             return Err(StoreError::Io(std::io::Error::last_os_error()));
         }
 
-        let block_size = stat.f_frsize;
-        let total = stat.f_blocks * block_size;
-        let available = stat.f_bavail * block_size;
+        // On Linux these fields are u64; on macOS they are u32. Cast via u64
+        // to be cross-platform without triggering clippy on either target.
+        #[allow(clippy::unnecessary_cast)]
+        let block_size = stat.f_frsize as u64;
+        #[allow(clippy::unnecessary_cast)]
+        let total = stat.f_blocks as u64 * block_size;
+        #[allow(clippy::unnecessary_cast)]
+        let available = stat.f_bavail as u64 * block_size;
         // f_bfree includes blocks reserved for root; f_bavail is what unprivileged users can use.
-        let free = stat.f_bfree * block_size;
+        #[allow(clippy::unnecessary_cast)]
+        let free = stat.f_bfree as u64 * block_size;
         let used = total.saturating_sub(free);
 
-        let inodes_total = stat.f_files;
-        let inodes_free = stat.f_ffree;
+        #[allow(clippy::unnecessary_cast)]
+        let inodes_total = stat.f_files as u64;
+        #[allow(clippy::unnecessary_cast)]
+        let inodes_free = stat.f_ffree as u64;
 
         // Warn when inode usage exceeds 80%.
         if inodes_total > 0 {

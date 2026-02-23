@@ -41,8 +41,11 @@ pub struct NodeSection {
 
 impl Default for NodeSection {
     fn default() -> Self {
+        let data_dir = dirs::home_dir()
+            .map(|h| h.join(".shoal"))
+            .unwrap_or_else(|| PathBuf::from(".shoal"));
         Self {
-            data_dir: PathBuf::from("/var/lib/shoal"),
+            data_dir,
             listen_addr: "0.0.0.0:4820".to_string(),
             s3_listen_addr: "0.0.0.0:4821".to_string(),
         }
@@ -272,7 +275,10 @@ level = "debug"
     fn test_parse_minimal_config() {
         let toml = "";
         let config = CliConfig::from_toml(toml).unwrap();
-        assert_eq!(config.node.data_dir, PathBuf::from("/var/lib/shoal"));
+        let expected_default = dirs::home_dir()
+            .map(|h| h.join(".shoal"))
+            .unwrap_or_else(|| PathBuf::from(".shoal"));
+        assert_eq!(config.node.data_dir, expected_default);
         assert_eq!(config.node.s3_listen_addr, "0.0.0.0:4821");
         assert_eq!(config.storage.backend, "file");
         assert_eq!(config.chunk_size(), 262_144);

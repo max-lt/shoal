@@ -532,3 +532,595 @@ async fn test_empty_object() {
     assert!(got.is_empty());
     assert_eq!(manifest.total_size, 0);
 }
+
+// -----------------------------------------------------------------------
+// Concurrent put/get (race conditions, shared state)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_concurrent_puts_different_keys() {
+    let node = Arc::new(single_node(1024, 2, 1).await);
+
+    let mut handles = Vec::new();
+    for i in 0..20u32 {
+        let n = Arc::clone(&node);
+        handles.push(tokio::spawn(async move {
+            let data = test_data(500 + i as usize * 100);
+            let key = format!("key-{i}");
+            n.put_object("b", &key, &data, BTreeMap::new())
+                .await
+                .unwrap();
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Verify all objects are readable.
+    for i in 0..20u32 {
+        let key = format!("key-{i}");
+        let expected = test_data(500 + i as usize * 100);
+        let (got, _) = node.get_object("b", &key).await.unwrap();
+        assert_eq!(got, expected, "mismatch for {key}");
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_reads_same_key() {
+    let node = Arc::new(single_node(1024, 2, 1).await);
+    let data = test_data(5000);
+    node.put_object("b", "shared", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let n = Arc::clone(&node);
+        let expected = data.clone();
+        handles.push(tokio::spawn(async move {
+            let (got, _) = n.get_object("b", "shared").await.unwrap();
+            assert_eq!(got, expected);
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn test_concurrent_put_and_read() {
+    // One task writes objects while another reads previously written ones.
+    let node = Arc::new(single_node(1024, 2, 1).await);
+
+    // Pre-populate some data.
+    for i in 0..5u32 {
+        let data = test_data(1000 + i as usize * 200);
+        node.put_object("b", &format!("pre-{i}"), &data, BTreeMap::new())
+            .await
+            .unwrap();
+    }
+
+    let writer = {
+        let n = Arc::clone(&node);
+        tokio::spawn(async move {
+            for i in 5..15u32 {
+                let data = test_data(1000 + i as usize * 200);
+                n.put_object("b", &format!("new-{i}"), &data, BTreeMap::new())
+                    .await
+                    .unwrap();
+            }
+        })
+    };
+
+    let reader = {
+        let n = Arc::clone(&node);
+        tokio::spawn(async move {
+            for i in 0..5u32 {
+                let expected = test_data(1000 + i as usize * 200);
+                let (got, _) = n.get_object("b", &format!("pre-{i}")).await.unwrap();
+                assert_eq!(got, expected);
+            }
+        })
+    };
+
+    writer.await.unwrap();
+    reader.await.unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Special characters in bucket/key names
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_special_chars_in_key() {
+    let node = single_node(1024, 2, 1).await;
+    let data = b"special chars test".to_vec();
+
+    // Keys with various special characters.
+    let keys = [
+        "hello world",
+        "path/to/nested/object",
+        "file.with.dots.txt",
+        "key-with-dashes",
+        "key_with_underscores",
+        "UPPERCASE",
+        "MiXeD_cAsE-123",
+        "key with  multiple   spaces",
+    ];
+
+    for key in &keys {
+        node.put_object("b", key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        let (got, _) = node.get_object("b", key).await.unwrap();
+        assert_eq!(got, data, "roundtrip failed for key: {key:?}");
+    }
+}
+
+#[tokio::test]
+async fn test_unicode_bucket_and_key() {
+    let node = single_node(1024, 2, 1).await;
+    let data = b"unicode test".to_vec();
+
+    node.put_object("données", "fichier/à/stocker", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, _) = node
+        .get_object("données", "fichier/à/stocker")
+        .await
+        .unwrap();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn test_empty_key_name() {
+    let node = single_node(1024, 2, 1).await;
+    let data = b"empty key".to_vec();
+
+    node.put_object("b", "", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, _) = node.get_object("b", "").await.unwrap();
+    assert_eq!(got, data);
+}
+
+// -----------------------------------------------------------------------
+// Boundary chunk sizes
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_data_exactly_one_chunk() {
+    let node = single_node(256, 2, 1).await;
+    let data = test_data(256);
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+    assert_eq!(manifest.chunks.len(), 1);
+}
+
+#[tokio::test]
+async fn test_data_one_byte_over_chunk() {
+    let node = single_node(256, 2, 1).await;
+    let data = test_data(257);
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+    assert_eq!(manifest.chunks.len(), 2);
+    // Second chunk should be 1 byte.
+    assert_eq!(manifest.chunks[1].size, 1);
+}
+
+#[tokio::test]
+async fn test_data_one_byte_under_chunk() {
+    let node = single_node(256, 2, 1).await;
+    let data = test_data(255);
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+    assert_eq!(manifest.chunks.len(), 1);
+}
+
+// -----------------------------------------------------------------------
+// Large objects
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_100kb_object() {
+    let node = single_node(4096, 4, 2).await;
+    let data = test_data(100_000);
+
+    let oid = node
+        .put_object("b", "big", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, manifest) = node.get_object("b", "big").await.unwrap();
+    assert_eq!(got, data);
+    assert_eq!(manifest.object_id, oid);
+    assert_eq!(manifest.total_size, 100_000);
+    // 100000 / 4096 = 24.41 → 25 chunks
+    assert_eq!(manifest.chunks.len(), 25);
+}
+
+#[tokio::test]
+async fn test_1mb_object() {
+    let node = single_node(8192, 4, 2).await;
+    let data = test_data(1_000_000);
+
+    node.put_object("b", "1mb", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, _) = node.get_object("b", "1mb").await.unwrap();
+    assert_eq!(got.len(), 1_000_000);
+    assert_eq!(got, data);
+}
+
+// -----------------------------------------------------------------------
+// Many objects in one bucket
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_many_objects_same_bucket() {
+    let node = single_node(1024, 2, 1).await;
+
+    for i in 0..100u32 {
+        let data = test_data(200 + i as usize);
+        node.put_object("b", &format!("obj-{i:04}"), &data, BTreeMap::new())
+            .await
+            .unwrap();
+    }
+
+    let keys = node.list_objects("b", "").unwrap();
+    assert_eq!(keys.len(), 100);
+
+    // Spot check a few.
+    for i in [0, 42, 99] {
+        let expected = test_data(200 + i as usize);
+        let (got, _) = node.get_object("b", &format!("obj-{i:04}")).await.unwrap();
+        assert_eq!(got, expected);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Get nonexistent object
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_get_nonexistent_bucket() {
+    let node = single_node(1024, 2, 1).await;
+    let err = node
+        .get_object("no-such-bucket", "no-key")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::ObjectNotFound { .. }));
+}
+
+// -----------------------------------------------------------------------
+// Overwrite preserves metadata correctly
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_overwrite_changes_metadata() {
+    let node = single_node(1024, 2, 1).await;
+
+    let mut meta1 = BTreeMap::new();
+    meta1.insert("content-type".to_string(), "text/plain".to_string());
+    node.put_object("b", "k", b"v1", meta1.clone())
+        .await
+        .unwrap();
+
+    let mut meta2 = BTreeMap::new();
+    meta2.insert("content-type".to_string(), "application/json".to_string());
+    node.put_object("b", "k", b"v2", meta2.clone())
+        .await
+        .unwrap();
+
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, b"v2");
+    assert_eq!(manifest.metadata, meta2);
+}
+
+// -----------------------------------------------------------------------
+// 3-node cluster: shard loss scenarios
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_three_node_lose_one_shard_per_chunk() {
+    // k=2, m=1 across 3 nodes. Lose 1 shard per chunk → still reads.
+    let nodes = three_node_cluster(512, 2, 1).await;
+    let data = test_data(2000);
+
+    nodes[0]
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let manifest = nodes[0].head_object("b", "k").unwrap();
+
+    // Delete 1 shard per chunk from the writing node's store.
+    for chunk_meta in &manifest.chunks {
+        let shard_to_delete = &chunk_meta.shards[0];
+        nodes[0]
+            .store()
+            .delete(shard_to_delete.shard_id)
+            .await
+            .unwrap();
+    }
+
+    let (got, _) = nodes[0].get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn test_three_node_k4_m2_lose_two_shards() {
+    // k=4, m=2 across 3 nodes. Lose 2 shards per chunk → still reads.
+    let nodes = three_node_cluster(1024, 4, 2).await;
+    let data = test_data(4000);
+
+    nodes[0]
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let manifest = nodes[0].head_object("b", "k").unwrap();
+
+    // Delete 2 shards per chunk (parity shards).
+    for chunk_meta in &manifest.chunks {
+        let mut deleted = 0;
+        for shard_meta in chunk_meta.shards.iter().rev() {
+            if deleted < 2 {
+                nodes[0].store().delete(shard_meta.shard_id).await.unwrap();
+                deleted += 1;
+            }
+        }
+    }
+
+    let (got, _) = nodes[0].get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn test_three_node_k4_m2_lose_three_shards_fails() {
+    // k=4, m=2. Lose 3 shards per chunk → only 3 left < k=4, should fail.
+    let nodes = three_node_cluster(1024, 4, 2).await;
+    let data = test_data(2000);
+
+    nodes[0]
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let manifest = nodes[0].head_object("b", "k").unwrap();
+
+    for chunk_meta in &manifest.chunks {
+        let mut deleted = 0;
+        for shard_meta in &chunk_meta.shards {
+            if deleted < 3 {
+                nodes[0].store().delete(shard_meta.shard_id).await.unwrap();
+                deleted += 1;
+            }
+        }
+    }
+
+    let err = nodes[0].get_object("b", "k").await.unwrap_err();
+    assert!(matches!(err, EngineError::ReadFailed { .. }));
+}
+
+// -----------------------------------------------------------------------
+// Determinism: same data at different chunk sizes produces different manifests
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_different_chunk_sizes_different_manifests() {
+    let node_a = single_node(512, 2, 1).await;
+    let node_b = single_node(1024, 2, 1).await;
+    let data = test_data(2000);
+
+    let oid_a = node_a
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let oid_b = node_b
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Different chunk sizes → different chunking → different manifests.
+    assert_ne!(oid_a, oid_b);
+}
+
+// -----------------------------------------------------------------------
+// Delete then re-put same key
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_then_reput() {
+    let node = single_node(1024, 2, 1).await;
+
+    node.put_object("b", "k", b"first", BTreeMap::new())
+        .await
+        .unwrap();
+    node.delete_object("b", "k").await.unwrap();
+
+    node.put_object("b", "k", b"second", BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, _) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, b"second");
+}
+
+// -----------------------------------------------------------------------
+// List objects with various prefix patterns
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_list_objects_nested_prefixes() {
+    let node = single_node(1024, 2, 1).await;
+
+    let keys = [
+        "a/b/c/1.txt",
+        "a/b/c/2.txt",
+        "a/b/d/3.txt",
+        "a/e/4.txt",
+        "f/5.txt",
+    ];
+
+    for (i, key) in keys.iter().enumerate() {
+        let data = test_data(100 + i);
+        node.put_object("b", key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+    }
+
+    let abc = node.list_objects("b", "a/b/c/").unwrap();
+    assert_eq!(abc.len(), 2);
+
+    let ab = node.list_objects("b", "a/b/").unwrap();
+    assert_eq!(ab.len(), 3);
+
+    let a = node.list_objects("b", "a/").unwrap();
+    assert_eq!(a.len(), 4);
+
+    let all = node.list_objects("b", "").unwrap();
+    assert_eq!(all.len(), 5);
+
+    let f = node.list_objects("b", "f/").unwrap();
+    assert_eq!(f.len(), 1);
+
+    let nothing = node.list_objects("b", "z/").unwrap();
+    assert!(nothing.is_empty());
+}
+
+// -----------------------------------------------------------------------
+// Head object returns correct chunk count for various sizes
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_head_object_chunk_count() {
+    let node = single_node(256, 2, 1).await;
+
+    let sizes_and_chunks = [
+        (0, 0),
+        (1, 1),
+        (255, 1),
+        (256, 1),
+        (257, 2),
+        (512, 2),
+        (513, 3),
+        (1024, 4),
+    ];
+
+    for (size, expected_chunks) in sizes_and_chunks {
+        let data = test_data(size);
+        let key = format!("size-{size}");
+        node.put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        let manifest = node.head_object("b", &key).unwrap();
+        assert_eq!(
+            manifest.chunks.len(),
+            expected_chunks,
+            "wrong chunk count for size={size}"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// Erasure edge case: k=1, m=0 (no parity at all)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_erasure_k1_m0_no_redundancy() {
+    let node = single_node(1024, 1, 0).await;
+    let data = test_data(3000);
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+    // Each chunk should have exactly 1 shard (data only, no parity).
+    for chunk in &manifest.chunks {
+        assert_eq!(chunk.shards.len(), 1);
+    }
+}
+
+// -----------------------------------------------------------------------
+// Identical data deduplication: shards should have same IDs
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_identical_data_same_shard_ids() {
+    let node = single_node(1024, 2, 1).await;
+    let data = test_data(2048);
+
+    let oid1 = node
+        .put_object("b", "copy1", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let oid2 = node
+        .put_object("b", "copy2", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Same data, same metadata → same ObjectId.
+    assert_eq!(oid1, oid2);
+
+    // Same shard IDs.
+    let m1 = node.head_object("b", "copy1").unwrap();
+    let m2 = node.head_object("b", "copy2").unwrap();
+
+    for (c1, c2) in m1.chunks.iter().zip(m2.chunks.iter()) {
+        assert_eq!(c1.chunk_id, c2.chunk_id);
+        for (s1, s2) in c1.shards.iter().zip(c2.shards.iter()) {
+            assert_eq!(s1.shard_id, s2.shard_id);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
+// Manifest version field is correctly set
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_manifest_version_field() {
+    let node = single_node(1024, 2, 1).await;
+    node.put_object("b", "k", b"data", BTreeMap::new())
+        .await
+        .unwrap();
+    let manifest = node.head_object("b", "k").unwrap();
+    assert_eq!(manifest.version, shoal_types::MANIFEST_VERSION);
+}
+
+// -----------------------------------------------------------------------
+// All shards have correct index values
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_shard_indices_correct() {
+    let node = single_node(1024, 4, 2).await;
+    let data = test_data(4000);
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let manifest = node.head_object("b", "k").unwrap();
+    for chunk in &manifest.chunks {
+        assert_eq!(chunk.shards.len(), 6); // k=4, m=2
+        for (i, shard) in chunk.shards.iter().enumerate() {
+            assert_eq!(shard.index, i as u8, "shard index mismatch");
+        }
+    }
+}

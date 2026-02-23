@@ -6,29 +6,35 @@
 //! # Usage
 //!
 //! ```text
-//! shoald start                   # start the node
-//! shoald start -c shoal.toml    # start with a config file
-//! shoald status                  # show cluster status
-//! shoald repair status           # show repair queue
-//! shoald benchmark -n 200 -s 65536  # write/read benchmark
+//! shoald start                              # start the node
+//! shoald start -c shoal.toml               # start with a config file
+//! shoald start -d ./node2 -l 127.0.0.1:4822  # second instance
+//! shoald start --seed <endpoint_id>         # join an existing cluster
+//! shoald status                             # show cluster status
+//! shoald repair status                      # show repair queue
+//! shoald benchmark -n 200 -s 65536          # write/read benchmark
 //! ```
 
 mod config;
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use shoal_cluster::ClusterState;
+use iroh::{EndpointAddr, SecretKey};
+use shoal_cluster::{ClusterIdentity, ClusterState, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
+use shoal_net::{ShoalMessage, ShoalTransport};
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
-use tracing::{error, info};
+use tokio::sync::RwLock;
+use tracing::{debug, error, info, warn};
 
 use config::CliConfig;
 
@@ -54,7 +60,34 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the Shoal node.
-    Start,
+    Start {
+        /// Override data directory (useful for running multiple instances).
+        #[arg(short, long)]
+        data_dir: Option<PathBuf>,
+
+        /// Override S3 listen address (e.g. "127.0.0.1:4822").
+        #[arg(short = 'l', long)]
+        s3_listen_addr: Option<String>,
+
+        /// Seed node(s) to join an existing cluster.
+        ///
+        /// Format: `<endpoint_id>` or `<endpoint_id>@<host:port>`.
+        /// Can be specified multiple times.
+        #[arg(short, long)]
+        seed: Vec<String>,
+
+        /// Cluster secret for authentication (nodes must share the same secret).
+        ///
+        /// If not set, falls back to the config file value or the default.
+        /// WARNING: The default secret is public — always set a unique secret
+        /// in production to prevent unauthorized nodes from joining your cluster.
+        #[arg(long)]
+        secret: Option<String>,
+
+        /// Run fully in-memory (no disk persistence).
+        #[arg(short, long)]
+        memory: bool,
+    },
 
     /// Show cluster status from the local metadata store.
     Status,
@@ -90,12 +123,37 @@ enum RepairCommands {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let config = CliConfig::load(cli.config.as_deref()).context("failed to load config")?;
+    let mut config = CliConfig::load(cli.config.as_deref()).context("failed to load config")?;
 
     setup_tracing(&config.log.level);
 
     match cli.command {
-        Commands::Start => cmd_start(config).await,
+        Commands::Start {
+            data_dir,
+            s3_listen_addr,
+            seed,
+            secret,
+            memory,
+        } => {
+            // CLI args override config file values.
+            if let Some(dir) = data_dir {
+                config.node.data_dir = dir;
+            }
+            if let Some(addr) = s3_listen_addr {
+                config.node.s3_listen_addr = addr;
+            }
+            // Merge CLI seeds with config seeds.
+            if !seed.is_empty() {
+                config.cluster.seeds = seed;
+            }
+            if let Some(s) = secret {
+                config.cluster.secret = s;
+            }
+            if memory {
+                config.storage.backend = "memory".to_string();
+            }
+            cmd_start(config).await
+        }
         Commands::Status => cmd_status(&config),
         Commands::Repair { action } => match action {
             RepairCommands::Status => cmd_repair_status(&config),
@@ -130,17 +188,72 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         "node configuration"
     );
 
-    // Deterministic node ID from listen address.
-    let node_id = NodeId::from_data(config.node.listen_addr.as_bytes());
+    let memory_mode = config.storage.backend == "memory";
 
-    // Create data directory.
-    std::fs::create_dir_all(&config.node.data_dir).context("failed to create data directory")?;
+    // Create data directory (skip in memory mode).
+    if !memory_mode {
+        std::fs::create_dir_all(&config.node.data_dir)
+            .context("failed to create data directory")?;
+    }
 
-    // Metadata store.
-    let meta_path = config.node.data_dir.join("meta");
-    let meta = Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?);
+    // --- Node identity (iroh SecretKey) ---
+    let secret_key = if memory_mode {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let key = SecretKey::from(bytes);
+        info!("generated ephemeral node key (memory mode)");
+        key
+    } else {
+        load_or_create_secret_key(&config.node.data_dir)?
+    };
+    let public_key = secret_key.public();
+    let node_id = NodeId::from(*public_key.as_bytes());
+    info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
-    // Shard store.
+    // --- Cluster secret ---
+    if config.cluster.secret == "shoal-default-secret" {
+        warn!(
+            "using default cluster secret — any node on the internet with the same default can join this cluster via relay"
+        );
+        warn!(
+            "set a unique secret with: --secret <your-secret> or [cluster] secret in config file"
+        );
+    }
+
+    // --- Network transport (iroh QUIC) ---
+    // Derive a cluster-specific ALPN from the shared secret so that nodes
+    // with different secrets cannot even establish QUIC connections.
+    let cluster_alpn = shoal_net::cluster_alpn(config.cluster.secret.as_bytes());
+    info!(
+        cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
+        "cluster identity derived from secret"
+    );
+    let transport = Arc::new(
+        ShoalTransport::bind_with_alpn(secret_key, iroh::RelayMode::Default, cluster_alpn)
+            .await
+            .context("failed to bind iroh endpoint")?,
+    );
+
+    let local_addr = transport.addr();
+    info!(
+        endpoint_id = %transport.endpoint_id().fmt_short(),
+        "iroh endpoint ready"
+    );
+    for addr in local_addr.ip_addrs() {
+        info!(%addr, "listening on");
+    }
+
+    // --- Metadata store ---
+    let meta = if memory_mode {
+        info!("using in-memory metadata store");
+        Arc::new(MetaStore::in_memory())
+    } else {
+        let meta_path = config.node.data_dir.join("meta");
+        Arc::new(MetaStore::open(&meta_path).context("failed to open metadata store")?)
+    };
+
+    // --- Shard store ---
     let store: Arc<dyn ShardStore> = match config.storage.backend.as_str() {
         "memory" => {
             info!("using in-memory shard store");
@@ -153,33 +266,248 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         }
     };
 
-    // Cluster state (single-node bootstrap).
+    // --- Cluster state ---
     let cluster = ClusterState::new(node_id, 128);
-    cluster
-        .add_member(Member {
-            node_id,
-            capacity: u64::MAX,
-            state: MemberState::Alive,
-            generation: 1,
-            topology: NodeTopology::default(),
-        })
-        .await;
 
-    // Engine.
-    let engine = Arc::new(ShoalNode::new(
-        ShoalNodeConfig {
-            node_id,
-            chunk_size: config.chunk_size(),
-            erasure_k: config.erasure_k() as usize,
-            erasure_m: config.erasure_m() as usize,
-            vnodes_per_node: 128,
-        },
-        store,
-        meta,
-        cluster,
+    // --- Address book: NodeId → EndpointAddr for routing ---
+    let address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>> =
+        Arc::new(RwLock::new(HashMap::new()));
+
+    // --- Membership service (foca SWIM) ---
+    let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default());
+    let membership_handle = Arc::new(membership::start(
+        identity.clone(),
+        membership::default_config(100),
+        cluster.clone(),
+        Some(meta.clone()),
     ));
 
-    // S3 HTTP API.
+    // --- Connect to seed nodes ---
+    for seed_str in &config.cluster.seeds {
+        match parse_seed(seed_str) {
+            Ok((seed_endpoint_addr, seed_node_id)) => {
+                // Store seed address for routing.
+                address_book
+                    .write()
+                    .await
+                    .insert(seed_node_id, seed_endpoint_addr);
+                let seed_identity =
+                    ClusterIdentity::new(seed_node_id, 1, u64::MAX, NodeTopology::default());
+                info!(seed = %seed_str, "joining cluster via seed");
+                if let Err(e) = membership_handle.join(seed_identity) {
+                    warn!(seed = %seed_str, %e, "failed to announce to seed");
+                }
+            }
+            Err(e) => {
+                warn!(seed = %seed_str, %e, "invalid seed format, skipping");
+            }
+        }
+    }
+
+    // --- Outgoing SWIM routing loop ---
+    // Reads foca's outgoing messages and sends them to target nodes via iroh.
+    {
+        let transport = transport.clone();
+        let handle = membership_handle.clone();
+        let book = address_book.clone();
+        tokio::spawn(async move {
+            loop {
+                match handle.next_outgoing().await {
+                    Some((target, data)) => {
+                        // Resolve target address: check book first, then fall back to relay.
+                        let addr = {
+                            let book = book.read().await;
+                            book.get(&target.node_id).cloned()
+                        };
+                        let addr = match addr {
+                            Some(a) => a,
+                            None => {
+                                // No known direct address — construct from public key.
+                                // iroh will attempt relay-based connection.
+                                match iroh::EndpointId::from_bytes(target.node_id.as_bytes()) {
+                                    Ok(eid) => EndpointAddr::new(eid),
+                                    Err(_) => {
+                                        warn!(target = %target.node_id, "invalid endpoint ID");
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
+
+                        let msg = ShoalMessage::SwimData(data);
+                        if let Err(e) = transport.send_to(addr, &msg).await {
+                            debug!(target = %target.node_id, %e, "failed to route SWIM message");
+                        }
+                    }
+                    None => {
+                        info!("membership service stopped, exiting routing loop");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // --- Incoming connection handler ---
+    // Accepts iroh connections and dispatches messages to the membership service.
+    {
+        let transport = transport.clone();
+        let handle = membership_handle.clone();
+        let store = store.clone();
+        let meta = meta.clone();
+        let address_book = address_book.clone();
+        tokio::spawn(async move {
+            loop {
+                match transport.accept().await {
+                    Some(conn) => {
+                        // Learn the remote peer's address for future routing.
+                        let remote_id = conn.remote_id();
+                        let remote_node_id = NodeId::from(*remote_id.as_bytes());
+                        let remote_addr = EndpointAddr::new(remote_id);
+                        address_book
+                            .write()
+                            .await
+                            .insert(remote_node_id, remote_addr);
+
+                        // Spawn a handler for each connection.
+                        let handle = handle.clone();
+                        let store = store.clone();
+                        let meta = meta.clone();
+
+                        // Handle uni-directional streams (SWIM data, shard push, manifest).
+                        let conn_uni = conn.clone();
+                        let handle_uni = handle.clone();
+                        let store_uni = store.clone();
+                        let meta_uni = meta.clone();
+                        tokio::spawn(async move {
+                            ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
+                                let handle = handle_uni.clone();
+                                let store = store_uni.clone();
+                                let meta = meta_uni.clone();
+                                async move {
+                                    match msg {
+                                        ShoalMessage::SwimData(data) => {
+                                            if let Err(e) = handle.feed_data(data) {
+                                                warn!(%e, "failed to feed SWIM data");
+                                            }
+                                        }
+                                        ShoalMessage::ShardPush { shard_id, data } => {
+                                            debug!(%shard_id, len = data.len(), "received shard push");
+                                            if let Err(e) = store
+                                                .put(shard_id, bytes::Bytes::from(data))
+                                                .await
+                                            {
+                                                warn!(%shard_id, %e, "failed to store pushed shard");
+                                            }
+                                        }
+                                        ShoalMessage::ManifestPut {
+                                            bucket,
+                                            key,
+                                            manifest_bytes,
+                                        } => {
+                                            match postcard::from_bytes::<shoal_types::Manifest>(
+                                                &manifest_bytes,
+                                            ) {
+                                                Ok(manifest) => {
+                                                    debug!(
+                                                        %bucket, %key,
+                                                        object_id = %manifest.object_id,
+                                                        "received manifest broadcast"
+                                                    );
+                                                    if let Err(e) = meta.put_manifest(&manifest) {
+                                                        warn!(%e, "failed to store broadcast manifest");
+                                                    }
+                                                    if let Err(e) =
+                                                        meta.put_object_key(&bucket, &key, &manifest.object_id)
+                                                    {
+                                                        warn!(%e, "failed to store broadcast object key");
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(%e, "failed to deserialize broadcast manifest");
+                                                }
+                                            }
+                                        }
+                                        other => {
+                                            debug!("unhandled uni-stream message: {other:?}");
+                                        }
+                                    }
+                                }
+                            })
+                            .await;
+                        });
+
+                        // Handle bi-directional streams (shard pull, manifest pull).
+                        let meta_bi = meta.clone();
+                        tokio::spawn(async move {
+                            ShoalTransport::handle_bi_streams(conn, move |msg| {
+                                let store = store.clone();
+                                let meta = meta_bi.clone();
+                                async move {
+                                    match msg {
+                                        ShoalMessage::ShardRequest { shard_id } => {
+                                            let data = store.get(shard_id).await.ok().flatten();
+                                            Some(ShoalMessage::ShardResponse {
+                                                shard_id,
+                                                data: data.map(|b| b.to_vec()),
+                                            })
+                                        }
+                                        ShoalMessage::ManifestRequest { bucket, key } => {
+                                            let manifest_bytes = meta
+                                                .get_object_key(&bucket, &key)
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|oid| {
+                                                    meta.get_manifest(&oid).ok().flatten()
+                                                })
+                                                .and_then(|m| postcard::to_allocvec(&m).ok());
+                                            Some(ShoalMessage::ManifestResponse {
+                                                bucket,
+                                                key,
+                                                manifest_bytes,
+                                            })
+                                        }
+                                        _ => None,
+                                    }
+                                }
+                            })
+                            .await;
+                        });
+                    }
+                    None => {
+                        info!("transport shut down, exiting accept loop");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Print join command for other nodes.
+    info!(
+        "to join this node: shoald start --seed {}",
+        transport.endpoint_id()
+    );
+
+    // --- Engine ---
+    let engine = Arc::new(
+        ShoalNode::new(
+            ShoalNodeConfig {
+                node_id,
+                chunk_size: config.chunk_size(),
+                erasure_k: config.erasure_k() as usize,
+                erasure_m: config.erasure_m() as usize,
+                vnodes_per_node: 128,
+            },
+            store,
+            meta.clone(),
+            cluster,
+        )
+        .with_transport(transport.clone())
+        .with_address_book(address_book.clone()),
+    );
+
+    // --- S3 HTTP API ---
     let server = S3Server::new(S3ServerConfig {
         engine,
         auth_secret: config.s3_auth_secret(),
@@ -192,6 +520,76 @@ async fn cmd_start(config: CliConfig) -> Result<()> {
         .context("S3 server failed")?;
 
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Networking helpers
+// -----------------------------------------------------------------------
+
+/// Parse a seed node string.
+///
+/// Formats:
+/// - `<endpoint_id>` — hex-encoded 32-byte public key (iroh relay used for discovery)
+/// - `<endpoint_id>@<host:port>` — with an explicit direct address
+fn parse_seed(s: &str) -> Result<(EndpointAddr, NodeId)> {
+    let (id_str, addr_str) = match s.split_once('@') {
+        Some((id, addr)) => (id, Some(addr)),
+        None => (s, None),
+    };
+
+    let endpoint_id: iroh::EndpointId = id_str
+        .parse()
+        .context("invalid endpoint ID (expected hex-encoded public key)")?;
+
+    let mut endpoint_addr = EndpointAddr::new(endpoint_id);
+    if let Some(addr) = addr_str {
+        let socket_addr: SocketAddr = addr
+            .parse()
+            .context("invalid socket address in seed (expected host:port)")?;
+        endpoint_addr = endpoint_addr.with_ip_addr(socket_addr);
+    }
+
+    let node_id = NodeId::from(*endpoint_id.as_bytes());
+
+    Ok((endpoint_addr, node_id))
+}
+
+// -----------------------------------------------------------------------
+// Key management
+// -----------------------------------------------------------------------
+
+/// Load or create a persistent iroh secret key from `data_dir/node.key`.
+///
+/// On first run, generates a new random ed25519 key and writes it to `node.key`.
+/// On subsequent runs, reads the existing key. This gives each node a stable
+/// iroh identity across restarts, and different `data_dir`s get different identities.
+fn load_or_create_secret_key(data_dir: &Path) -> Result<SecretKey> {
+    let key_path = data_dir.join("node.key");
+    if key_path.exists() {
+        let bytes = std::fs::read(&key_path).context("failed to read node.key")?;
+        anyhow::ensure!(bytes.len() == 32, "node.key must be exactly 32 bytes");
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        let key = SecretKey::from_bytes(&arr);
+        info!(
+            endpoint_id = %key.public().fmt_short(),
+            "loaded existing node key"
+        );
+        Ok(key)
+    } else {
+        // Generate a new random ed25519 key.
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let key = SecretKey::from(bytes);
+        std::fs::write(&key_path, key.to_bytes()).context("failed to write node.key")?;
+        info!(
+            path = %key_path.display(),
+            endpoint_id = %key.public().fmt_short(),
+            "generated new node key"
+        );
+        Ok(key)
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -408,5 +806,93 @@ mod tests {
         assert!(conn.is_ok(), "should be able to connect to the S3 port");
 
         handle.abort();
+    }
+
+    #[test]
+    fn test_parse_seed_endpoint_id_only() {
+        // Use a known valid ed25519 public key (all zeros is not valid, use a generated one).
+        let key = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            SecretKey::from(b)
+        };
+        let id_str = key.public().to_string();
+
+        let (addr, node_id) = parse_seed(&id_str).unwrap();
+        assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
+        assert!(addr.is_empty()); // no direct addresses, relay-only
+    }
+
+    #[test]
+    fn test_parse_seed_with_address() {
+        let key = {
+            use rand::RngCore;
+            let mut b = [0u8; 32];
+            rand::thread_rng().fill_bytes(&mut b);
+            SecretKey::from(b)
+        };
+        let id_str = key.public().to_string();
+        let seed = format!("{id_str}@127.0.0.1:4820");
+
+        let (addr, node_id) = parse_seed(&seed).unwrap();
+        assert_eq!(*addr.id.as_bytes(), *node_id.as_bytes());
+        assert!(!addr.is_empty()); // has a direct address
+    }
+
+    #[test]
+    fn test_parse_seed_invalid() {
+        assert!(parse_seed("not-a-valid-key").is_err());
+        assert!(parse_seed("abc123@not-a-valid-addr").is_err());
+    }
+
+    #[test]
+    fn test_cli_secret_flag_overrides_config() {
+        // The --secret flag should override the config file's cluster secret.
+        use clap::Parser;
+
+        // Parse CLI args with --secret flag.
+        let cli = Cli::try_parse_from(["shoald", "start", "--secret", "my-unique-secret"])
+            .expect("CLI should parse with --secret flag");
+
+        match cli.command {
+            Commands::Start { secret, .. } => {
+                assert_eq!(
+                    secret.as_deref(),
+                    Some("my-unique-secret"),
+                    "--secret flag should be captured"
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_default_secret_is_not_empty() {
+        // The default cluster secret should be set but should trigger a warning
+        // when used in production.
+        let config = CliConfig::auto_detect();
+        assert!(
+            !config.cluster.secret.is_empty(),
+            "default cluster secret should not be empty"
+        );
+        // Default secret is known, so nodes without explicit secrets
+        // could join each other via relay — this is the root cause of
+        // phantom node appearances.
+        assert_eq!(config.cluster.secret, "shoal-default-secret");
+    }
+
+    #[test]
+    fn test_secret_key_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // First call generates a new key.
+        let key1 = load_or_create_secret_key(dir.path()).unwrap();
+
+        // Second call loads the same key.
+        let key2 = load_or_create_secret_key(dir.path()).unwrap();
+
+        assert_eq!(key1.to_bytes(), key2.to_bytes());
+        assert_eq!(key1.public(), key2.public());
     }
 }

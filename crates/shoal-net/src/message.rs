@@ -50,4 +50,35 @@ pub enum ShoalMessage {
         /// Timestamp from the original ping.
         timestamp: u64,
     },
+
+    /// Raw SWIM protocol data routed between foca membership services.
+    SwimData(Vec<u8>),
+
+    /// Broadcast a manifest and its object key mapping to other nodes.
+    ManifestPut {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+        /// Postcard-serialized [`Manifest`](shoal_types::Manifest).
+        manifest_bytes: Vec<u8>,
+    },
+
+    /// Request a manifest by bucket/key (bi-directional, expects ManifestResponse).
+    ManifestRequest {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+    },
+
+    /// Response to a [`ShoalMessage::ManifestRequest`].
+    ManifestResponse {
+        /// Bucket name (echoed back).
+        bucket: String,
+        /// Object key (echoed back).
+        key: String,
+        /// Postcard-serialized [`Manifest`](shoal_types::Manifest), or `None` if not found.
+        manifest_bytes: Option<Vec<u8>>,
+    },
 }

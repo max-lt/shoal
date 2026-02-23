@@ -216,4 +216,202 @@ mod tests {
         let result = decode(4, 2, &subset, original_size).unwrap();
         assert_eq!(result, data);
     }
+
+    // -----------------------------------------------------------------------
+    // k=1, m=0: passthrough decode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_k1_m0() {
+        let data = vec![0xAA; 100];
+        let (shards, original_size) = encode_helper(1, 0, &data);
+        assert_eq!(shards.len(), 1);
+        let result = decode(1, 0, &shards, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // k=1, m=1: mirror decode from either shard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_k1_m1_data_shard_only() {
+        let data = vec![0xBB; 50];
+        let (shards, original_size) = encode_helper(1, 1, &data);
+        // Keep only data shard (index 0).
+        let data_only: Vec<_> = shards.into_iter().filter(|(i, _)| *i == 0).collect();
+        let result = decode(1, 1, &data_only, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_decode_k1_m1_parity_shard_only() {
+        let data = vec![0xCC; 50];
+        let (shards, original_size) = encode_helper(1, 1, &data);
+        // Keep only parity shard (index 1).
+        let parity_only: Vec<_> = shards.into_iter().filter(|(i, _)| *i == 1).collect();
+        let result = decode(1, 1, &parity_only, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // k=3, m=3: all C(6,3) = 20 combinations
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_k3_m3_all_combinations() {
+        let data = vec![0xDD; 300];
+        let (shards, original_size) = encode_helper(3, 3, &data);
+        assert_eq!(shards.len(), 6);
+
+        // Generate all C(6,3) = 20 combinations.
+        for a in 0..6 {
+            for b in (a + 1)..6 {
+                for c in (b + 1)..6 {
+                    let subset: Vec<_> = shards
+                        .iter()
+                        .filter(|(i, _)| *i as usize == a || *i as usize == b || *i as usize == c)
+                        .cloned()
+                        .collect();
+                    let result = decode(3, 3, &subset, original_size)
+                        .unwrap_or_else(|e| panic!("failed for combo [{a},{b},{c}]: {e}"));
+                    assert_eq!(result, data, "mismatch for shard combination [{a},{b},{c}]");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Shard order shouldn't matter
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_shard_order_independent() {
+        let data = vec![0xEE; 200];
+        let (shards, original_size) = encode_helper(3, 2, &data);
+
+        // Reverse order.
+        let mut reversed = shards.clone();
+        reversed.reverse();
+        let result = decode(3, 2, &reversed, original_size).unwrap();
+        assert_eq!(result, data);
+
+        // Random-ish shuffle: take indices 2, 0, 4, 1, 3.
+        let shuffled = vec![
+            shards[2].clone(),
+            shards[0].clone(),
+            shards[4].clone(),
+            shards[1].clone(),
+            shards[3].clone(),
+        ];
+        let result = decode(3, 2, &shuffled, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Single byte data
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_single_byte() {
+        let data = vec![42u8];
+        let (shards, original_size) = encode_helper(2, 1, &data);
+        let result = decode(2, 1, &shards, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // k=8, m=4 production config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_k8_m4_drop_4() {
+        let data = vec![0xFF; 4096];
+        let (shards, original_size) = encode_helper(8, 4, &data);
+        assert_eq!(shards.len(), 12);
+
+        // Drop 4 shards (the maximum tolerable).
+        let subset: Vec<_> = shards.into_iter().take(8).collect();
+        let result = decode(8, 4, &subset, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    #[test]
+    fn test_decode_k8_m4_drop_5_fails() {
+        let data = vec![0xFF; 4096];
+        let (shards, original_size) = encode_helper(8, 4, &data);
+
+        // Drop 5 shards → only 7 left < k=8.
+        let subset: Vec<_> = shards.into_iter().take(7).collect();
+        let result = decode(8, 4, &subset, original_size);
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Exactly k shards present: should use fast-path (no RS decode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_exactly_k_data_shards_fast_path() {
+        let data = vec![0x11; 500];
+        let (shards, original_size) = encode_helper(4, 2, &data);
+
+        // Keep exactly the k=4 data shards (indices 0-3).
+        let data_shards: Vec<_> = shards
+            .into_iter()
+            .filter(|(i, _)| (*i as usize) < 4)
+            .collect();
+        assert_eq!(data_shards.len(), 4);
+
+        let result = decode(4, 2, &data_shards, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // More than k shards provided (extra are ignored)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_more_than_k_shards() {
+        let data = vec![0x22; 200];
+        let (shards, original_size) = encode_helper(2, 2, &data);
+
+        // Provide all 4 shards (k=2, so 2 extra).
+        let result = decode(2, 2, &shards, original_size).unwrap();
+        assert_eq!(result, data);
+    }
+
+    // -----------------------------------------------------------------------
+    // Zero shards → error
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_zero_shards_errors() {
+        let result = decode(2, 1, &[], 100);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ErasureError::NotEnoughShards { needed, got } => {
+                assert_eq!(needed, 2);
+                assert_eq!(got, 0);
+            }
+            other => panic!("expected NotEnoughShards, got: {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Varying data sizes with same k,m
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_decode_various_sizes() {
+        let k = 3;
+        let m = 2;
+        for size in [1, 2, 3, 5, 7, 13, 64, 100, 255, 1000, 4096] {
+            let data = vec![size as u8; size];
+            let (shards, original_size) = encode_helper(k, m, &data);
+            let result = decode(k, m, &shards, original_size)
+                .unwrap_or_else(|e| panic!("failed for size={size}: {e}"));
+            assert_eq!(result, data, "mismatch for size={size}");
+        }
+    }
 }

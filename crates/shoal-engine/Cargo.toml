@@ -14,6 +14,7 @@ shoal-cluster = { workspace = true }
 shoal-repair = { workspace = true }
 shoal-net = { workspace = true }
 async-trait = { workspace = true }
+postcard = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
 thiserror = { workspace = true }
