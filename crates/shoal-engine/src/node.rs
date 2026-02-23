@@ -11,6 +11,7 @@ use iroh::EndpointAddr;
 use shoal_cas::{Chunker, build_manifest};
 use shoal_cluster::ClusterState;
 use shoal_erasure::ErasureEncoder;
+use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::{ShoalMessage, Transport};
 use shoal_store::ShardStore;
@@ -101,6 +102,12 @@ pub struct ShoalNode {
     /// Prevents `lookup_manifest` from re-fetching deleted objects from
     /// peers when `pull_manifest` is available.
     deleted_keys: RwLock<HashSet<(String, String)>>,
+    /// Optional LogTree for DAG-based mutation tracking.
+    ///
+    /// When present, replaces MetaStore for object metadata (resolve, list,
+    /// manifest cache) and replaces ManifestPut broadcasts with LogEntry
+    /// broadcasts.
+    log_tree: Option<Arc<LogTree>>,
 }
 
 impl ShoalNode {
@@ -126,12 +133,19 @@ impl ShoalNode {
             address_book: Arc::new(RwLock::new(HashMap::new())),
             shard_cache: ShardCache::new(config.cache_max_bytes),
             deleted_keys: RwLock::new(HashSet::new()),
+            log_tree: None,
         }
     }
 
     /// Set the network transport for distributed operations.
     pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Set the LogTree for DAG-based mutation tracking.
+    pub fn with_log_tree(mut self, log_tree: Arc<LogTree>) -> Self {
+        self.log_tree = Some(log_tree);
         self
     }
 
@@ -268,43 +282,87 @@ impl ShoalNode {
         let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
         let object_id = manifest.object_id;
 
-        // Step 4: persist manifest and key mapping locally.
-        self.meta.put_manifest(&manifest)?;
-        self.meta.put_object_key(bucket, key, &object_id)?;
+        // Step 4: persist manifest and key mapping.
+        if let Some(log_tree) = &self.log_tree {
+            // LogTree mode: append log entry + broadcast LogEntryBroadcast.
+            let log_entry = log_tree.append_put(bucket, key, object_id, &manifest)?;
 
-        // Step 5: broadcast manifest to all known peers in parallel.
-        if let Some(transport) = &self.transport {
-            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
-            let peers = self.cluster.members().await;
-            let mut broadcast_tasks = tokio::task::JoinSet::new();
+            if let Some(transport) = &self.transport {
+                let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+                let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
+                let msg = ShoalMessage::LogEntryBroadcast {
+                    entry_bytes,
+                    manifest_bytes: Some(manifest_bytes),
+                };
+                let peers = self.cluster.members().await;
+                let mut broadcast_tasks = tokio::task::JoinSet::new();
 
-            for peer in &peers {
-                if peer.node_id == self.node_id {
-                    continue;
+                for peer in &peers {
+                    if peer.node_id == self.node_id {
+                        continue;
+                    }
+
+                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                        let transport = transport.clone();
+                        let peer_id = peer.node_id;
+                        let msg = msg.clone();
+                        broadcast_tasks.spawn(async move {
+                            if let Err(e) = transport.send_to(addr, &msg).await {
+                                warn!(
+                                    peer = %peer_id,
+                                    %e,
+                                    "failed to broadcast log entry"
+                                );
+                            }
+                        });
+                    }
                 }
-                if let Some(addr) = self.resolve_addr(&peer.node_id).await {
-                    let transport = transport.clone();
-                    let peer_id = peer.node_id;
-                    let msg = ShoalMessage::ManifestPut {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                        manifest_bytes: manifest_bytes.clone(),
-                    };
-                    broadcast_tasks.spawn(async move {
-                        if let Err(e) = transport.send_to(addr, &msg).await {
-                            warn!(
-                                peer = %peer_id,
-                                %e,
-                                "failed to broadcast manifest"
-                            );
-                        }
-                    });
+
+                while let Some(res) = broadcast_tasks.join_next().await {
+                    if let Err(e) = res {
+                        warn!(%e, "log entry broadcast task panicked");
+                    }
                 }
             }
+        } else {
+            // Fallback: old behavior (MetaStore + ManifestPut broadcast).
+            self.meta.put_manifest(&manifest)?;
+            self.meta.put_object_key(bucket, key, &object_id)?;
 
-            while let Some(res) = broadcast_tasks.join_next().await {
-                if let Err(e) = res {
-                    warn!(%e, "manifest broadcast task panicked");
+            if let Some(transport) = &self.transport {
+                let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
+                let peers = self.cluster.members().await;
+                let mut broadcast_tasks = tokio::task::JoinSet::new();
+
+                for peer in &peers {
+                    if peer.node_id == self.node_id {
+                        continue;
+                    }
+
+                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                        let transport = transport.clone();
+                        let peer_id = peer.node_id;
+                        let msg = ShoalMessage::ManifestPut {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            manifest_bytes: manifest_bytes.clone(),
+                        };
+                        broadcast_tasks.spawn(async move {
+                            if let Err(e) = transport.send_to(addr, &msg).await {
+                                warn!(
+                                    peer = %peer_id,
+                                    %e,
+                                    "failed to broadcast manifest"
+                                );
+                            }
+                        });
+                    }
+                }
+
+                while let Some(res) = broadcast_tasks.join_next().await {
+                    if let Err(e) = res {
+                        warn!(%e, "manifest broadcast task panicked");
+                    }
                 }
             }
         }
@@ -480,55 +538,129 @@ impl ShoalNode {
     /// Shard data is left in place for now; a background GC pass would
     /// clean up orphaned shards (post-milestone optimization).
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
-        // Look up to verify it exists.
-        let object_id =
-            self.meta
-                .get_object_key(bucket, key)?
-                .ok_or_else(|| EngineError::ObjectNotFound {
+        if let Some(log_tree) = &self.log_tree {
+            // LogTree mode: append delete entry + broadcast.
+            // Verify existence via LogTree resolve.
+            if log_tree.resolve(bucket, key)?.is_none() {
+                return Err(EngineError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
-                })?;
+                });
+            }
 
-        // Remove key mapping.
-        self.meta.delete_object_key(bucket, key)?;
+            let log_entry = log_tree.append_delete(bucket, key)?;
 
-        // Track deletion so lookup_manifest won't re-fetch from peers.
-        self.deleted_keys
-            .write()
-            .await
-            .insert((bucket.to_string(), key.to_string()));
+            if let Some(transport) = &self.transport {
+                let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+                let msg = ShoalMessage::LogEntryBroadcast {
+                    entry_bytes,
+                    manifest_bytes: None,
+                };
+                let peers = self.cluster.members().await;
+                let mut broadcast_tasks = tokio::task::JoinSet::new();
 
-        info!(bucket, key, %object_id, "delete_object: key mapping removed");
+                for peer in &peers {
+                    if peer.node_id == self.node_id {
+                        continue;
+                    }
+
+                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                        let transport = transport.clone();
+                        let peer_id = peer.node_id;
+                        let msg = msg.clone();
+                        broadcast_tasks.spawn(async move {
+                            if let Err(e) = transport.send_to(addr, &msg).await {
+                                warn!(
+                                    peer = %peer_id,
+                                    %e,
+                                    "failed to broadcast delete log entry"
+                                );
+                            }
+                        });
+                    }
+                }
+
+                while let Some(res) = broadcast_tasks.join_next().await {
+                    if let Err(e) = res {
+                        warn!(%e, "delete log entry broadcast task panicked");
+                    }
+                }
+            }
+
+            info!(bucket, key, "delete_object: delete entry appended");
+        } else {
+            // Fallback: old behavior (MetaStore).
+            let object_id = self.meta.get_object_key(bucket, key)?.ok_or_else(|| {
+                EngineError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                }
+            })?;
+
+            self.meta.delete_object_key(bucket, key)?;
+
+            // Track deletion so lookup_manifest won't re-fetch from peers.
+            self.deleted_keys
+                .write()
+                .await
+                .insert((bucket.to_string(), key.to_string()));
+
+            info!(bucket, key, %object_id, "delete_object: key mapping removed");
+        }
 
         Ok(())
     }
 
     /// Check if an object exists.
     pub fn has_object(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
-        Ok(self.meta.get_object_key(bucket, key)?.is_some())
+        if let Some(log_tree) = &self.log_tree {
+            Ok(log_tree.resolve(bucket, key)?.is_some())
+        } else {
+            Ok(self.meta.get_object_key(bucket, key)?.is_some())
+        }
     }
 
     /// List objects in a bucket with an optional prefix.
     pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
-        Ok(self.meta.list_objects(bucket, prefix)?)
+        if let Some(log_tree) = &self.log_tree {
+            Ok(log_tree.list_keys(bucket, prefix)?)
+        } else {
+            Ok(self.meta.list_objects(bucket, prefix)?)
+        }
     }
 
     /// Retrieve object metadata (manifest) without fetching data.
     pub fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
-        let object_id =
-            self.meta
-                .get_object_key(bucket, key)?
+        if let Some(log_tree) = &self.log_tree {
+            let object_id =
+                log_tree
+                    .resolve(bucket, key)?
+                    .ok_or_else(|| EngineError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    })?;
+
+            log_tree
+                .get_manifest(&object_id)?
                 .ok_or_else(|| EngineError::ObjectNotFound {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
-                })?;
+                })
+        } else {
+            let object_id = self.meta.get_object_key(bucket, key)?.ok_or_else(|| {
+                EngineError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                }
+            })?;
 
-        self.meta
-            .get_manifest(&object_id)?
-            .ok_or_else(|| EngineError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            })
+            self.meta
+                .get_manifest(&object_id)?
+                .ok_or_else(|| EngineError::ObjectNotFound {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                })
+        }
     }
 
     // ------------------------------------------------------------------
@@ -564,12 +696,16 @@ impl ShoalNode {
                     for entry in entries {
                         match postcard::from_bytes::<Manifest>(&entry.manifest_bytes) {
                             Ok(manifest) => {
-                                // Only store if we don't already have this key mapping.
-                                if self
-                                    .meta
-                                    .get_object_key(&entry.bucket, &entry.key)?
-                                    .is_none()
-                                {
+                                // Store if we don't have this key, or if the
+                                // peer has a different (newer) ObjectId for it.
+                                let local_oid =
+                                    self.meta.get_object_key(&entry.bucket, &entry.key)?;
+                                let dominated = match local_oid {
+                                    None => true,
+                                    Some(oid) => oid != manifest.object_id,
+                                };
+
+                                if dominated {
                                     self.meta.put_manifest(&manifest)?;
                                     self.meta.put_object_key(
                                         &entry.bucket,
@@ -610,6 +746,105 @@ impl ShoalNode {
     }
 
     // ------------------------------------------------------------------
+    // LogTree sync
+    // ------------------------------------------------------------------
+
+    /// Sync log entries from cluster peers using the LogTree.
+    ///
+    /// When a node joins (or restarts), it pulls missing log entries from
+    /// peers using its current DAG tips, allowing efficient delta sync.
+    ///
+    /// Returns the total number of new entries applied.
+    pub async fn sync_log_from_peers(&self) -> Result<usize, EngineError> {
+        let log_tree = self.log_tree.as_ref().ok_or(EngineError::NoLogTree)?;
+        let transport = self.transport.as_ref().ok_or(EngineError::NoTransport)?;
+
+        let my_tips = log_tree.tips()?;
+        let tip_refs: Vec<[u8; 32]> = my_tips.clone();
+
+        let peers = self.cluster.members().await;
+        let mut total_applied = 0usize;
+
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+
+            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                continue;
+            };
+
+            match transport.pull_log_entries(addr, &tip_refs).await {
+                Ok((entry_bytes_list, manifest_pairs)) => {
+                    // Deserialize entries.
+                    let mut entries = Vec::new();
+                    for eb in &entry_bytes_list {
+                        match postcard::from_bytes::<shoal_logtree::LogEntry>(eb) {
+                            Ok(entry) => entries.push(entry),
+                            Err(e) => {
+                                warn!(
+                                    from = %peer.node_id,
+                                    %e,
+                                    "failed to deserialize log entry from peer"
+                                );
+                            }
+                        }
+                    }
+
+                    // Deserialize manifests.
+                    let mut manifests = Vec::new();
+                    for (oid, mb) in &manifest_pairs {
+                        match postcard::from_bytes::<Manifest>(mb) {
+                            Ok(manifest) => manifests.push((*oid, manifest)),
+                            Err(e) => {
+                                warn!(
+                                    from = %peer.node_id,
+                                    %e,
+                                    "failed to deserialize manifest from peer"
+                                );
+                            }
+                        }
+                    }
+
+                    match log_tree.apply_sync_entries(&entries, &manifests) {
+                        Ok(applied) => {
+                            if applied > 0 {
+                                debug!(
+                                    from = %peer.node_id,
+                                    applied,
+                                    "applied log entries from peer"
+                                );
+                            }
+                            total_applied += applied;
+                        }
+                        Err(e) => {
+                            warn!(
+                                from = %peer.node_id,
+                                %e,
+                                "failed to apply log entries from peer"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(from = %peer.node_id, %e, "failed to pull log entries from peer");
+                }
+            }
+        }
+
+        if total_applied > 0 {
+            info!(total_applied, "log sync complete");
+        }
+
+        Ok(total_applied)
+    }
+
+    /// Return a reference to the LogTree, if configured.
+    pub fn log_tree(&self) -> Option<&Arc<LogTree>> {
+        self.log_tree.as_ref()
+    }
+
+    // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 
@@ -621,6 +856,21 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Manifest>, EngineError> {
+        // LogTree mode: resolve from the DAG's materialized state.
+        if let Some(log_tree) = &self.log_tree {
+            let object_id = match log_tree.resolve(bucket, key)? {
+                Some(oid) => oid,
+                None => return Ok(None),
+            };
+
+            return match log_tree.get_manifest(&object_id)? {
+                Some(m) => Ok(Some(m)),
+                None => Ok(None),
+            };
+        }
+
+        // Fallback: MetaStore + peer pull.
+
         // Try local first.
         if let Some(object_id) = self.meta.get_object_key(bucket, key)?
             && let Some(manifest) = self.meta.get_manifest(&object_id)?

@@ -27,6 +27,18 @@ pub enum EngineError {
     #[error("repair error: {0}")]
     Repair(#[from] shoal_repair::RepairError),
 
+    /// LogTree error.
+    #[error("logtree error: {0}")]
+    LogTree(#[from] shoal_logtree::LogTreeError),
+
+    /// No LogTree configured.
+    #[error("no log tree configured")]
+    NoLogTree,
+
+    /// No transport configured.
+    #[error("no transport configured")]
+    NoTransport,
+
     /// Object not found.
     #[error("object not found: bucket={bucket}, key={key}")]
     ObjectNotFound {

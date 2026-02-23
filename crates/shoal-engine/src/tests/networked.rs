@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use shoal_cluster::ClusterState;
+use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
 use shoal_store::{MemoryStore, ShardStore};
@@ -32,6 +33,8 @@ struct FailableMockTransport {
     stores: HashMap<NodeId, Arc<dyn ShardStore>>,
     /// Maps NodeId → MetaStore for manifest sync.
     metas: HashMap<NodeId, Arc<MetaStore>>,
+    /// Maps NodeId → LogTree for log entry sync.
+    log_trees: HashMap<NodeId, Arc<LogTree>>,
     /// Set of nodes currently "down" (unreachable).
     down_nodes: Arc<RwLock<HashSet<NodeId>>>,
 }
@@ -80,17 +83,36 @@ impl Transport for FailableMockTransport {
         if self.down_nodes.read().await.contains(&node_id) {
             return Err(NetError::Endpoint("node is down".into()));
         }
-        if let ShoalMessage::ManifestPut {
-            bucket,
-            key,
-            manifest_bytes,
-        } = msg
-            && let Some(meta) = self.metas.get(&node_id)
-            && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
-        {
-            let _ = meta.put_manifest(&manifest);
-            let _ = meta.put_object_key(bucket, key, &manifest.object_id);
+
+        match msg {
+            ShoalMessage::ManifestPut {
+                bucket,
+                key,
+                manifest_bytes,
+            } => {
+                if let Some(meta) = self.metas.get(&node_id)
+                    && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
+                {
+                    let _ = meta.put_manifest(&manifest);
+                    let _ = meta.put_object_key(bucket, key, &manifest.object_id);
+                }
+            }
+            ShoalMessage::LogEntryBroadcast {
+                entry_bytes,
+                manifest_bytes,
+            } => {
+                if let Some(log_tree) = self.log_trees.get(&node_id)
+                    && let Ok(entry) = postcard::from_bytes::<shoal_logtree::LogEntry>(entry_bytes)
+                {
+                    let manifest = manifest_bytes
+                        .as_ref()
+                        .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
+                    let _ = log_tree.receive_entry(&entry, manifest.as_ref());
+                }
+            }
+            _ => {}
         }
+
         Ok(())
     }
 
@@ -142,6 +164,43 @@ impl Transport for FailableMockTransport {
         }
         Ok(result)
     }
+
+    async fn pull_log_entries(
+        &self,
+        addr: iroh::EndpointAddr,
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+
+        let Some(log_tree) = self.log_trees.get(&node_id) else {
+            return Ok((vec![], vec![]));
+        };
+
+        let delta = log_tree
+            .compute_delta(my_tips)
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+
+        let entries: Vec<Vec<u8>> = delta
+            .iter()
+            .filter_map(|e| postcard::to_allocvec(e).ok())
+            .collect();
+
+        let manifests: Vec<(ObjectId, Vec<u8>)> = delta
+            .iter()
+            .filter_map(|e| match &e.action {
+                shoal_logtree::Action::Put { manifest_id, .. } => {
+                    let m = log_tree.get_manifest(manifest_id).ok()??;
+                    Some((*manifest_id, postcard::to_allocvec(&m).ok()?))
+                }
+                _ => None,
+            })
+            .collect();
+
+        Ok((entries, manifests))
+    }
 }
 
 /// Derive a valid (NodeId, EndpointAddr) pair from a seed byte.
@@ -162,13 +221,17 @@ struct TestCluster {
     stores: Vec<Arc<dyn ShardStore>>,
     cluster: Arc<ClusterState>,
     down_nodes: Arc<RwLock<HashSet<NodeId>>>,
+    /// Keep LogTree instances alive for the duration of the test.
+    /// The nodes hold their own Arc clones via `.with_log_tree()`.
+    #[allow(dead_code)]
+    log_trees: Vec<Option<Arc<LogTree>>>,
 }
 
 impl TestCluster {
     /// Create an N-node cluster. Seeds start at 1 (seed=0 gives an invalid key).
     /// Uses shard_replication=1 (each shard on exactly one node).
     async fn new(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
-        Self::with_replication(n, chunk_size, k, m, 1).await
+        Self::build(n, chunk_size, k, m, 1, false).await
     }
 
     /// Create an N-node cluster with a custom shard replication factor.
@@ -179,6 +242,23 @@ impl TestCluster {
         k: usize,
         m: usize,
         shard_replication: usize,
+    ) -> Self {
+        Self::build(n, chunk_size, k, m, shard_replication, false).await
+    }
+
+    /// Create an N-node cluster with LogTree enabled.
+    async fn with_log_tree(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
+        Self::build(n, chunk_size, k, m, 1, true).await
+    }
+
+    /// Internal builder that supports all configuration options.
+    async fn build(
+        n: usize,
+        chunk_size: u32,
+        k: usize,
+        m: usize,
+        shard_replication: usize,
+        use_log_tree: bool,
     ) -> Self {
         assert!(n >= 2, "need at least 2 nodes");
         assert!(n <= 200, "seed byte overflow");
@@ -231,11 +311,31 @@ impl TestCluster {
             .map(|(&nid, meta)| (nid, meta.clone()))
             .collect();
 
+        // Optionally create LogTree instances for each node.
+        let log_tree_instances: Vec<Option<Arc<LogTree>>> = if use_log_tree {
+            (0..n)
+                .map(|i| {
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[(i + 1) as u8; 32]);
+                    let store = shoal_logtree::LogTreeStore::open_temporary().unwrap();
+                    Some(Arc::new(LogTree::new(store, node_ids[i], signing_key)))
+                })
+                .collect()
+        } else {
+            (0..n).map(|_| None).collect()
+        };
+
+        let log_tree_map: HashMap<NodeId, Arc<LogTree>> = node_ids
+            .iter()
+            .zip(log_tree_instances.iter())
+            .filter_map(|(&nid, lt)| lt.as_ref().map(|lt| (nid, lt.clone())))
+            .collect();
+
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {
             let transport: Arc<dyn Transport> = Arc::new(FailableMockTransport {
                 stores: store_map.clone(),
                 metas: meta_map.clone(),
+                log_trees: log_tree_map.clone(),
                 down_nodes: down_nodes.clone(),
             });
             let book: HashMap<NodeId, iroh::EndpointAddr> = full_book
@@ -244,7 +344,7 @@ impl TestCluster {
                 .map(|(&nid, addr)| (nid, addr.clone()))
                 .collect();
 
-            let node = ShoalNode::new(
+            let mut node = ShoalNode::new(
                 ShoalNodeConfig {
                     node_id: node_ids[i],
                     chunk_size,
@@ -261,6 +361,10 @@ impl TestCluster {
             .with_transport(transport)
             .with_address_book(Arc::new(RwLock::new(book)));
 
+            if let Some(lt) = &log_tree_instances[i] {
+                node = node.with_log_tree(lt.clone());
+            }
+
             nodes.push(node);
         }
 
@@ -270,6 +374,7 @@ impl TestCluster {
             stores,
             cluster,
             down_nodes,
+            log_trees: log_tree_instances,
         }
     }
 
@@ -365,11 +470,13 @@ async fn writer_reader_pair_with_transport(
     let transport_a: Arc<dyn Transport> = Arc::new(FailableMockTransport {
         stores: HashMap::from([(nid_b, store_b.clone())]),
         metas: HashMap::from([(nid_b, meta_b.clone())]),
+        log_trees: HashMap::new(),
         down_nodes: down.clone(),
     });
     let transport_b: Arc<dyn Transport> = Arc::new(FailableMockTransport {
         stores: HashMap::from([(nid_a, store_a.clone())]),
         metas: HashMap::from([(nid_a, meta_a.clone())]),
+        log_trees: HashMap::new(),
         down_nodes: down,
     });
 
@@ -1371,6 +1478,62 @@ async fn test_manifest_sync_idempotent() {
     assert_eq!(keys.len(), 1);
 }
 
+/// Bug regression: when a node has a stale key mapping from before a
+/// restart, `sync_manifests_from_peers` should update it to the latest
+/// version from peers. Previously, sync only stored manifests for keys
+/// that didn't exist locally, silently ignoring overwrites.
+///
+/// Scenario:
+/// 1. Node 0 writes v1 of key.txt — all nodes receive the broadcast
+/// 2. Node 2 goes down
+/// 3. Node 0 overwrites key.txt with v2 — node 2 misses the broadcast
+/// 4. Node 2 comes back up and syncs — should get v2, not stay on v1
+#[tokio::test]
+async fn test_manifest_sync_updates_stale_key_after_overwrite() {
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+    let v1 = test_data(2000);
+    let v2 = test_data(3000);
+
+    // Node 0 writes v1. put_object broadcasts via send_to → node 2 gets v1.
+    c.node(0)
+        .put_object("b", "key.txt", &v1, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Verify node 2 has v1.
+    let (got, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got, v1, "node 2 should have v1 from broadcast");
+
+    // Kill node 2 — simulates a restart (it will miss subsequent broadcasts).
+    c.kill_node(2).await;
+
+    // Node 0 overwrites key.txt with v2. Broadcast won't reach node 2.
+    c.node(0)
+        .put_object("b", "key.txt", &v2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Verify other nodes have v2.
+    let (got, _) = c.node(1).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got, v2, "node 1 should have v2");
+
+    // Revive node 2.
+    c.revive_node(2).await;
+
+    // Node 2 syncs from peers. It already has key.txt → v1_object_id.
+    // The sync SHOULD detect that peers have a different (newer) ObjectId
+    // and update the mapping.
+    let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert!(
+        synced >= 1,
+        "sync should update stale key mapping (got {synced})"
+    );
+
+    // Node 2 should now read v2, not the stale v1.
+    let (got, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got, v2, "node 2 should read v2 after sync, not stale v1");
+}
+
 /// Sync across multiple buckets works correctly.
 #[tokio::test]
 async fn test_manifest_sync_multiple_buckets() {
@@ -1396,4 +1559,155 @@ async fn test_manifest_sync_multiple_buckets() {
 
     assert_eq!(c.node(2).list_objects("photos", "").unwrap().len(), 1);
     assert_eq!(c.node(2).list_objects("docs", "").unwrap().len(), 1);
+}
+
+// =========================================================================
+// LogTree integration tests
+// =========================================================================
+
+/// With LogTree: put_object appends a log entry and broadcasts to peers.
+#[tokio::test]
+async fn test_logtree_put_broadcasts_to_peers() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let data = test_data(5000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // The LogEntryBroadcast via send_to should have delivered the entry
+    // to all peers' LogTrees. All nodes should resolve the key.
+    for i in 0..3 {
+        let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
+        assert_eq!(got, data, "logtree node {i} should read the object");
+    }
+}
+
+/// With LogTree: delete_object appends a delete log entry.
+#[tokio::test]
+async fn test_logtree_delete_object() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let data = test_data(2000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // All nodes see it.
+    let (got, _) = c.node(1).get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+
+    // Node 1 deletes.
+    c.node(1).delete_object("b", "k").await.unwrap();
+
+    // Node 1 should see the delete (resolve returns None).
+    let result = c.node(1).get_object("b", "k").await;
+    assert!(result.is_err(), "deleted object should not be found");
+}
+
+/// With LogTree: get_object reads from LogTree's materialized state.
+#[tokio::test]
+async fn test_logtree_get_reads_from_materialized_state() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let data = test_data(3000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Verify has_object and list_objects also use LogTree.
+    assert!(c.node(0).has_object("b", "k").unwrap());
+    assert!(c.node(1).has_object("b", "k").unwrap());
+
+    let keys = c.node(2).list_objects("b", "").unwrap();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0], "k");
+}
+
+/// With LogTree: sync_log_from_peers recovers missed entries.
+#[tokio::test]
+async fn test_logtree_sync_from_peers() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+
+    // Kill node 2 so it misses broadcasts.
+    c.kill_node(2).await;
+
+    let data1 = test_data(2000);
+    let data2 = test_data(3000);
+
+    c.node(0)
+        .put_object("b", "key1.txt", &data1, BTreeMap::new())
+        .await
+        .unwrap();
+    c.node(1)
+        .put_object("b", "key2.txt", &data2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Revive node 2.
+    c.revive_node(2).await;
+
+    // Node 2 has no objects before sync.
+    let keys_before = c.node(2).list_objects("b", "").unwrap();
+    assert_eq!(
+        keys_before.len(),
+        0,
+        "node 2 should have 0 objects before sync"
+    );
+
+    // Sync log entries from peers.
+    let synced = c.node(2).sync_log_from_peers().await.unwrap();
+    assert!(
+        synced >= 2,
+        "should have synced at least 2 entries, got {synced}"
+    );
+
+    // Node 2 should now see both objects.
+    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    keys_after.sort();
+    assert_eq!(keys_after, vec!["key1.txt", "key2.txt"]);
+
+    // And should be able to read them.
+    let (got1, _) = c.node(2).get_object("b", "key1.txt").await.unwrap();
+    assert_eq!(got1, data1);
+    let (got2, _) = c.node(2).get_object("b", "key2.txt").await.unwrap();
+    assert_eq!(got2, data2);
+}
+
+/// With LogTree: overwrite scenario — put v1, kill node, put v2, revive, sync → reads v2.
+#[tokio::test]
+async fn test_logtree_overwrite_after_sync() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let v1 = test_data(2000);
+    let v2 = test_data(3000);
+
+    // Node 0 writes v1, all nodes get it.
+    c.node(0)
+        .put_object("b", "key.txt", &v1, BTreeMap::new())
+        .await
+        .unwrap();
+
+    let (got, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got, v1, "node 2 should have v1");
+
+    // Kill node 2.
+    c.kill_node(2).await;
+
+    // Node 0 overwrites with v2.
+    c.node(0)
+        .put_object("b", "key.txt", &v2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Revive node 2, sync.
+    c.revive_node(2).await;
+    let synced = c.node(2).sync_log_from_peers().await.unwrap();
+    assert!(synced >= 1, "should sync the v2 entry");
+
+    // Node 2 should read v2 via LWW.
+    let (got, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got, v2, "node 2 should read v2 after sync");
 }

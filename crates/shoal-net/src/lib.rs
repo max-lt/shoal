@@ -59,6 +59,15 @@ pub trait Transport: Send + Sync {
         &self,
         addr: iroh::EndpointAddr,
     ) -> Result<Vec<ManifestSyncEntry>, NetError>;
+
+    /// Pull missing log entries from a remote node.
+    ///
+    /// Sends our tip hashes, receives entries and manifests we are missing.
+    async fn pull_log_entries(
+        &self,
+        addr: iroh::EndpointAddr,
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

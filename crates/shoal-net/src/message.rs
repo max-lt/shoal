@@ -3,7 +3,7 @@
 //! All messages are serialized with postcard over QUIC streams.
 
 use serde::{Deserialize, Serialize};
-use shoal_types::{ClusterEvent, Member, ShardId};
+use shoal_types::{ClusterEvent, Member, ObjectId, ShardId};
 
 /// Protocol messages exchanged between Shoal nodes.
 ///
@@ -89,6 +89,28 @@ pub enum ShoalMessage {
     ManifestSyncResponse {
         /// Each entry is (bucket, key, postcard-serialized Manifest).
         entries: Vec<ManifestSyncEntry>,
+    },
+
+    /// Broadcast a new log entry (+ optional manifest for Put actions).
+    LogEntryBroadcast {
+        /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
+        entry_bytes: Vec<u8>,
+        /// Postcard-serialized [`Manifest`](shoal_types::Manifest) for Put actions.
+        manifest_bytes: Option<Vec<u8>>,
+    },
+
+    /// Request missing log entries. Sender provides their tip hashes.
+    LogSyncRequest {
+        /// The sender's current DAG tip hashes.
+        tips: Vec<[u8; 32]>,
+    },
+
+    /// Response with missing entries and their associated manifests.
+    LogSyncResponse {
+        /// Each entry is a postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
+        entries: Vec<Vec<u8>>,
+        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
+        manifests: Vec<(ObjectId, Vec<u8>)>,
     },
 }
 

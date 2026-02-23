@@ -13,10 +13,11 @@ use std::sync::Arc;
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
 use shoal_cluster::membership::MembershipHandle;
+use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
-use shoal_types::NodeId;
+use shoal_types::{Manifest, NodeId, ObjectId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -31,6 +32,7 @@ pub struct ShoalProtocol {
     meta: Arc<MetaStore>,
     membership: Arc<MembershipHandle>,
     address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
+    log_tree: Option<Arc<LogTree>>,
 }
 
 impl fmt::Debug for ShoalProtocol {
@@ -52,7 +54,14 @@ impl ShoalProtocol {
             meta,
             membership,
             address_book,
+            log_tree: None,
         }
+    }
+
+    /// Set the LogTree for DAG-based mutation tracking.
+    pub fn with_log_tree(mut self, log_tree: Arc<LogTree>) -> Self {
+        self.log_tree = Some(log_tree);
+        self
     }
 }
 
@@ -67,16 +76,18 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .await
             .insert(remote_node_id, remote_addr);
 
-        // Spawn a handler for uni-directional streams (SWIM data, shard push, manifest).
+        // Spawn a handler for uni-directional streams (SWIM data, shard push, manifest, log entries).
         let conn_uni = conn.clone();
         let membership = self.membership.clone();
         let store_uni = self.store.clone();
         let meta_uni = self.meta.clone();
+        let log_tree_uni = self.log_tree.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
                 let store = store_uni.clone();
                 let meta = meta_uni.clone();
+                let log_tree = log_tree_uni.clone();
                 async move {
                     match msg {
                         ShoalMessage::SwimData(data) => {
@@ -90,11 +101,46 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 warn!(%shard_id, %e, "failed to store pushed shard");
                             }
                         }
+                        ShoalMessage::LogEntryBroadcast {
+                            entry_bytes,
+                            manifest_bytes,
+                        } => {
+                            if let Some(log_tree) = &log_tree {
+                                match postcard::from_bytes::<shoal_logtree::LogEntry>(&entry_bytes)
+                                {
+                                    Ok(entry) => {
+                                        let manifest = manifest_bytes
+                                            .as_ref()
+                                            .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
+                                        match log_tree.receive_entry(&entry, manifest.as_ref()) {
+                                            Ok(true) => {
+                                                debug!("stored log entry");
+                                            }
+                                            Ok(false) => {} // already known
+                                            Err(e) => {
+                                                warn!(
+                                                    %e,
+                                                    "failed to process log entry"
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            %e,
+                                            "failed to deserialize log entry broadcast"
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!("received log entry broadcast but no LogTree configured");
+                            }
+                        }
                         ShoalMessage::ManifestPut {
                             bucket,
                             key,
                             manifest_bytes,
-                        } => match postcard::from_bytes::<shoal_types::Manifest>(&manifest_bytes) {
+                        } => match postcard::from_bytes::<Manifest>(&manifest_bytes) {
                             Ok(manifest) => {
                                 debug!(
                                     %bucket, %key,
@@ -129,13 +175,15 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .await;
         });
 
-        // Handle bi-directional streams (shard pull, manifest pull).
+        // Handle bi-directional streams (shard pull, manifest pull, log sync).
         let store = self.store.clone();
         let meta = self.meta.clone();
+        let log_tree_bi = self.log_tree.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_bi_streams(conn, move |msg| {
                 let store = store.clone();
                 let meta = meta.clone();
+                let log_tree = log_tree_bi.clone();
                 async move {
                     match msg {
                         ShoalMessage::ShardRequest { shard_id } => {
@@ -174,6 +222,31 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 })
                                 .collect();
                             Some(ShoalMessage::ManifestSyncResponse { entries })
+                        }
+                        ShoalMessage::LogSyncRequest { tips } => {
+                            if let Some(log_tree) = &log_tree {
+                                let delta = log_tree.compute_delta(&tips).unwrap_or_default();
+                                let entries: Vec<Vec<u8>> = delta
+                                    .iter()
+                                    .filter_map(|e| postcard::to_allocvec(e).ok())
+                                    .collect();
+                                let manifests: Vec<(ObjectId, Vec<u8>)> = delta
+                                    .iter()
+                                    .filter_map(|e| match &e.action {
+                                        shoal_logtree::Action::Put { manifest_id, .. } => {
+                                            let m = log_tree.get_manifest(manifest_id).ok()??;
+                                            Some((*manifest_id, postcard::to_allocvec(&m).ok()?))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+                                Some(ShoalMessage::LogSyncResponse { entries, manifests })
+                            } else {
+                                Some(ShoalMessage::LogSyncResponse {
+                                    entries: vec![],
+                                    manifests: vec![],
+                                })
+                            }
                         }
                         _ => None,
                     }

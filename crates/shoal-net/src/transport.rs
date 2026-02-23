@@ -487,6 +487,49 @@ impl ShoalTransport {
         }
     }
 
+    /// Pull missing log entries from a remote peer.
+    ///
+    /// Opens a bidirectional stream: sends a `LogSyncRequest` with our tips,
+    /// receives a `LogSyncResponse` with entries and manifests we're missing.
+    pub async fn pull_log_entries(
+        &self,
+        addr: EndpointAddr,
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::LogSyncRequest {
+            tips: my_tips.to_vec(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::LogSyncResponse { entries, manifests } => {
+                debug!(
+                    entries = entries.len(),
+                    manifests = manifests.len(),
+                    "received log sync response"
+                );
+                Ok((entries, manifests))
+            }
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
     /// Gracefully close the transport.
     pub async fn close(&self) {
         self.endpoint.close().await;
@@ -534,5 +577,13 @@ impl crate::Transport for ShoalTransport {
         addr: EndpointAddr,
     ) -> Result<Vec<crate::ManifestSyncEntry>, crate::NetError> {
         self.pull_all_manifests(addr).await
+    }
+
+    async fn pull_log_entries(
+        &self,
+        addr: EndpointAddr,
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), crate::NetError> {
+        self.pull_log_entries(addr, my_tips).await
     }
 }

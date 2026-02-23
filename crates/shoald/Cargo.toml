@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 shoal-cluster = { workspace = true }
 shoal-engine = { workspace = true }
+shoal-logtree = { workspace = true }
 shoal-meta = { workspace = true }
 shoal-net = { workspace = true }
 shoal-repair = { workspace = true }
@@ -21,6 +22,7 @@ async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true }
+ed25519-dalek = { workspace = true }
 dirs = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }

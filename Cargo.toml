@@ -10,6 +10,7 @@ members = [
     "crates/shoal-repair",
     "crates/shoal-net",
     "crates/shoal-engine",
+    "crates/shoal-logtree",
     "crates/shoal-s3",
     "crates/shoald",
     "tests",
@@ -32,6 +33,7 @@ shoal-cluster = { path = "crates/shoal-cluster" }
 shoal-repair = { path = "crates/shoal-repair" }
 shoal-net = { path = "crates/shoal-net" }
 shoal-engine = { path = "crates/shoal-engine" }
+shoal-logtree = { path = "crates/shoal-logtree" }
 shoal-s3 = { path = "crates/shoal-s3" }
 
 # Hashing
@@ -78,6 +80,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 thiserror = "2"
 anyhow = "1"
+
+# Signing
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 
 # System
 libc = "0.2"

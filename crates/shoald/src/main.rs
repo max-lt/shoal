@@ -32,6 +32,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
 use shoal_cluster::{ClusterIdentity, ClusterState, GossipService, membership};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
+use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::{ShoalMessage, ShoalTransport};
 use shoal_repair::executor::ShardTransfer;
@@ -265,6 +266,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         load_or_create_secret_key(&config.node.data_dir)?
     };
     let public_key = secret_key.public();
+    let secret_key_bytes = secret_key.to_bytes();
     let node_id = NodeId::from(*public_key.as_bytes());
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
@@ -443,6 +445,24 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         cluster.clone(),
     );
 
+    // --- LogTree (DAG-based mutation tracking) ---
+    let log_tree = {
+        // Derive an ed25519-dalek signing key from the iroh SecretKey.
+        // The iroh SecretKey is a Curve25519 key, but its raw bytes are
+        // also a valid ed25519 seed. We use it to create a deterministic
+        // ed25519 signing key for log entry signatures.
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
+        let log_store = if memory_mode {
+            shoal_logtree::LogTreeStore::open_temporary()
+                .context("failed to create in-memory LogTree store")?
+        } else {
+            let log_path = config.node.data_dir.join("logtree");
+            shoal_logtree::LogTreeStore::open(&log_path).context("failed to open LogTree store")?
+        };
+        Arc::new(LogTree::new(log_store, node_id, signing_key))
+    };
+    info!("LogTree initialized");
+
     // --- Incoming connection handler (iroh Router) ---
     // A single Router handles both our custom protocol (cluster_alpn) and
     // the iroh-gossip protocol (GOSSIP_ALPN).
@@ -451,7 +471,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         meta.clone(),
         membership_handle.clone(),
         address_book.clone(),
-    );
+    )
+    .with_log_tree(log_tree.clone());
     let router = Router::builder(endpoint.clone())
         .accept(cluster_alpn, protocol)
         .accept(GOSSIP_ALPN, gossip)
@@ -544,7 +565,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             cluster.clone(),
         )
         .with_transport(transport.clone())
-        .with_address_book(address_book.clone()),
+        .with_address_book(address_book.clone())
+        .with_log_tree(log_tree.clone()),
     );
 
     // --- Repair subsystem ---
@@ -600,23 +622,20 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         "repair subsystem started"
     );
 
-    // --- Manifest sync (catch up on historical manifests from peers) ---
-    // This is necessary because manifest broadcasts are point-in-time: if
+    // --- Log sync (catch up on historical mutations from peers) ---
+    // This is necessary because log entry broadcasts are point-in-time: if
     // this node is joining an existing cluster, it missed all previous
-    // broadcasts. We pull all manifests from one peer to populate our local
-    // Fjall index, so that list_objects returns a complete view.
+    // broadcasts. We pull missing log entries from peers using our current
+    // DAG tips, allowing efficient delta sync.
     if !config.cluster.peers.is_empty() {
         let engine_sync = engine.clone();
         tokio::spawn(async move {
             // Small delay to let SWIM handshake establish connections.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match engine_sync.sync_manifests_from_peers().await {
-                Ok(0) => debug!("manifest sync: nothing new from peers"),
-                Ok(n) => info!(
-                    count = n,
-                    "manifest sync: caught up on historical manifests"
-                ),
-                Err(e) => warn!(%e, "manifest sync failed (will retry on next restart)"),
+            match engine_sync.sync_log_from_peers().await {
+                Ok(0) => debug!("log sync: nothing new from peers"),
+                Ok(n) => info!(count = n, "log sync: caught up on historical mutations"),
+                Err(e) => warn!(%e, "log sync failed (will retry on next restart)"),
             }
         });
     }

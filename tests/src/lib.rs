@@ -140,6 +140,15 @@ impl Transport for MockTransport {
         }
         Ok(result)
     }
+
+    async fn pull_log_entries(
+        &self,
+        _addr: iroh::EndpointAddr,
+        _my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+        // Integration tests use MetaStore mode, not LogTree.
+        Ok((vec![], vec![]))
+    }
 }
 
 // =========================================================================

@@ -8,6 +8,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -346,6 +348,84 @@ impl Default for RepairCircuitBreaker {
             rebalance_cooldown_secs: 60,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Hybrid Logical Clock
+// ---------------------------------------------------------------------------
+
+/// A hybrid logical clock combining wall-clock time with a logical counter.
+///
+/// Produces monotonically increasing timestamps (nanoseconds since UNIX epoch)
+/// that are always at least as large as the wall clock and strictly increasing
+/// even when the wall clock hasn't advanced. Thread-safe via `AtomicU64`.
+pub struct HybridClock {
+    last: AtomicU64,
+}
+
+impl HybridClock {
+    /// Create a new clock initialised to the current wall-clock time.
+    pub fn new() -> Self {
+        let now = wall_clock_nanos();
+        Self {
+            last: AtomicU64::new(now),
+        }
+    }
+
+    /// Advance and return a new unique timestamp.
+    ///
+    /// The returned value is `max(wall_clock, last) + 1`, guaranteeing strict
+    /// monotonicity even under rapid successive calls or clock skew.
+    pub fn tick(&self) -> u64 {
+        loop {
+            let prev = self.last.load(Ordering::SeqCst);
+            let now = wall_clock_nanos();
+            let candidate = prev.max(now) + 1;
+
+            if self
+                .last
+                .compare_exchange(prev, candidate, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return candidate;
+            }
+        }
+    }
+
+    /// Witness a remote HLC timestamp, advancing the local clock if necessary.
+    ///
+    /// After witnessing, `last = max(last, remote_hlc)`. The next [`tick`](Self::tick)
+    /// will produce a value strictly greater than both.
+    pub fn witness(&self, remote_hlc: u64) {
+        self.last.fetch_max(remote_hlc, Ordering::SeqCst);
+    }
+
+    /// Return the current clock value without advancing it.
+    pub fn current(&self) -> u64 {
+        self.last.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for HybridClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Debug for HybridClock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HybridClock")
+            .field("last", &self.last.load(Ordering::SeqCst))
+            .finish()
+    }
+}
+
+/// Current wall-clock time in nanoseconds since UNIX epoch.
+fn wall_clock_nanos() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -759,5 +839,93 @@ mod tests {
     fn test_node_config_includes_circuit_breaker() {
         let config = NodeConfig::default();
         assert!((config.repair_circuit_breaker.max_down_fraction - 0.5).abs() < f64::EPSILON);
+    }
+
+    // --- HybridClock tests ---
+
+    #[test]
+    fn test_hlc_tick_monotonic() {
+        let clock = HybridClock::new();
+        let mut prev = clock.tick();
+
+        for _ in 0..1000 {
+            let next = clock.tick();
+            assert!(next > prev, "tick must be strictly increasing");
+            prev = next;
+        }
+    }
+
+    #[test]
+    fn test_hlc_tick_advances_beyond_wall_clock() {
+        let clock = HybridClock::new();
+        // Rapid ticks should produce values beyond the wall clock.
+        let t1 = clock.tick();
+        let t2 = clock.tick();
+        let t3 = clock.tick();
+        assert!(t2 > t1);
+        assert!(t3 > t2);
+    }
+
+    #[test]
+    fn test_hlc_witness_advances_local() {
+        let clock = HybridClock::new();
+        let far_future = clock.current() + 1_000_000_000; // 1 second ahead
+        clock.witness(far_future);
+        assert!(
+            clock.current() >= far_future,
+            "witness should advance local clock"
+        );
+        let next = clock.tick();
+        assert!(next > far_future, "tick after witness should exceed remote");
+    }
+
+    #[test]
+    fn test_hlc_witness_no_retreat() {
+        let clock = HybridClock::new();
+        let current = clock.tick();
+        let past = current.saturating_sub(1_000_000);
+        clock.witness(past);
+        assert!(
+            clock.current() >= current,
+            "witness with past value should not retreat"
+        );
+    }
+
+    #[test]
+    fn test_hlc_concurrent_ticks_unique() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        let clock = Arc::new(HybridClock::new());
+        let n_threads = 4;
+        let ticks_per_thread = 1000;
+
+        let mut handles = Vec::new();
+
+        for _ in 0..n_threads {
+            let clock = clock.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut values = Vec::with_capacity(ticks_per_thread);
+
+                for _ in 0..ticks_per_thread {
+                    values.push(clock.tick());
+                }
+
+                values
+            }));
+        }
+
+        let mut all_values = HashSet::new();
+
+        for h in handles {
+            for v in h.join().unwrap() {
+                assert!(
+                    all_values.insert(v),
+                    "concurrent tick produced duplicate value"
+                );
+            }
+        }
+
+        assert_eq!(all_values.len(), n_threads * ticks_per_thread);
     }
 }

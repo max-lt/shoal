@@ -13,6 +13,7 @@ shoal-placement = { workspace = true }
 shoal-cluster = { workspace = true }
 shoal-repair = { workspace = true }
 shoal-net = { workspace = true }
+shoal-logtree = { workspace = true }
 async-trait = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
@@ -25,3 +26,4 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = { workspace = true }
 rand = { workspace = true }
+ed25519-dalek = { workspace = true }
