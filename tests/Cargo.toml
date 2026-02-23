@@ -52,6 +52,10 @@ name = "stress"
 path = "integration/stress.rs"
 
 [[test]]
+name = "torture"
+path = "integration/torture.rs"
+
+[[test]]
 name = "random_kill"
 path = "chaos/random_kill.rs"
 
