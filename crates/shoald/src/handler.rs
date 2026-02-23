@@ -14,7 +14,7 @@ use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
 use shoal_cluster::membership::MembershipHandle;
 use shoal_meta::MetaStore;
-use shoal_net::{ShoalMessage, ShoalTransport};
+use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
 use shoal_types::NodeId;
 use tokio::sync::RwLock;
@@ -157,6 +157,23 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 key,
                                 manifest_bytes,
                             })
+                        }
+                        ShoalMessage::ManifestSyncRequest => {
+                            let entries = meta
+                                .list_all_object_entries()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|(bucket, key, oid)| {
+                                    let manifest = meta.get_manifest(&oid).ok().flatten()?;
+                                    let bytes = postcard::to_allocvec(&manifest).ok()?;
+                                    Some(ManifestSyncEntry {
+                                        bucket,
+                                        key,
+                                        manifest_bytes: bytes,
+                                    })
+                                })
+                                .collect();
+                            Some(ShoalMessage::ManifestSyncResponse { entries })
                         }
                         _ => None,
                     }

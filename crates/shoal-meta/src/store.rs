@@ -231,6 +231,45 @@ impl MetaStore {
         Ok(())
     }
 
+    /// List all object entries across all buckets.
+    ///
+    /// Returns `(bucket, key, ObjectId)` triples by scanning the entire objects
+    /// keyspace. Used for manifest sync when a node joins the cluster and needs
+    /// to catch up on historical manifests.
+    pub fn list_all_object_entries(&self) -> Result<Vec<(String, String, ObjectId)>> {
+        match &self.backend {
+            Backend::Fjall { objects, .. } => {
+                let mut entries = Vec::new();
+                for guard in objects.iter() {
+                    let (k, v) = guard.into_inner()?;
+                    let full_key = std::str::from_utf8(&k).map_err(|e| {
+                        MetaError::CorruptData(format!("object key is not valid UTF-8: {e}"))
+                    })?;
+                    let arr: [u8; 32] = v[..32].try_into().map_err(|_| {
+                        MetaError::CorruptData(format!(
+                            "ObjectId expected 32 bytes, got {}",
+                            v.len()
+                        ))
+                    })?;
+                    if let Some((bucket, key)) = full_key.split_once('/') {
+                        entries.push((bucket.to_string(), key.to_string(), ObjectId::from(arr)));
+                    }
+                }
+                Ok(entries)
+            }
+            Backend::Memory(m) => {
+                let map = m.objects.read().unwrap();
+                let mut entries = Vec::new();
+                for (full_key, arr) in map.iter() {
+                    if let Some((bucket, key)) = full_key.split_once('/') {
+                        entries.push((bucket.to_string(), key.to_string(), ObjectId::from(*arr)));
+                    }
+                }
+                Ok(entries)
+            }
+        }
+    }
+
     // ----- Shard map (local cache) -----
 
     /// Store the current owners of a shard.

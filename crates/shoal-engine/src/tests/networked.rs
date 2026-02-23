@@ -9,7 +9,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
-use shoal_net::{NetError, ShoalMessage, Transport};
+use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
 use shoal_store::{MemoryStore, ShardStore};
 use shoal_types::*;
 use tokio::sync::RwLock;
@@ -30,6 +30,8 @@ use super::helpers::{TEST_MAX_BYTES, test_data};
 struct FailableMockTransport {
     /// Maps NodeId → store for all nodes in the cluster.
     stores: HashMap<NodeId, Arc<dyn ShardStore>>,
+    /// Maps NodeId → MetaStore for manifest sync.
+    metas: HashMap<NodeId, Arc<MetaStore>>,
     /// Set of nodes currently "down" (unreachable).
     down_nodes: Arc<RwLock<HashSet<NodeId>>>,
 }
@@ -88,6 +90,35 @@ impl Transport for FailableMockTransport {
         _key: &str,
     ) -> Result<Option<Vec<u8>>, NetError> {
         Ok(None)
+    }
+
+    async fn pull_all_manifests(
+        &self,
+        addr: iroh::EndpointAddr,
+    ) -> Result<Vec<ManifestSyncEntry>, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        let Some(meta) = self.metas.get(&node_id) else {
+            return Ok(vec![]);
+        };
+        let entries = meta
+            .list_all_object_entries()
+            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+        let mut result = Vec::new();
+        for (bucket, key, oid) in entries {
+            if let Ok(Some(manifest)) = meta.get_manifest(&oid) {
+                if let Ok(bytes) = postcard::to_allocvec(&manifest) {
+                    result.push(ManifestSyncEntry {
+                        bucket,
+                        key,
+                        manifest_bytes: bytes,
+                    });
+                }
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -167,10 +198,22 @@ impl TestCluster {
             .map(|(&nid, addr)| (nid, addr.clone()))
             .collect();
 
+        // Create MetaStores upfront so we can share them with the transport.
+        let metas: Vec<Arc<MetaStore>> = (0..n)
+            .map(|_| Arc::new(MetaStore::open_temporary().unwrap()))
+            .collect();
+
+        let meta_map: HashMap<NodeId, Arc<MetaStore>> = node_ids
+            .iter()
+            .zip(metas.iter())
+            .map(|(&nid, meta)| (nid, meta.clone()))
+            .collect();
+
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {
             let transport: Arc<dyn Transport> = Arc::new(FailableMockTransport {
                 stores: store_map.clone(),
+                metas: meta_map.clone(),
                 down_nodes: down_nodes.clone(),
             });
             let book: HashMap<NodeId, iroh::EndpointAddr> = full_book
@@ -189,7 +232,7 @@ impl TestCluster {
                     shard_replication,
                 },
                 stores[i].clone(),
-                Arc::new(MetaStore::open_temporary().unwrap()),
+                metas[i].clone(),
                 cluster.clone(),
             )
             .with_transport(transport)
@@ -298,10 +341,12 @@ async fn writer_reader_pair_with_transport(
 
     let transport_a: Arc<dyn Transport> = Arc::new(FailableMockTransport {
         stores: HashMap::from([(nid_b, store_b.clone())]),
+        metas: HashMap::from([(nid_b, meta_b.clone())]),
         down_nodes: down.clone(),
     });
     let transport_b: Arc<dyn Transport> = Arc::new(FailableMockTransport {
         stores: HashMap::from([(nid_a, store_a.clone())]),
+        metas: HashMap::from([(nid_a, meta_a.clone())]),
         down_nodes: down,
     });
 
@@ -1214,4 +1259,108 @@ async fn test_list_objects_after_broadcast() {
         let keys = c.node(i).list_objects("b", "").unwrap();
         assert_eq!(keys.len(), 10, "node {i} should list 10 objects");
     }
+}
+
+// =========================================================================
+// Manifest sync (regression test for gossip catch-up bug)
+// =========================================================================
+
+/// Bug regression: a node that didn't receive manifest broadcasts (e.g.
+/// because it joined after the objects were stored) can't list objects.
+/// After calling `sync_manifests_from_peers`, it should see everything.
+#[tokio::test]
+async fn test_new_node_lists_objects_after_manifest_sync() {
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+
+    // Write 2 objects from different nodes.
+    let data1 = test_data(2000);
+    let data2 = test_data(3000);
+
+    c.node(0)
+        .put_object("b", "key.txt", &data1, BTreeMap::new())
+        .await
+        .unwrap();
+    c.node(1)
+        .put_object("b", "w.txt", &data2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Broadcast manifests to nodes 0 and 1 only — simulating that
+    // node 2 joined the cluster AFTER the objects were stored.
+    simulate_manifest_broadcast(c.node(0), c.node(1), "b", "key.txt");
+    simulate_manifest_broadcast(c.node(1), c.node(0), "b", "w.txt");
+
+    // Node 2 has NO manifests.
+    let keys_before = c.node(2).list_objects("b", "").unwrap();
+    assert_eq!(
+        keys_before.len(),
+        0,
+        "node 2 should have 0 objects before sync"
+    );
+
+    // After manifest sync, node 2 should see both objects.
+    let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert_eq!(synced, 2, "should have synced 2 manifests");
+
+    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    keys_after.sort();
+    assert_eq!(
+        keys_after,
+        vec!["key.txt", "w.txt"],
+        "node 2 should list both objects after sync"
+    );
+
+    // Node 2 should also be able to read the objects via shard pull.
+    let (got1, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
+    assert_eq!(got1, data1);
+    let (got2, _) = c.node(2).get_object("b", "w.txt").await.unwrap();
+    assert_eq!(got2, data2);
+}
+
+/// Sync is idempotent: calling it twice doesn't duplicate entries.
+#[tokio::test]
+async fn test_manifest_sync_idempotent() {
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+    let data = test_data(2000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    simulate_manifest_broadcast(c.node(0), c.node(1), "b", "k");
+
+    // First sync: picks up the manifest.
+    let synced1 = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert_eq!(synced1, 1);
+
+    // Second sync: nothing new.
+    let synced2 = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert_eq!(synced2, 0);
+
+    let keys = c.node(2).list_objects("b", "").unwrap();
+    assert_eq!(keys.len(), 1);
+}
+
+/// Sync across multiple buckets works correctly.
+#[tokio::test]
+async fn test_manifest_sync_multiple_buckets() {
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+
+    c.node(0)
+        .put_object("photos", "cat.jpg", &test_data(1000), BTreeMap::new())
+        .await
+        .unwrap();
+    c.node(0)
+        .put_object("docs", "readme.md", &test_data(500), BTreeMap::new())
+        .await
+        .unwrap();
+    simulate_manifest_broadcast(c.node(0), c.node(1), "photos", "cat.jpg");
+    simulate_manifest_broadcast(c.node(0), c.node(1), "docs", "readme.md");
+
+    // Node 2 syncs.
+    let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert_eq!(synced, 2);
+
+    assert_eq!(c.node(2).list_objects("photos", "").unwrap().len(), 1);
+    assert_eq!(c.node(2).list_objects("docs", "").unwrap().len(), 1);
 }

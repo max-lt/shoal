@@ -450,6 +450,43 @@ impl ShoalTransport {
         Ok(())
     }
 
+    /// Pull all manifests from a remote peer (bulk sync).
+    ///
+    /// Opens a bidirectional stream: sends a `ManifestSyncRequest`, receives a
+    /// `ManifestSyncResponse`. Used to catch up on historical manifests when
+    /// a node joins the cluster.
+    pub async fn pull_all_manifests(
+        &self,
+        addr: EndpointAddr,
+    ) -> Result<Vec<crate::ManifestSyncEntry>, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::ManifestSyncRequest;
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::ManifestSyncResponse { entries } => {
+                debug!(count = entries.len(), "received manifest sync response");
+                Ok(entries)
+            }
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
     /// Gracefully close the transport.
     pub async fn close(&self) {
         self.endpoint.close().await;
@@ -490,5 +527,12 @@ impl crate::Transport for ShoalTransport {
         key: &str,
     ) -> Result<Option<Vec<u8>>, crate::NetError> {
         self.pull_manifest(addr, bucket, key).await
+    }
+
+    async fn pull_all_manifests(
+        &self,
+        addr: EndpointAddr,
+    ) -> Result<Vec<crate::ManifestSyncEntry>, crate::NetError> {
+        self.pull_all_manifests(addr).await
     }
 }

@@ -467,6 +467,89 @@ impl ShoalNode {
     }
 
     // ------------------------------------------------------------------
+    // Manifest sync
+    // ------------------------------------------------------------------
+
+    /// Sync manifests from cluster peers.
+    ///
+    /// When a node joins (or restarts), it may have missed manifest
+    /// broadcasts for objects stored before it was part of the cluster.
+    /// This method pulls all manifests from each peer and stores them
+    /// locally, ensuring `list_objects` returns a complete view.
+    ///
+    /// Returns the total number of new manifests synced.
+    pub async fn sync_manifests_from_peers(&self) -> Result<usize, EngineError> {
+        let Some(transport) = &self.transport else {
+            return Ok(0);
+        };
+
+        let peers = self.cluster.members().await;
+        let mut total_synced = 0usize;
+
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                continue;
+            };
+
+            match transport.pull_all_manifests(addr).await {
+                Ok(entries) => {
+                    for entry in entries {
+                        match postcard::from_bytes::<Manifest>(&entry.manifest_bytes) {
+                            Ok(manifest) => {
+                                // Only store if we don't already have this key mapping.
+                                if self
+                                    .meta
+                                    .get_object_key(&entry.bucket, &entry.key)?
+                                    .is_none()
+                                {
+                                    self.meta.put_manifest(&manifest)?;
+                                    self.meta.put_object_key(
+                                        &entry.bucket,
+                                        &entry.key,
+                                        &manifest.object_id,
+                                    )?;
+                                    total_synced += 1;
+                                    debug!(
+                                        bucket = %entry.bucket,
+                                        key = %entry.key,
+                                        object_id = %manifest.object_id,
+                                        from = %peer.node_id,
+                                        "synced manifest from peer"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    from = %peer.node_id,
+                                    %e,
+                                    "failed to deserialize synced manifest"
+                                );
+                            }
+                        }
+                    }
+                    // One successful peer is enough — manifests are the same everywhere.
+                    if total_synced > 0 {
+                        info!(
+                            total_synced,
+                            from = %peer.node_id,
+                            "manifest sync complete"
+                        );
+                    }
+                    break;
+                }
+                Err(e) => {
+                    warn!(from = %peer.node_id, %e, "failed to sync manifests from peer");
+                }
+            }
+        }
+
+        Ok(total_synced)
+    }
+
+    // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
 

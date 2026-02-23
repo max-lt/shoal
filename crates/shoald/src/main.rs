@@ -418,6 +418,27 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         .with_address_book(address_book.clone()),
     );
 
+    // --- Manifest sync (catch up on historical manifests from peers) ---
+    // This is necessary because manifest broadcasts are point-in-time: if
+    // this node is joining an existing cluster, it missed all previous
+    // broadcasts. We pull all manifests from one peer to populate our local
+    // Fjall index, so that list_objects returns a complete view.
+    if !config.cluster.peers.is_empty() {
+        let engine_sync = engine.clone();
+        tokio::spawn(async move {
+            // Small delay to let SWIM handshake establish connections.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match engine_sync.sync_manifests_from_peers().await {
+                Ok(0) => debug!("manifest sync: nothing new from peers"),
+                Ok(n) => info!(
+                    count = n,
+                    "manifest sync: caught up on historical manifests"
+                ),
+                Err(e) => warn!(%e, "manifest sync failed (will retry on next restart)"),
+            }
+        });
+    }
+
     // --- S3 HTTP API ---
     let server = S3Server::new(S3ServerConfig {
         engine,

@@ -16,7 +16,7 @@ mod tests;
 mod transport;
 
 pub use error::NetError;
-pub use message::ShoalMessage;
+pub use message::{ManifestSyncEntry, ShoalMessage};
 pub use transport::ShoalTransport;
 
 /// Trait abstracting the network transport operations used by the engine.
@@ -51,6 +51,14 @@ pub trait Transport: Send + Sync {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, NetError>;
+
+    /// Pull all manifests from a remote node (bulk sync for catch-up).
+    ///
+    /// Returns a list of `(bucket, key, manifest_bytes)` entries.
+    async fn pull_all_manifests(
+        &self,
+        addr: iroh::EndpointAddr,
+    ) -> Result<Vec<ManifestSyncEntry>, NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

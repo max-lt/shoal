@@ -81,4 +81,24 @@ pub enum ShoalMessage {
         /// Postcard-serialized [`Manifest`](shoal_types::Manifest), or `None` if not found.
         manifest_bytes: Option<Vec<u8>>,
     },
+
+    /// Request all manifests from a peer (used for catch-up on join).
+    ManifestSyncRequest,
+
+    /// Response containing all manifests the peer has.
+    ManifestSyncResponse {
+        /// Each entry is (bucket, key, postcard-serialized Manifest).
+        entries: Vec<ManifestSyncEntry>,
+    },
+}
+
+/// A single manifest entry in a [`ShoalMessage::ManifestSyncResponse`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestSyncEntry {
+    /// Bucket name.
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Postcard-serialized [`Manifest`](shoal_types::Manifest).
+    pub manifest_bytes: Vec<u8>,
 }
