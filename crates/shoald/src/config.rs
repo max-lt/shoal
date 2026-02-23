@@ -206,6 +206,41 @@ impl CliConfig {
     pub fn s3_auth_secret(&self) -> Option<String> {
         self.s3.secret_key.clone()
     }
+
+    /// Effective maximum repair bandwidth in bytes per second.
+    ///
+    /// Parses human-readable strings like `"100MB/s"`, `"1GB/s"`, `"1MB/s"`.
+    /// Defaults to 100 MB/s.
+    pub fn repair_max_bandwidth_bytes(&self) -> u64 {
+        self.repair
+            .max_bandwidth
+            .as_deref()
+            .map(parse_bandwidth)
+            .unwrap_or(104_857_600) // 100 MB/s
+    }
+
+    /// Effective number of concurrent repair transfers.
+    ///
+    /// Defaults to 8.
+    pub fn repair_concurrent_transfers(&self) -> u16 {
+        self.repair.concurrent_transfers.unwrap_or(8)
+    }
+}
+
+/// Parse a human-readable bandwidth string into bytes per second.
+///
+/// Supports: `"100MB/s"`, `"1GB/s"`, `"512KB/s"`, `"1048576"` (raw bytes).
+fn parse_bandwidth(s: &str) -> u64 {
+    let s = s.trim().trim_end_matches("/s");
+    if let Some(num) = s.strip_suffix("GB") {
+        num.trim().parse::<u64>().unwrap_or(100) * 1_073_741_824
+    } else if let Some(num) = s.strip_suffix("MB") {
+        num.trim().parse::<u64>().unwrap_or(100) * 1_048_576
+    } else if let Some(num) = s.strip_suffix("KB") {
+        num.trim().parse::<u64>().unwrap_or(100) * 1_024
+    } else {
+        s.parse::<u64>().unwrap_or(104_857_600)
+    }
 }
 
 /// Detect total system RAM in bytes by reading `/proc/meminfo`.
@@ -343,5 +378,20 @@ s3_listen_addr = "127.0.0.1:9999"
     fn test_load_without_file_auto_detects() {
         let config = CliConfig::load(None).unwrap();
         assert!(config.chunk_size() >= 131_072);
+    }
+
+    #[test]
+    fn test_parse_bandwidth() {
+        assert_eq!(parse_bandwidth("100MB/s"), 100 * 1_048_576);
+        assert_eq!(parse_bandwidth("1GB/s"), 1_073_741_824);
+        assert_eq!(parse_bandwidth("512KB/s"), 512 * 1_024);
+        assert_eq!(parse_bandwidth("1048576"), 1_048_576);
+    }
+
+    #[test]
+    fn test_repair_config_defaults() {
+        let config = CliConfig::auto_detect();
+        assert!(config.repair_max_bandwidth_bytes() > 0);
+        assert!(config.repair_concurrent_transfers() > 0);
     }
 }

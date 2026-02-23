@@ -3596,12 +3596,14 @@ name = "shoald"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "blake3",
  "bytes",
  "clap",
  "dirs",
  "iroh",
+ "iroh-gossip",
  "libc",
  "postcard",
  "rand",
@@ -3610,6 +3612,7 @@ dependencies = [
  "shoal-engine",
  "shoal-meta",
  "shoal-net",
+ "shoal-repair",
  "shoal-s3",
  "shoal-store",
  "shoal-types",
