@@ -50,3 +50,11 @@ path = "integration/rebalancing.rs"
 [[test]]
 name = "stress"
 path = "integration/stress.rs"
+
+[[test]]
+name = "random_kill"
+path = "chaos/random_kill.rs"
+
+[[test]]
+name = "network_partition"
+path = "chaos/network_partition.rs"

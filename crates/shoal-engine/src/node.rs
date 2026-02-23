@@ -530,20 +530,15 @@ impl ShoalNode {
                             }
                         }
                     }
-                    // One successful peer is enough — manifests are the same everywhere.
-                    if total_synced > 0 {
-                        info!(
-                            total_synced,
-                            from = %peer.node_id,
-                            "manifest sync complete"
-                        );
-                    }
-                    break;
                 }
                 Err(e) => {
                     warn!(from = %peer.node_id, %e, "failed to sync manifests from peer");
                 }
             }
+        }
+
+        if total_synced > 0 {
+            info!(total_synced, "manifest sync complete");
         }
 
         Ok(total_synced)

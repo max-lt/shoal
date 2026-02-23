@@ -3467,14 +3467,23 @@ dependencies = [
 name = "shoal-integration-tests"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
+ "futures-lite",
+ "iroh",
+ "postcard",
+ "rand",
  "shoal-cas",
+ "shoal-cluster",
+ "shoal-engine",
  "shoal-erasure",
  "shoal-meta",
+ "shoal-net",
  "shoal-placement",
  "shoal-store",
  "shoal-types",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

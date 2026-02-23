@@ -724,22 +724,22 @@ The binary that brings it all together.
 
 ---
 
-## Milestone 14 — End-to-End Integration Tests
+## Milestone 14 — End-to-End Integration Tests ✅
 
 Full cluster tests with real networking.
 
-- [ ] `tests/integration/cluster_formation.rs`:
+- [x] `tests/integration/cluster_formation.rs`:
   - Start 5 nodes in-process with different ports
   - Verify all 5 discover each other within 10 seconds
   - Verify consistent ring across all nodes
 
-- [ ] `tests/integration/write_read.rs`:
+- [x] `tests/integration/write_read.rs`:
   - 5-node cluster
   - Write 100 objects of varying sizes (1KB to 10MB)
   - Read each object from a random node → verify matches
   - Write and immediately read → consistency check
 
-- [ ] `tests/integration/node_failure.rs`:
+- [x] `tests/integration/node_failure.rs`:
   - 5-node cluster, write 50 objects
   - Kill 1 node
   - Wait for repair to complete
@@ -747,33 +747,33 @@ Full cluster tests with real networking.
   - Kill another node
   - Read all 50 objects → all still succeed (k=4, m=2 tolerates 2 failures)
 
-- [ ] `tests/integration/rebalancing.rs`:
+- [x] `tests/integration/rebalancing.rs`:
   - 3-node cluster, write 50 objects
   - Add 2 more nodes
   - Wait for rebalancing
   - Verify shard distribution is roughly even across 5 nodes
   - Read all objects → succeed
 
-- [ ] `tests/integration/stress.rs`:
+- [x] `tests/integration/stress.rs`:
   - 5-node cluster
   - Concurrent writers (10 threads) writing 1000 objects total
   - Concurrent readers (10 threads) reading random objects
   - Verify no data corruption
 
-- [ ] All integration tests pass: `cargo test --test '*'`
+- [x] All integration tests pass: `cargo test --test '*'`
 
 ---
 
-## Milestone 15 — Chaos Tests
+## Milestone 15 — Chaos Tests ✅
 
-- [ ] `tests/chaos/random_kill.rs`:
+- [x] `tests/chaos/random_kill.rs`:
   - 7-node cluster
   - Background: continuously write and read objects
   - Every 5 seconds: kill a random node, wait 2 seconds, restart it
   - After 60 seconds: verify all objects are readable
   - No data loss allowed
 
-- [ ] `tests/chaos/network_partition.rs`:
+- [x] `tests/chaos/network_partition.rs`:
   - 6-node cluster
   - Simulate network partition (3 vs 3)
   - Both sides should remain operational for reads of local data
