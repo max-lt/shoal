@@ -9,4 +9,5 @@ mod edge_cases;
 mod erasure;
 mod multi_node;
 mod networked;
+mod real_transport;
 mod shard_distribution;
