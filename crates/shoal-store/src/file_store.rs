@@ -44,6 +44,14 @@ impl FileStore {
 impl ShardStore for FileStore {
     async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
         let path = self.shard_path(&id);
+
+        // Content-addressed: if the shard file already exists, the data is
+        // identical (same blake3 hash → same ShardId). Skip the write.
+        if tokio::fs::metadata(&path).await.is_ok() {
+            debug!(%id, "shard already on disk, skipping write");
+            return Ok(());
+        }
+
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -408,6 +416,30 @@ mod tests {
         assert!(
             matches!(result, Err(StoreError::CorruptShard { .. })),
             "expected CorruptShard error, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_put_existing_shard_skips_rewrite() {
+        let (store, _dir) = make_store().await;
+        let data = Bytes::from_static(b"dedup test");
+        let id = ShardId::from_data(&data);
+
+        // First put: creates the file.
+        store.put(id, data.clone()).await.unwrap();
+        let path = store.shard_path(&id);
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Small delay to ensure different mtime if file is rewritten.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Second put of the same content-addressed shard should be a no-op.
+        store.put(id, data).await.unwrap();
+        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert_eq!(
+            mtime1, mtime2,
+            "second put of same shard should not rewrite the file"
         );
     }
 

@@ -43,25 +43,27 @@ impl MemoryStore {
 impl ShardStore for MemoryStore {
     async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
         let mut map = self.shards.write().expect("lock poisoned");
+
+        // Content-addressed: if the shard already exists, the data is
+        // identical (same blake3 hash → same ShardId). Skip the insert.
+        if map.contains_key(&id) {
+            debug!(%id, "shard already in memory, skipping write");
+            return Ok(());
+        }
+
         let data_len = data.len() as u64;
         let used = self.used_bytes.load(Ordering::Relaxed);
 
-        // If we're replacing an existing shard, account for freed space.
-        let existing_len = map.get(&id).map_or(0, |v| v.len() as u64);
-        let net_increase = data_len.saturating_sub(existing_len);
-
-        if used + net_increase > self.max_bytes {
+        if used + data_len > self.max_bytes {
             return Err(StoreError::CapacityExceeded {
-                needed: net_increase,
+                needed: data_len,
                 available: self.max_bytes.saturating_sub(used),
             });
         }
 
         debug!(%id, size = data.len(), "storing shard in memory");
         map.insert(id, data);
-        // Update used bytes: add new size, subtract old size.
-        self.used_bytes
-            .store(used - existing_len + data_len, Ordering::Relaxed);
+        self.used_bytes.store(used + data_len, Ordering::Relaxed);
         Ok(())
     }
 
@@ -262,18 +264,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_put_overwrite_updates_capacity() {
+    async fn test_put_existing_shard_is_noop() {
         let store = MemoryStore::new(1024);
-        let data_small = Bytes::from_static(b"small");
-        let data_big = Bytes::from_static(b"bigger data here");
+        let data = Bytes::from_static(b"content-addressed dedup");
+        let id = ShardId::from_data(&data);
 
-        // Use a synthetic ID so we can overwrite with different data.
-        let fixed_id = ShardId::from([0xAA; 32]);
-        store.put(fixed_id, data_small).await.unwrap();
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 5);
+        store.put(id, data.clone()).await.unwrap();
+        let cap_after_first = store.capacity().await.unwrap().used_bytes;
 
-        store.put(fixed_id, data_big).await.unwrap();
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 16);
+        // Second put with same content-addressed ID should be a no-op.
+        store.put(id, data).await.unwrap();
+        let cap_after_second = store.capacity().await.unwrap().used_bytes;
+
+        assert_eq!(
+            cap_after_first, cap_after_second,
+            "second put should not change capacity"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -364,21 +370,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Capacity freed on overwrite with smaller data
+    // Two different shards accumulate capacity
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_overwrite_with_smaller_data_frees_capacity() {
+    async fn test_two_different_shards_accumulate_capacity() {
         let store = MemoryStore::new(1024);
-        let fixed_id = ShardId::from([0xBB; 32]);
 
-        let big = Bytes::from(vec![0; 500]);
-        store.put(fixed_id, big).await.unwrap();
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 500);
+        let data1 = Bytes::from_static(b"shard alpha");
+        let id1 = ShardId::from_data(&data1);
+        store.put(id1, data1.clone()).await.unwrap();
+        assert_eq!(
+            store.capacity().await.unwrap().used_bytes,
+            data1.len() as u64
+        );
 
-        let small = Bytes::from(vec![0; 100]);
-        store.put(fixed_id, small).await.unwrap();
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 100);
+        let data2 = Bytes::from_static(b"shard bravo");
+        let id2 = ShardId::from_data(&data2);
+        store.put(id2, data2.clone()).await.unwrap();
+        assert_eq!(
+            store.capacity().await.unwrap().used_bytes,
+            (data1.len() + data2.len()) as u64
+        );
     }
 
     // -----------------------------------------------------------------------

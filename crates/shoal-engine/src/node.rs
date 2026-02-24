@@ -206,6 +206,9 @@ impl ShoalNode {
         let ring = self.cluster.ring().await;
 
         let mut chunk_metas = Vec::with_capacity(chunks.len());
+        let mut local_new: u32 = 0;
+        let mut local_existing: u32 = 0;
+        let mut remote_pushed: u32 = 0;
 
         // Remote pushes are fired in parallel to avoid blocking on slow or
         // dead nodes. Local stores and metadata writes stay sequential
@@ -225,7 +228,26 @@ impl ShoalNode {
                 // is no transport — single-node / test mode).
                 let local_is_owner = owners.contains(&self.node_id);
                 if local_is_owner || self.transport.is_none() {
+                    let already_exists = self.store.contains(shard.id).await?;
+
                     self.store.put(shard.id, shard.data.clone()).await?;
+
+                    if already_exists {
+                        local_existing += 1;
+                        debug!(
+                            shard = %shard.id,
+                            index = shard.index,
+                            "shard already exists locally, skipped"
+                        );
+                    } else {
+                        local_new += 1;
+                        debug!(
+                            shard = %shard.id,
+                            index = shard.index,
+                            size = shard.data.len(),
+                            "new shard stored locally"
+                        );
+                    }
                 }
 
                 // Push to remote owners (spawned in parallel).
@@ -235,6 +257,7 @@ impl ShoalNode {
                             continue;
                         }
                         if let Some(addr) = self.resolve_addr(owner).await {
+                            remote_pushed += 1;
                             let transport = transport.clone();
                             let owner_id = *owner;
                             let shard_id = shard.id;
@@ -277,6 +300,11 @@ impl ShoalNode {
                 warn!(%e, "shard push task panicked");
             }
         }
+
+        info!(
+            bucket,
+            key, local_new, local_existing, remote_pushed, "shard distribution complete"
+        );
 
         // Step 3: build manifest.
         let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
