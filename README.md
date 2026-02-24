@@ -1,6 +1,6 @@
 # Shoal
 
-Distributed, self-healing object storage engine written in 100% pure Rust.
+Distributed, self-healing object storage engine.
 
 Shoal is a lightweight, peer-to-peer alternative to S3-compatible storage that can run anywhere — from a Raspberry Pi with an SD card to a 128-core datacenter server with NVMe arrays. Nodes discover each other automatically, form a cluster, distribute data using erasure coding, and self-repair when nodes join or leave.
 
@@ -28,6 +28,8 @@ The name comes from a **shoal of fish** — lightweight individual units that mo
 │ Erasure  │  Placement       │  shoal-erasure / shoal-placement
 │ Coding   │  (hash ring)     │
 ├──────────┴──────────────────┤
+│   LogTree (audit DAG)       │  shoal-logtree
+├─────────────────────────────┤
 │   Metadata Store (Fjall)    │  shoal-meta
 ├─────────────────────────────┤
 │   Content Addressing        │  shoal-cas
@@ -73,6 +75,7 @@ crates/
   shoal-erasure/     Reed-Solomon erasure coding (reed-solomon-simd)
   shoal-placement/   Consistent hashing ring with topology-aware placement
   shoal-cluster/     Membership (foca SWIM) + gossip (iroh-gossip)
+  shoal-logtree/     Signed DAG of mutations for cluster-wide audit trail
   shoal-repair/      Auto-repair, rebalancing, throttling
   shoal-net/         Network protocol on iroh QUIC
   shoal-engine/      Node orchestrator, write/read pipelines
@@ -92,7 +95,7 @@ No C/C++ bindings in the dependency tree.
 | Hashing          | `blake3`             |
 | Metadata DB      | `fjall` v3           |
 | Erasure coding   | `reed-solomon-simd`  |
-| Networking       | `iroh` 0.35          |
+| Networking       | `iroh` 0.96          |
 | Gossip           | `iroh-gossip`        |
 | Membership       | `foca`               |
 | Serialization    | `postcard` + `serde` |
@@ -103,7 +106,7 @@ No C/C++ bindings in the dependency tree.
 
 ```bash
 cargo build                          # build everything
-cargo test                           # run all 441 tests
+cargo test                           # run all 523 tests
 cargo test -p shoal-types            # single crate
 cargo test --test torture            # torture/stress tests
 cargo clippy -- -D warnings          # lint (zero warnings)
@@ -114,27 +117,24 @@ cargo fmt --check                    # format check
 
 All 15 milestones complete. The full storage engine works end-to-end:
 
-| Milestone | Component | Tests |
-| --------- | --------- | ----- |
-| 0 | Workspace setup | -- |
-| 1 | `shoal-types` — shared types, IDs | 32 |
-| 2 | `shoal-store` — shard storage trait + backends | 24 |
-| 3 | `shoal-cas` — content addressing, chunking | 13 |
-| 4 | `shoal-erasure` — Reed-Solomon coding | 21 |
-| 5 | `shoal-placement` — consistent hash ring | 12 |
-| 6 | `shoal-meta` — metadata persistence (Fjall) | 16 |
-| 7 | Local pipeline integration test | 1 |
-| 8 | `shoal-net` — iroh QUIC transport | 6 |
-| 9 | `shoal-cluster` — membership + gossip | 4 |
-| 10 | `shoal-repair` — auto-repair, circuit breaker | 11 |
-| 11 | `shoal-engine` — node orchestrator | 6 |
-| 12 | `shoal-s3` — S3 HTTP API | 90 |
-| 13 | `shoald` — CLI, config, auto-detection | 43 |
-| 14 | End-to-end integration tests | 33 |
-| 15 | Chaos tests (random kill, network partition) | 3 |
-| -- | Torture tests (comprehensive stress) | 11 |
+| Crate | Description | Tests |
+| ----- | ----------- | ----- |
+| `shoal-types` | Shared types, IDs | 40 |
+| `shoal-store` | Shard storage trait + backends | 36 |
+| `shoal-cas` | Content addressing, chunking | 15 |
+| `shoal-erasure` | Reed-Solomon coding | 43 |
+| `shoal-placement` | Consistent hash ring | 33 |
+| `shoal-meta` | Metadata persistence (Fjall) | 36 |
+| `shoal-net` | iroh QUIC transport | 32 |
+| `shoal-cluster` | Membership + gossip | 20 |
+| `shoal-logtree` | Signed mutation DAG | 44 |
+| `shoal-repair` | Auto-repair, circuit breaker | 27 |
+| `shoal-engine` | Node orchestrator | 115 |
+| `shoal-s3` | S3 HTTP API | 17 |
+| `shoald` | CLI, config, auto-detection | 16 |
+| integration | End-to-end + chaos + torture | 49 |
 
-**Total: 441 tests**, all passing, clippy clean.
+**Total: 523 tests**, all passing, clippy clean.
 
 ## Documentation
 
