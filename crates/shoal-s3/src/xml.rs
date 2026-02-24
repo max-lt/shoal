@@ -13,10 +13,17 @@ pub(crate) fn xml_escape(s: &str) -> String {
 }
 
 /// Build a ListObjectsV2 XML response.
-pub(crate) fn list_objects_v2(bucket: &str, prefix: &str, keys: &[String]) -> String {
+pub(crate) fn list_objects_v2(
+    bucket: &str,
+    prefix: &str,
+    keys: &[String],
+    max_keys: usize,
+    is_truncated: bool,
+) -> String {
     let bucket = xml_escape(bucket);
     let prefix = xml_escape(prefix);
     let count = keys.len();
+    let truncated = if is_truncated { "true" } else { "false" };
 
     let mut contents = String::new();
     for key in keys {
@@ -32,8 +39,8 @@ pub(crate) fn list_objects_v2(bucket: &str, prefix: &str, keys: &[String]) -> St
          \x20 <Name>{bucket}</Name>\n\
          \x20 <Prefix>{prefix}</Prefix>\n\
          \x20 <KeyCount>{count}</KeyCount>\n\
-         \x20 <MaxKeys>1000</MaxKeys>\n\
-         \x20 <IsTruncated>false</IsTruncated>\n\
+         \x20 <MaxKeys>{max_keys}</MaxKeys>\n\
+         \x20 <IsTruncated>{truncated}</IsTruncated>\n\
          {contents}\
          </ListBucketResult>"
     )

@@ -358,12 +358,15 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         Arc::new(RwLock::new(HashMap::new()));
 
     // --- Membership service (foca SWIM) ---
-    let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default());
-    let membership_handle = Arc::new(membership::start(
+    let listen_addrs = endpoint.bound_sockets();
+    let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default())
+        .with_listen_addrs(listen_addrs);
+    let membership_handle = Arc::new(membership::start_with_address_book(
         identity.clone(),
         membership::default_config(100),
         cluster.clone(),
         Some(meta.clone()),
+        Some(address_book.clone()),
     ));
 
     // --- Connect to peer nodes ---

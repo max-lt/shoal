@@ -10,6 +10,7 @@
 //!   - **schedule**: timer events queued via `tokio::time::sleep`.
 //!   - **notify**: membership changes applied to [`ClusterState`].
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,8 +19,8 @@ use foca::{AccumulatingRuntime, Config, OwnedNotification, PostcardCodec, Timer}
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 use shoal_meta::MetaStore;
-use shoal_types::{Member, MemberState};
-use tokio::sync::{Mutex, mpsc};
+use shoal_types::{Member, MemberState, NodeId};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::error::ClusterError;
@@ -51,6 +52,9 @@ pub struct MembershipHandle {
     /// Background task handle.
     task: tokio::task::JoinHandle<()>,
 }
+
+/// Shared address book type: maps NodeId → EndpointAddr.
+pub type AddressBook = Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>;
 
 impl MembershipHandle {
     /// Feed incoming SWIM protocol data from the network.
@@ -106,11 +110,29 @@ impl MembershipHandle {
 /// protocol. The caller is responsible for routing outgoing messages to
 /// the network (read from [`MembershipHandle::next_outgoing`]) and feeding
 /// incoming network data (via [`MembershipHandle::feed_data`]).
+///
+/// When `address_book` is provided, the service updates it whenever a
+/// new member is discovered via foca (using the addresses carried in
+/// [`ClusterIdentity::listen_addrs`]).
 pub fn start(
     identity: ClusterIdentity,
     foca_config: Config,
     state: Arc<ClusterState>,
     meta: Option<Arc<MetaStore>>,
+) -> MembershipHandle {
+    start_with_address_book(identity, foca_config, state, meta, None)
+}
+
+/// Start the membership service with an address book for peer discovery.
+///
+/// Same as [`start`], but also updates the given address book when new
+/// members are discovered.
+pub fn start_with_address_book(
+    identity: ClusterIdentity,
+    foca_config: Config,
+    state: Arc<ClusterState>,
+    meta: Option<Arc<MetaStore>>,
+    address_book: Option<AddressBook>,
 ) -> MembershipHandle {
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
     let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
@@ -121,6 +143,7 @@ pub fn start(
         foca_config,
         state.clone(),
         meta,
+        address_book,
         incoming_rx,
         outgoing_tx,
         command_rx,
@@ -167,11 +190,13 @@ pub fn default_config(max_members: u32) -> Config {
 // Internal event loop
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn membership_loop(
     identity: ClusterIdentity,
     config: Config,
     state: Arc<ClusterState>,
     meta: Option<Arc<MetaStore>>,
+    address_book: Option<AddressBook>,
     mut incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     outgoing_tx: mpsc::UnboundedSender<(ClusterIdentity, Vec<u8>)>,
     mut command_rx: mpsc::UnboundedReceiver<MembershipCommand>,
@@ -193,7 +218,7 @@ async fn membership_loop(
                 if let Err(e) = foca.handle_data(&data, &mut runtime) {
                     debug!("foca handle_data error: {e}");
                 }
-                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
+                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
             }
 
             // --- Scheduled timer events ---
@@ -201,7 +226,7 @@ async fn membership_loop(
                 if let Err(e) = foca.handle_timer(timer, &mut runtime) {
                     debug!("foca handle_timer error: {e}");
                 }
-                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
+                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
             }
 
             // --- Commands (join, leave) ---
@@ -212,14 +237,14 @@ async fn membership_loop(
                         if let Err(e) = foca.announce(seed, &mut runtime) {
                             warn!("foca announce error: {e}");
                         }
-                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
+                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
                     }
                     MembershipCommand::Leave => {
                         info!("leaving cluster gracefully");
                         if let Err(e) = foca.leave_cluster(&mut runtime) {
                             warn!("foca leave error: {e}");
                         }
-                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta).await;
+                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
                         break;
                     }
                 }
@@ -243,6 +268,7 @@ async fn drain_runtime(
     timer_tx: &mpsc::UnboundedSender<Timer<ClusterIdentity>>,
     state: &Arc<ClusterState>,
     meta: &Option<Arc<MetaStore>>,
+    address_book: &Option<AddressBook>,
 ) {
     // Send outgoing SWIM messages.
     while let Some((target, data)) = runtime.to_send() {
@@ -263,7 +289,7 @@ async fn drain_runtime(
 
     // Process membership notifications.
     while let Some(notification) = runtime.to_notify() {
-        handle_notification(notification, state, meta).await;
+        handle_notification(notification, state, meta, address_book).await;
     }
 }
 
@@ -272,11 +298,35 @@ async fn handle_notification(
     notification: OwnedNotification<ClusterIdentity>,
     state: &Arc<ClusterState>,
     meta: &Option<Arc<MetaStore>>,
+    address_book: &Option<AddressBook>,
 ) {
     match notification {
         OwnedNotification::MemberUp(identity) => {
             let member = Member::from(&identity);
-            info!(node_id = %member.node_id, "foca: member up");
+            info!(
+                node_id = %member.node_id,
+                addrs = ?identity.listen_addrs,
+                "foca: member up"
+            );
+
+            // Update address book with the member's listen addresses.
+            if let Some(book) = address_book
+                && !identity.listen_addrs.is_empty()
+                && let Ok(eid) = iroh::EndpointId::from_bytes(identity.node_id.as_bytes())
+            {
+                let mut addr = iroh::EndpointAddr::new(eid);
+
+                for socket_addr in &identity.listen_addrs {
+                    addr = addr.with_ip_addr(*socket_addr);
+                }
+
+                book.write().await.insert(identity.node_id, addr);
+                debug!(
+                    node_id = %identity.node_id,
+                    addrs = ?identity.listen_addrs,
+                    "updated address book from foca membership"
+                );
+            }
 
             // Persist to meta store if available.
             if let Some(meta) = meta

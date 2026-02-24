@@ -19,4 +19,5 @@ mod tests;
 pub use error::ClusterError;
 pub use gossip::{GossipHandle, GossipService};
 pub use identity::ClusterIdentity;
+pub use membership::AddressBook;
 pub use state::ClusterState;

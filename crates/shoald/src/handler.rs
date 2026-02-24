@@ -148,13 +148,16 @@ fn drain_pending(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usiz
 impl iroh::protocol::ProtocolHandler for ShoalProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         // Learn the remote peer's address for future routing.
+        // Note: we only store the EndpointId here; full socket addresses
+        // are populated by the membership service from ClusterIdentity.listen_addrs.
         let remote_id = conn.remote_id();
         let remote_node_id = NodeId::from(*remote_id.as_bytes());
         let remote_addr = iroh::EndpointAddr::new(remote_id);
         self.address_book
             .write()
             .await
-            .insert(remote_node_id, remote_addr);
+            .entry(remote_node_id)
+            .or_insert(remote_addr);
 
         // Spawn a handler for uni-directional streams (SWIM data, manifest, log entries).
         let conn_uni = conn.clone();

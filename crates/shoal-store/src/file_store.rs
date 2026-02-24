@@ -56,10 +56,18 @@ impl ShardStore for FileStore {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        // Atomic write: write to a temp file in the same directory, then rename.
-        // This ensures we never leave a half-written shard on disk.
-        let tmp_path = path.with_extension("tmp");
+        // Atomic write: write to a uniquely-named temp file, then rename.
+        // The random suffix prevents ENOENT races when multiple tasks write
+        // the same ShardId concurrently (each gets its own temp file).
+        let suffix: u64 = rand::random();
+        let tmp_path = path.with_extension(format!("tmp.{suffix:016x}"));
+
         tokio::fs::write(&tmp_path, &data).await?;
+
+        // rename is atomic on POSIX — if two concurrent writes race, the
+        // last rename wins and the result is still correct (same content).
+        // If the file was created between our metadata check and here,
+        // the rename harmlessly overwrites it with identical data.
         tokio::fs::rename(&tmp_path, &path).await?;
 
         debug!(%id, path = %path.display(), size = data.len(), "stored shard to file");
@@ -490,6 +498,39 @@ mod tests {
                 "shard {id} should be readable after concurrent write"
             );
         }
+    }
+
+    /// Reproduction of the same-key concurrent write ENOENT: multiple writes
+    /// to the exact same ShardId at the same time. Before the fix, all
+    /// concurrent writers shared a single `.tmp` path, so one rename would
+    /// delete another writer's temp file.
+    #[tokio::test]
+    async fn test_concurrent_writes_same_shard_id() {
+        let (store, _dir) = make_store().await;
+        let store = std::sync::Arc::new(store);
+
+        let data = Bytes::from_static(b"same-content-for-all-writers");
+        let id = ShardId::from_data(&data);
+
+        let mut handles = Vec::new();
+
+        for _ in 0..50 {
+            let store = store.clone();
+            let data = data.clone();
+            handles.push(tokio::spawn(async move { store.put(id, data).await }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "concurrent same-shard put {i} failed: {:?}",
+                result.err()
+            );
+        }
+
+        let got = store.get(id).await.unwrap();
+        assert_eq!(got.as_deref(), Some(data.as_ref()));
     }
 
     #[tokio::test]

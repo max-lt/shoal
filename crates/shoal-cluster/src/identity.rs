@@ -5,6 +5,8 @@
 //! separate from [`Member`](shoal_types::Member) because foca manages the
 //! alive/suspect/down state internally.
 
+use std::net::SocketAddr;
+
 use serde::{Deserialize, Serialize};
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
 
@@ -13,6 +15,11 @@ use shoal_types::{Member, MemberState, NodeId, NodeTopology};
 /// Contains everything needed to address a node and resolve identity
 /// conflicts. The `generation` field is bumped on each node restart so
 /// that the cluster can distinguish a restarted node from a zombie.
+///
+/// The `listen_addrs` field carries the node's QUIC listening addresses
+/// so that all cluster members learn how to reach each other through
+/// foca's protocol dissemination — without relying on relay or requiring
+/// every node pair to have connected directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClusterIdentity {
     /// Unique node identifier (derived from the iroh endpoint key).
@@ -23,6 +30,12 @@ pub struct ClusterIdentity {
     pub capacity: u64,
     /// Physical location in the infrastructure hierarchy.
     pub topology: NodeTopology,
+    /// QUIC listening addresses for direct connections.
+    ///
+    /// Propagated via foca SWIM so all nodes in the cluster learn how
+    /// to reach this node without needing relay or prior connections.
+    #[serde(default)]
+    pub listen_addrs: Vec<SocketAddr>,
 }
 
 impl ClusterIdentity {
@@ -33,7 +46,14 @@ impl ClusterIdentity {
             generation,
             capacity,
             topology,
+            listen_addrs: Vec::new(),
         }
+    }
+
+    /// Set the listening addresses for this identity.
+    pub fn with_listen_addrs(mut self, addrs: Vec<SocketAddr>) -> Self {
+        self.listen_addrs = addrs;
+        self
     }
 }
 
@@ -97,6 +117,7 @@ impl From<Member> for ClusterIdentity {
             node_id: m.node_id,
             generation: m.generation,
             capacity: m.capacity,
+            listen_addrs: Vec::new(),
             topology: m.topology,
         }
     }

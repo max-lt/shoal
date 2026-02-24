@@ -63,10 +63,16 @@ pub(crate) async fn list_objects(
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
     let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
-    tracing::debug!(bucket = %bucket, prefix, "list_objects");
+    let max_keys: usize = params
+        .get("max-keys")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1000);
+    tracing::debug!(bucket = %bucket, prefix, max_keys, "list_objects");
 
     let keys = state.engine.list_objects(&bucket, prefix)?;
-    let body = xml::list_objects_v2(&bucket, prefix, &keys);
+    let truncated = keys.len() > max_keys;
+    let returned_keys = if truncated { &keys[..max_keys] } else { &keys };
+    let body = xml::list_objects_v2(&bucket, prefix, returned_keys, max_keys, truncated);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
