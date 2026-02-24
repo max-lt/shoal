@@ -69,7 +69,7 @@ pub(crate) async fn list_objects(
         .unwrap_or(1000);
     tracing::debug!(bucket = %bucket, prefix, max_keys, "list_objects");
 
-    let keys = state.engine.list_objects(&bucket, prefix).await?;
+    let keys = state.engine.list_objects(&bucket, prefix)?;
     let truncated = keys.len() > max_keys;
     let returned_keys = if truncated { &keys[..max_keys] } else { &keys };
     let body = xml::list_objects_v2(&bucket, prefix, returned_keys, max_keys, truncated);
@@ -253,7 +253,6 @@ pub(crate) async fn head_object_handler(
     let manifest = state
         .engine
         .head_object(&bucket, &key)
-        .await
         .map_err(|e| engine_to_s3(e, &bucket, &key))?;
 
     let etag = format!("\"{0}\"", manifest.object_id);

@@ -593,7 +593,7 @@ impl QuicTestCluster {
 
     /// Broadcast a manifest from one node to all others over real QUIC.
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
+        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
         let manifest_bytes = postcard::to_allocvec(&manifest).unwrap();
 
         let msg = ShoalMessage::ManifestPut {
@@ -623,6 +623,7 @@ impl QuicTestCluster {
 
 /// 3a. Basic smoke test: PUT on node 0, GET from node 0 and node 1.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(30000)]
 async fn test_quic_put_get_roundtrip() {
     let c = QuicTestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(5000);
@@ -651,6 +652,7 @@ async fn test_quic_put_get_roundtrip() {
 /// With 1 MB / 64 KB = 16 chunks * 4 shards = 64 total shards — well within
 /// what a single QUIC connection can handle without congestion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(30000)]
 async fn test_quic_large_object() {
     let c = QuicTestCluster::new(4, 65536, 2, 2).await;
     let data = test_data(1_000_000); // 1 MB
@@ -679,6 +681,7 @@ async fn test_quic_large_object() {
 
 /// 3c. Cross-node manifest visibility: PUT on A, GET on B and C.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(30000)]
 async fn test_quic_cross_node_manifest_sync() {
     let c = QuicTestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(5000);
@@ -703,6 +706,7 @@ async fn test_quic_cross_node_manifest_sync() {
 
 /// 3d. Concurrent writes: 20 concurrent PUT calls on node 0.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(60000)]
 async fn test_quic_concurrent_writes() {
     // Use larger chunk size to keep shard count manageable.
     let c = Arc::new(QuicTestCluster::new(3, 4096, 2, 1).await);
@@ -753,6 +757,7 @@ async fn test_quic_concurrent_writes() {
 /// cold start) and must recover all manifests by pulling from peers over
 /// real QUIC bi-directional streams.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(30000)]
 async fn test_quic_manifest_sync_from_peers() {
     let c = QuicTestCluster::new(4, 4096, 2, 2).await;
 
@@ -777,7 +782,7 @@ async fn test_quic_manifest_sync_from_peers() {
     for i in 0..4 {
         for (key, _) in &objects {
             assert!(
-                c.node(i).head_object("bucket", key).await.is_ok(),
+                c.node(i).head_object("bucket", key).is_ok(),
                 "node {i} should have manifest for {key} after broadcast"
             );
         }

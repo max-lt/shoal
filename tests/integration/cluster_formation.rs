@@ -10,6 +10,7 @@ use shoal_integration_tests::{IntegrationCluster, test_data};
 /// All nodes share the same ClusterState, so membership is immediate.
 /// The ring should contain all 5 nodes and be consistent across them.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_cluster_formation() {
     let c = IntegrationCluster::new(5, 1024, 4, 2).await;
 
@@ -26,6 +27,7 @@ async fn test_5_node_cluster_formation() {
 
 /// Verify consistent ring: all nodes place the same shard on the same owner.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_consistent_ring() {
     let c = IntegrationCluster::new(5, 1024, 4, 2).await;
 
@@ -47,6 +49,7 @@ async fn test_5_node_consistent_ring() {
 
 /// Ring should be well-distributed: shards spread across multiple nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_shard_distribution() {
     let c = IntegrationCluster::new(5, 1024, 4, 2).await;
 
@@ -75,6 +78,7 @@ async fn test_5_node_shard_distribution() {
 
 /// Cluster formation with 10 nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_10_node_cluster() {
     let c = IntegrationCluster::new(10, 2048, 4, 2).await;
 

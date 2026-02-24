@@ -3643,6 +3643,7 @@ dependencies = [
  "bytes",
  "futures-lite",
  "iroh",
+ "ntest",
  "postcard",
  "rand",
  "shoal-cas",

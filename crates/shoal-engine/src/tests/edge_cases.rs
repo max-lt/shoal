@@ -204,7 +204,7 @@ async fn test_many_objects_same_bucket() {
             .unwrap();
     }
 
-    let keys = node.list_objects("b", "").await.unwrap();
+    let keys = node.list_objects("b", "").unwrap();
     assert_eq!(keys.len(), 100);
 
     // Spot check a few.

@@ -20,6 +20,7 @@ use tokio::time;
 ///
 /// After the chaos phase, all objects written must be verifiable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(60000)]
 async fn test_random_kill_no_data_loss() {
     // --- Setup ---
     // replication=3 ensures each shard has 3 copies across 7 nodes.

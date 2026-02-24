@@ -12,6 +12,7 @@ use tokio::sync::Barrier;
 /// 10 concurrent writers, each writing 100 objects = 1000 total.
 /// Then verify all 1000 objects are readable from every node.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_concurrent_writers_1000_objects() {
     let c = Arc::new(IntegrationCluster::new(5, 2048, 4, 2).await);
 
@@ -62,6 +63,7 @@ async fn test_concurrent_writers_1000_objects() {
 
 /// Concurrent readers and writers: writers write while readers read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_concurrent_read_write() {
     let c = Arc::new(IntegrationCluster::new(5, 2048, 4, 2).await);
 
@@ -143,6 +145,7 @@ async fn test_concurrent_read_write() {
 /// Verify no data corruption: write with known data, read back,
 /// compare byte-by-byte.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_no_data_corruption() {
     let c = IntegrationCluster::new(5, 1024, 4, 2).await;
 

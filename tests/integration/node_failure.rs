@@ -8,6 +8,7 @@ use shoal_integration_tests::{IntegrationCluster, test_data_seeded};
 
 /// 5-node cluster, write 50 objects, kill 1 node, read all 50 → succeed.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_kill_one_node_all_objects_readable() {
     // k=4, m=2, replication=2: each shard on 2 nodes.
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 2).await;
@@ -53,6 +54,7 @@ async fn test_kill_one_node_all_objects_readable() {
 
 /// Kill 2 nodes: with k=4, m=2 and replication=3, should still read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_kill_two_nodes_still_readable() {
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 3).await;
 
@@ -97,6 +99,7 @@ async fn test_kill_two_nodes_still_readable() {
 
 /// Kill the writer node: non-writer nodes should still read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_kill_writer_node() {
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 2).await;
 
@@ -123,6 +126,7 @@ async fn test_kill_writer_node() {
 
 /// Kill a node, revive it, verify reads work before and after.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_node_kill_and_revive() {
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 2).await;
 
@@ -161,6 +165,7 @@ async fn test_node_kill_and_revive() {
 
 /// Mass failure and recovery: kill all except writer, revive all.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_mass_failure_and_recovery() {
     // Full replication so writer has all shards locally.
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 5).await;
@@ -201,6 +206,7 @@ async fn test_mass_failure_and_recovery() {
 /// `put_object`'s built-in manifest broadcast (via `send_to`) and
 /// the `pull_manifest` fallback for the respawned node.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_4_nodes_kill_write_respawn_catches_up() {
     // k=2, m=1, shard_replication=2: each shard on 2 nodes.
     let c = IntegrationCluster::with_replication(4, 1024, 2, 1, 2).await;
@@ -257,6 +263,7 @@ async fn test_4_nodes_kill_write_respawn_catches_up() {
 
 /// Delete object, verify it's gone.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_delete_object_after_node_failure() {
     let c = IntegrationCluster::with_replication(5, 2048, 4, 2, 2).await;
 

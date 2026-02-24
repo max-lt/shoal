@@ -25,6 +25,7 @@ use tokio::sync::RwLock;
 /// erasure pipeline. Exercises the chunker edge cases (tiny, exact, off-by-one,
 /// multi-chunk, large).
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_data_size_spectrum() {
     let c = IntegrationCluster::new(5, 1024, 2, 1).await;
 
@@ -85,6 +86,7 @@ async fn test_data_size_spectrum() {
 /// Write the same key 20 times with different data. After each write,
 /// verify reading returns the latest value.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_overwrite_consistency() {
     let c = IntegrationCluster::new(5, 1024, 2, 1).await;
 
@@ -129,7 +131,7 @@ async fn test_overwrite_consistency() {
     }
 
     // Only 1 key should be listed.
-    let keys = c.node(0).list_objects("overwrite", "").await.unwrap();
+    let keys = c.node(0).list_objects("overwrite", "").unwrap();
     assert_eq!(keys.len(), 1, "should have exactly 1 key after overwrites");
 }
 
@@ -141,6 +143,7 @@ async fn test_overwrite_consistency() {
 /// verify the object is still readable via data shards only (fast path).
 /// Then delete some data shards and verify RS decode reconstructs.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_shard_deletion_rs_reconstruction() {
     // k=2, m=2 → 4 shards per chunk, need 2 to reconstruct.
     let c = IntegrationCluster::with_replication(5, 1024, 2, 2, 2).await;
@@ -199,6 +202,7 @@ async fn test_shard_deletion_rs_reconstruction() {
 /// With replication=3 and k=2 m=2, delete shards from some replicas
 /// but keep enough across the cluster for RS decode.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_shard_loss_across_replicas_still_readable() {
     // k=2, m=1 → 3 shards, replication=3 → each shard on 3 nodes.
     let c = IntegrationCluster::with_replication(5, 2048, 2, 1, 3).await;
@@ -234,6 +238,7 @@ async fn test_shard_loss_across_replicas_still_readable() {
 /// 5 nodes, concurrent PUT + GET + DELETE + LIST operations running
 /// simultaneously. Verify no panics, no data corruption.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(60000)]
 async fn test_concurrent_mixed_operations() {
     let c = Arc::new(IntegrationCluster::new(5, 1024, 2, 1).await);
     let stop = Arc::new(AtomicBool::new(false));
@@ -331,9 +336,9 @@ async fn test_concurrent_mixed_operations() {
         let lc = list_count.clone();
         handles.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                let _ = cluster.node(0).list_objects("mix", "").await;
-                let _ = cluster.node(0).list_objects("mix", "mix-w0").await;
-                let _ = cluster.node(0).list_objects("mix", "mix-w1").await;
+                let _ = cluster.node(0).list_objects("mix", "");
+                let _ = cluster.node(0).list_objects("mix", "mix-w0");
+                let _ = cluster.node(0).list_objects("mix", "mix-w1");
                 lc.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -377,6 +382,7 @@ async fn test_concurrent_mixed_operations() {
 /// killed, revived, and new nodes are added. After stabilization,
 /// all surviving objects must be readable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ntest::timeout(60000)]
 async fn test_rolling_chaos_with_expansion() {
     let c = Arc::new(RwLock::new(
         IntegrationCluster::with_replication(7, 2048, 4, 2, 3).await,
@@ -526,6 +532,7 @@ async fn test_rolling_chaos_with_expansion() {
 /// 20-node cluster. Write 200 objects, read from random nodes.
 /// Verify shard distribution uses all nodes.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_large_cluster_20_nodes() {
     let c = IntegrationCluster::new(20, 2048, 4, 2).await;
 
@@ -570,6 +577,7 @@ async fn test_large_cluster_20_nodes() {
 
 /// Test various k/m combinations all produce correct results.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_erasure_config_variations() {
     let configs: Vec<(usize, usize, usize)> = vec![
         // (k, m, num_nodes)
@@ -606,6 +614,7 @@ async fn test_erasure_config_variations() {
 
 /// Verify user metadata survives the full pipeline round-trip.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_metadata_round_trip() {
     let c = IntegrationCluster::new(5, 1024, 2, 1).await;
 
@@ -628,7 +637,7 @@ async fn test_metadata_round_trip() {
     c.broadcast_manifest(0, "meta", "tagged.bin").await;
 
     // HEAD from a different node.
-    let manifest = c.node(2).head_object("meta", "tagged.bin").await.unwrap();
+    let manifest = c.node(2).head_object("meta", "tagged.bin").unwrap();
     assert_eq!(manifest.metadata, metadata);
     assert_eq!(manifest.total_size, 3000);
 
@@ -645,6 +654,7 @@ async fn test_metadata_round_trip() {
 /// Write 50 objects, delete half, verify list returns exactly the
 /// non-deleted ones.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_delete_then_list_consistency() {
     let c = IntegrationCluster::new(5, 1024, 2, 1).await;
 
@@ -676,7 +686,7 @@ async fn test_delete_then_list_consistency() {
     }
 
     // List should return exactly the kept keys.
-    let mut listed = c.node(0).list_objects("dl", "").await.unwrap();
+    let mut listed = c.node(0).list_objects("dl", "").unwrap();
     listed.sort();
     kept.sort();
     assert_eq!(listed, kept, "list after delete should match kept keys");
@@ -699,6 +709,7 @@ async fn test_delete_then_list_consistency() {
 /// Objects in different buckets should be completely isolated.
 /// Same key name in different buckets → different objects.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_multi_bucket_isolation() {
     let c = IntegrationCluster::new(5, 1024, 2, 1).await;
 
@@ -719,7 +730,7 @@ async fn test_multi_bucket_isolation() {
 
     // Verify each bucket's objects are independent.
     for (bi, bucket) in buckets.iter().enumerate() {
-        let keys = c.node(0).list_objects(bucket, "").await.unwrap();
+        let keys = c.node(0).list_objects(bucket, "").unwrap();
         assert_eq!(
             keys.len(),
             10,

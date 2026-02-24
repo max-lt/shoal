@@ -1,5 +1,6 @@
 //! Tests for the LogTree crate.
 
+mod dag_tests;
 mod entry_tests;
 mod integrity_tests;
 mod snapshot_tests;

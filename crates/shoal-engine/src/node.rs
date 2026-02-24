@@ -762,26 +762,25 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Check if an object exists.
+    /// Check if an object exists (local-only).
     ///
-    /// Uses `lookup_manifest` for peer-pull-on-miss consistency: if the
-    /// manifest isn't cached locally, peers are queried.
-    pub async fn has_object(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
-        Ok(self.lookup_manifest(bucket, key).await?.is_some())
+    /// Returns `true` if the object key is known locally (LogTree or
+    /// MetaStore). Does NOT query peers — this is a fast path used
+    /// by the S3 layer and tests. Use `get_object` for the full
+    /// read path with peer fallback.
+    pub fn has_object(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
+        if let Some(log_tree) = &self.log_tree {
+            return Ok(log_tree.resolve(bucket, key)?.is_some());
+        }
+        Ok(self.meta.get_object_key(bucket, key)?.is_some())
     }
 
-    /// List objects in a bucket with an optional prefix.
+    /// List objects in a bucket with an optional prefix (local-only).
     ///
-    /// Syncs manifests from peers first to ensure cross-node consistency
-    /// (objects written on other nodes are visible in the listing).
-    /// The sync is a no-op when no transport is configured.
-    pub async fn list_objects(
-        &self,
-        bucket: &str,
-        prefix: &str,
-    ) -> Result<Vec<String>, EngineError> {
-        let _ = self.sync_manifests_from_all_peers().await;
-
+    /// Returns keys known locally via LogTree or MetaStore. Does NOT
+    /// query peers — cross-node visibility is handled by gossip and
+    /// periodic sync, not inline on every list call.
+    pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
         if let Some(log_tree) = &self.log_tree {
             Ok(log_tree.list_keys(bucket, prefix)?)
         } else {
@@ -789,17 +788,31 @@ impl ShoalNode {
         }
     }
 
-    /// Retrieve object metadata (manifest) without fetching data.
+    /// Retrieve object metadata (manifest) without fetching data (local-only).
     ///
-    /// Uses `lookup_manifest` for peer-pull-on-miss consistency: if the
-    /// manifest isn't cached locally, peers are queried.
-    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
-        self.lookup_manifest(bucket, key)
-            .await?
-            .ok_or_else(|| EngineError::ObjectNotFound {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            })
+    /// Looks up the manifest from LogTree or MetaStore. Does NOT query
+    /// peers — use `get_object` for the full read path with peer
+    /// fallback, or call `sync_manifests_from_peers` explicitly first.
+    pub fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+        // LogTree mode.
+        if let Some(log_tree) = &self.log_tree
+            && let Some(object_id) = log_tree.resolve(bucket, key)?
+            && let Some(m) = log_tree.get_manifest(&object_id)?
+        {
+            return Ok(m);
+        }
+
+        // MetaStore fallback.
+        if let Some(object_id) = self.meta.get_object_key(bucket, key)?
+            && let Some(manifest) = self.meta.get_manifest(&object_id)?
+        {
+            return Ok(manifest);
+        }
+
+        Err(EngineError::ObjectNotFound {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        })
     }
 
     // ------------------------------------------------------------------
@@ -888,64 +901,6 @@ impl ShoalNode {
 
         if total_synced > 0 {
             info!(total_synced, "manifest sync complete");
-        }
-
-        Ok(total_synced)
-    }
-
-    /// Sync manifests from ALL cluster peers for listing consistency.
-    ///
-    /// Unlike `sync_manifests_from_peers` which stops after the first
-    /// successful sync, this queries every reachable peer to ensure
-    /// objects written on any node are visible in listings.
-    pub async fn sync_manifests_from_all_peers(&self) -> Result<usize, EngineError> {
-        let Some(transport) = &self.transport else {
-            return Ok(0);
-        };
-
-        let peers: Vec<_> = self
-            .cluster
-            .members()
-            .await
-            .into_iter()
-            .filter(|p| p.node_id != self.node_id)
-            .collect();
-
-        let mut total_synced = 0usize;
-
-        for peer in &peers {
-            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
-                continue;
-            };
-
-            match transport.pull_all_manifests(addr).await {
-                Ok(entries) => {
-                    for entry in entries {
-                        if let Ok(manifest) =
-                            postcard::from_bytes::<Manifest>(&entry.manifest_bytes)
-                        {
-                            let dominated = self
-                                .meta
-                                .get_object_key(&entry.bucket, &entry.key)?
-                                .as_ref()
-                                != Some(&manifest.object_id);
-
-                            if dominated {
-                                self.meta.put_manifest(&manifest)?;
-                                self.meta.put_object_key(
-                                    &entry.bucket,
-                                    &entry.key,
-                                    &manifest.object_id,
-                                )?;
-                                total_synced += 1;
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(from = %peer.node_id, %e, "manifest sync from peer failed");
-                }
-            }
         }
 
         Ok(total_synced)

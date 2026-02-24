@@ -147,6 +147,7 @@ async fn read_object(
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_write_read_roundtrip() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -164,6 +165,7 @@ async fn test_write_read_roundtrip() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_chunking_produces_expected_count() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -198,6 +200,7 @@ async fn test_chunking_produces_expected_count() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_shards_distributed_across_nodes() {
     let (stores, ring, nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -229,6 +232,7 @@ async fn test_shards_distributed_across_nodes() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_single_shard_loss_per_chunk_read_succeeds() {
     // Delete 1 shard per chunk (simulating a node loss).
     // With k=2, m=1, losing 1 of 3 shards leaves k=2 → decode succeeds.
@@ -276,6 +280,7 @@ async fn test_single_shard_loss_per_chunk_read_succeeds() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_two_shard_loss_per_chunk_read_fails() {
     // Delete 2 shards per chunk (total failure scenario).
     // With k=2, m=1, losing 2 of 3 shards leaves only 1 → decode fails.
@@ -323,6 +328,7 @@ async fn test_two_shard_loss_per_chunk_read_fails() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_small_object_roundtrip() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -338,6 +344,7 @@ async fn test_small_object_roundtrip() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_exact_chunk_size_object() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -361,6 +368,7 @@ async fn test_exact_chunk_size_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_multiple_objects_independent() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -397,6 +405,7 @@ async fn test_multiple_objects_independent() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_nonexistent_object_returns_none() {
     let (stores, _ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -406,6 +415,7 @@ async fn test_nonexistent_object_returns_none() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_shard_integrity_verified() {
     let (stores, ring, _nodes) = setup_cluster();
     let meta = MetaStore::open_temporary().unwrap();
@@ -436,6 +446,7 @@ async fn test_shard_integrity_verified() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_parity_shard_reconstruction() {
     // Delete the first DATA shard (index 0) of each chunk.
     // The decoder must use the parity shard to reconstruct.

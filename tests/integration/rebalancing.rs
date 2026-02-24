@@ -11,6 +11,7 @@ use shoal_integration_tests::{IntegrationCluster, test_data_seeded};
 /// After adding nodes, the ring should include all 5 nodes.
 /// All objects should still be readable.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_add_nodes_objects_still_readable() {
     let mut c = IntegrationCluster::new(3, 2048, 2, 1).await;
 
@@ -60,6 +61,7 @@ async fn test_add_nodes_objects_still_readable() {
 
 /// After adding nodes, new writes should distribute shards to the new nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_new_writes_use_expanded_ring() {
     let mut c = IntegrationCluster::new(3, 1024, 2, 1).await;
 
@@ -92,6 +94,7 @@ async fn test_new_writes_use_expanded_ring() {
 
 /// Ring expansion: verify shard distribution becomes more even.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_shard_distribution_after_expansion() {
     let mut c = IntegrationCluster::new(3, 1024, 2, 1).await;
 
@@ -147,6 +150,7 @@ async fn test_shard_distribution_after_expansion() {
 
 /// Manifest sync after node addition: new node can list all objects.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_new_node_lists_objects_after_sync() {
     let mut c = IntegrationCluster::new(3, 1024, 2, 1).await;
 
@@ -165,7 +169,7 @@ async fn test_new_node_lists_objects_after_sync() {
     let idx = c.add_node().await;
 
     // Before sync: new node has 0 objects.
-    let before = c.node(idx).list_objects("b", "").await.unwrap();
+    let before = c.node(idx).list_objects("b", "").unwrap();
     assert_eq!(
         before.len(),
         0,
@@ -176,7 +180,7 @@ async fn test_new_node_lists_objects_after_sync() {
     let synced = c.node(idx).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced, 20, "should sync 20 manifests");
 
-    let after = c.node(idx).list_objects("b", "").await.unwrap();
+    let after = c.node(idx).list_objects("b", "").unwrap();
     assert_eq!(
         after.len(),
         20,

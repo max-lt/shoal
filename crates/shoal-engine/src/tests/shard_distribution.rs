@@ -168,7 +168,7 @@ async fn test_writer_stores_all_shards_locally_without_transport() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").await.unwrap();
+    let manifest = nodes[0].head_object("b", "k").unwrap();
 
     // Without transport, the writer stores ALL shards (k+m = 3) locally.
     let mut local_count = 0;

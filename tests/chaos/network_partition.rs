@@ -11,6 +11,7 @@ use shoal_integration_tests::{IntegrationCluster, test_data_seeded};
 /// Each partition side can read its own data. After healing, verify all
 /// data is consistent.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_network_partition_and_heal() {
     // replication=3 ensures shards are spread across nodes.
     let c = IntegrationCluster::with_replication(6, 2048, 2, 1, 3).await;
@@ -76,11 +77,7 @@ async fn test_network_partition_and_heal() {
             .await
             .unwrap();
         // Only broadcast to partition A nodes.
-        let manifest = c
-            .node(i as usize % 3)
-            .head_object("part", &key)
-            .await
-            .unwrap();
+        let manifest = c.node(i as usize % 3).head_object("part", &key).unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
@@ -134,6 +131,7 @@ async fn test_network_partition_and_heal() {
 /// Partition then simultaneous writes from both sides.
 /// After healing, all data from both sides should be readable.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_split_brain_writes_both_sides() {
     let c = IntegrationCluster::with_replication(6, 2048, 2, 1, 3).await;
 
@@ -153,11 +151,7 @@ async fn test_split_brain_writes_both_sides() {
             .await
             .unwrap();
         // Broadcast only to side A.
-        let manifest = c
-            .node(i as usize % 3)
-            .head_object("split", &key)
-            .await
-            .unwrap();
+        let manifest = c.node(i as usize % 3).head_object("split", &key).unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
@@ -183,7 +177,6 @@ async fn test_split_brain_writes_both_sides() {
         let manifest = c
             .node(3 + i as usize % 3)
             .head_object("split", &key)
-            .await
             .unwrap();
         for target in 3..6 {
             if target != 3 + i as usize % 3 {

@@ -10,6 +10,7 @@ use shoal_integration_tests::{IntegrationCluster, test_data_seeded};
 /// Write 100 objects of varying sizes (1 KB to ~100 KB), read each from a
 /// random node, verify data matches.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_100_objects_varying_sizes() {
     let c = IntegrationCluster::new(5, 4096, 4, 2).await;
 
@@ -42,6 +43,7 @@ async fn test_100_objects_varying_sizes() {
 
 /// Write and immediately read from the SAME node — should always succeed.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_write_then_immediate_read_same_node() {
     let c = IntegrationCluster::new(5, 2048, 4, 2).await;
 
@@ -63,6 +65,7 @@ async fn test_write_then_immediate_read_same_node() {
 
 /// Write and immediately read from a DIFFERENT node — requires manifest broadcast.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_write_then_read_different_node() {
     let c = IntegrationCluster::new(5, 2048, 4, 2).await;
 
@@ -85,6 +88,7 @@ async fn test_write_then_read_different_node() {
 
 /// Large objects: write 10 objects of 1 MB each, read back.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_large_objects_1mb() {
     let c = IntegrationCluster::new(5, 65536, 4, 2).await;
 
@@ -107,6 +111,7 @@ async fn test_large_objects_1mb() {
 
 /// All nodes list the same objects.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_all_nodes_list_same_objects() {
     let c = IntegrationCluster::new(5, 2048, 4, 2).await;
 
@@ -124,7 +129,7 @@ async fn test_all_nodes_list_same_objects() {
 
     // Every node should list 30 objects.
     for i in 0..5 {
-        let keys = c.node(i).list_objects("catalog", "").await.unwrap();
+        let keys = c.node(i).list_objects("catalog", "").unwrap();
         assert_eq!(
             keys.len(),
             30,
@@ -136,6 +141,7 @@ async fn test_all_nodes_list_same_objects() {
 
 /// Prefix filtering works across all nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_list_objects_with_prefix() {
     let c = IntegrationCluster::new(5, 2048, 4, 2).await;
 
@@ -164,9 +170,9 @@ async fn test_list_objects_with_prefix() {
     }
 
     for i in 0..5 {
-        let images = c.node(i).list_objects("b", "images/").await.unwrap();
-        let docs = c.node(i).list_objects("b", "docs/").await.unwrap();
-        let all = c.node(i).list_objects("b", "").await.unwrap();
+        let images = c.node(i).list_objects("b", "images/").unwrap();
+        let docs = c.node(i).list_objects("b", "docs/").unwrap();
+        let all = c.node(i).list_objects("b", "").unwrap();
 
         assert_eq!(images.len(), 10, "node {i}: images prefix");
         assert_eq!(docs.len(), 10, "node {i}: docs prefix");

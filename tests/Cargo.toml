@@ -22,6 +22,7 @@ postcard = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }
 futures-lite = "2"
+ntest = "0.9"
 
 [lib]
 name = "shoal_integration_tests"
