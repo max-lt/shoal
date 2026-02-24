@@ -4,10 +4,14 @@
 //! `{base_dir}/{hex[0..2]}/{hex[2..4]}/{hex}`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use shoal_types::ShardId;
 use tracing::{debug, error, warn};
+
+/// Monotonic counter for unique temp file names.
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::StoreError;
 use crate::traits::{ShardStore, StorageCapacity};
@@ -57,10 +61,10 @@ impl ShardStore for FileStore {
         }
 
         // Atomic write: write to a uniquely-named temp file, then rename.
-        // The random suffix prevents ENOENT races when multiple tasks write
+        // The counter suffix prevents ENOENT races when multiple tasks write
         // the same ShardId concurrently (each gets its own temp file).
-        let suffix: u64 = rand::random();
-        let tmp_path = path.with_extension(format!("tmp.{suffix:016x}"));
+        let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{seq}"));
 
         tokio::fs::write(&tmp_path, &data).await?;
 
