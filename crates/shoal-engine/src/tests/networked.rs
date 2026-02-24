@@ -271,6 +271,20 @@ impl TestCluster {
         Self::build(n, chunk_size, k, m, 1, false, Some(chaos)).await
     }
 
+    /// Create an N-node cluster with chaos fault injection AND custom
+    /// shard replication. Combines the two for tests that need redundancy
+    /// to survive chaotic transport failures.
+    async fn with_chaos_and_replication(
+        n: usize,
+        chunk_size: u32,
+        k: usize,
+        m: usize,
+        shard_replication: usize,
+        chaos: ChaosConfig,
+    ) -> Self {
+        Self::build(n, chunk_size, k, m, shard_replication, false, Some(chaos)).await
+    }
+
     /// Internal builder that supports all configuration options.
     async fn build(
         n: usize,
@@ -2436,5 +2450,809 @@ async fn test_chaos_partition_then_heal() {
     assert!(
         stats.partitioned > 0,
         "chaos stats should show partitioned messages: {stats:?}"
+    );
+}
+
+// =========================================================================
+// Advanced chaos tests — QUIC-style network misbehaviour
+// =========================================================================
+
+/// Cascading node failures under network latency.
+///
+/// 7-node cluster with high latency. Write objects, then kill nodes one by one.
+/// After each kill, verify that surviving nodes can still read all data.
+/// Simulates the cascading failure pattern that QUIC connections experience
+/// when a rack switch goes down and nodes timeout one after another.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_cascading_node_failures_with_latency() {
+    let chaos = ChaosConfig {
+        latency_ms: (20, 80),
+        drop_rate: 0.0,
+        seed: 7777,
+        ..Default::default()
+    };
+
+    // replication=4 so shards survive multiple node losses with k=2, m=1
+    let c = TestCluster::with_chaos_and_replication(7, 1024, 2, 1, 4, chaos).await;
+
+    // Write 10 objects from various nodes.
+    let mut objects = Vec::new();
+    for i in 0..10 {
+        let writer = i % 7;
+        let key = format!("cascade-{i}");
+        let data = test_data(2000 + i * 100);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data));
+    }
+
+    // Kill nodes 6, 5, 4 one at a time (cascading), verifying after each.
+    for kill_idx in (4..7).rev() {
+        c.kill_node(kill_idx).await;
+
+        // Pick a surviving reader.
+        let reader = kill_idx.saturating_sub(4);
+        for (key, expected) in &objects {
+            let (got, _) = c
+                .node(reader)
+                .get_object("b", key)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("node {reader} failed to read {key} after killing node {kill_idx}: {e}")
+                });
+            assert_eq!(
+                &got, expected,
+                "data mismatch for {key} after kill {kill_idx}"
+            );
+        }
+    }
+}
+
+/// Flapping node: a node repeatedly goes down and comes back.
+///
+/// Simulates an unstable QUIC connection that keeps resetting —
+/// the kind of thing you see with flaky NICs or overloaded NAT gateways.
+/// Writes happen concurrently with the flapping. All data must be readable
+/// after the flapping stops.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_flapping_node() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 20),
+        drop_rate: 0.0,
+        seed: 1234,
+        ..Default::default()
+    };
+
+    let c = Arc::new(TestCluster::with_chaos_and_replication(5, 1024, 2, 1, 2, chaos).await);
+
+    let flapper_idx = 3;
+    let n_objects = 30;
+
+    // Spawn a task that flaps node 3 repeatedly.
+    let flap_cluster = c.clone();
+    let flap_handle = tokio::spawn(async move {
+        for cycle in 0..6 {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            flap_cluster.disconnect_node(flapper_idx).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(30)).await;
+            flap_cluster.reconnect_node(flapper_idx).await;
+            let _ = cycle; // suppress unused warning in release
+        }
+    });
+
+    // Concurrently write objects from non-flapping nodes.
+    let mut handles = Vec::new();
+    for j in 0..n_objects {
+        let cluster = c.clone();
+        handles.push(tokio::spawn(async move {
+            let writer = j % 3; // nodes 0, 1, 2 only
+            let key = format!("flap-{j}");
+            let data = test_data(800 + j * 50);
+            cluster
+                .node(writer)
+                .put_object("b", &key, &data, BTreeMap::new())
+                .await
+                .unwrap_or_else(|e| panic!("write {key} from node {writer} failed: {e}"));
+            cluster.broadcast_manifest(writer, "b", &key).await;
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+    flap_handle.await.unwrap();
+
+    // Ensure flapper is reconnected.
+    c.reconnect_node(flapper_idx).await;
+
+    // Retry any pending pushes on all writers.
+    for i in 0..3 {
+        c.node(i).retry_pending_pushes().await;
+    }
+
+    // All objects must be readable from every surviving node.
+    for j in 0..n_objects {
+        let key = format!("flap-{j}");
+        let expected = test_data(800 + j * 50);
+
+        for reader in 0..5 {
+            let (got, _) = c
+                .node(reader)
+                .get_object("b", &key)
+                .await
+                .unwrap_or_else(|e| panic!("node {reader} failed to read {key}: {e}"));
+            assert_eq!(got, expected, "data mismatch for {key} on node {reader}");
+        }
+    }
+}
+
+/// High drop rate with replication: 30% packet loss, but replication=3
+/// ensures enough shard copies land on enough nodes.
+///
+/// Simulates a badly congested network where QUIC streams experience
+/// heavy packet loss. The replication factor compensates: even if a push
+/// to one replica is dropped, others succeed.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_high_drop_rate_with_replication() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 30),
+        drop_rate: 0.30,
+        seed: 999,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos_and_replication(5, 1024, 2, 1, 3, chaos).await;
+
+    // Write 15 objects. Some shard pushes will be dropped, but enough
+    // copies should land thanks to replication=3.
+    let mut objects = Vec::new();
+    for i in 0..15 {
+        let writer = i % 5;
+        let key = format!("drop-{i}");
+        let data = test_data(1500 + i * 100);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("write {key} failed despite replication: {e}"));
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data));
+    }
+
+    // Retry pending pushes — the dropped ones should succeed now
+    // (the chaos RNG may still drop some, so retry a few rounds).
+    for _round in 0..3 {
+        for i in 0..5 {
+            c.node(i).retry_pending_pushes().await;
+        }
+    }
+
+    // The writer node always has all shards locally, so reads from
+    // the writer must always work.
+    for (i, (key, expected)) in objects.iter().enumerate() {
+        let writer = i % 5;
+        let (got, _) = c
+            .node(writer)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("writer {writer} can't read {key}: {e}"));
+        assert_eq!(&got, expected, "writer {writer} data mismatch for {key}");
+    }
+}
+
+/// Simultaneous partitions isolating nodes into disjoint groups.
+///
+/// 6 nodes split into three groups: {0,1}, {2,3}, {4,5}.
+/// Each group writes objects. After healing, manifest sync merges state.
+/// Simulates a multi-rack datacenter where inter-rack links fail.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_simultaneous_partitions() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 15),
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos_and_replication(6, 1024, 2, 1, 2, chaos).await;
+    let controller = c.chaos_controller.as_ref().unwrap();
+
+    // Pre-partition: write a baseline object visible to all.
+    let data_base = test_data(2000);
+    c.node(0)
+        .put_object("b", "baseline", &data_base, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "baseline").await;
+
+    // Create 3 disjoint partitions: {0,1}, {2,3}, {4,5}.
+    // Each group is isolated from the other two.
+    let groups: Vec<Vec<usize>> = vec![vec![0, 1], vec![2, 3], vec![4, 5]];
+    for (gi, group_a) in groups.iter().enumerate() {
+        for (gj, group_b) in groups.iter().enumerate() {
+            if gi >= gj {
+                continue;
+            }
+            for &a in group_a {
+                for &b in group_b {
+                    controller.partition(c.node_ids[a], c.node_ids[b]).await;
+                }
+            }
+        }
+    }
+
+    // Each group writes objects (only reachable within the group).
+    let mut partition_objects: Vec<(String, Vec<u8>, usize)> = Vec::new();
+    for (gi, group) in groups.iter().enumerate() {
+        let writer = group[0];
+        let key = format!("part-{gi}");
+        let data = test_data(3000 + gi * 500);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        // Only broadcast within the group (the cross-group ones will be
+        // blocked by the partition anyway).
+        c.broadcast_manifest(writer, "b", &key).await;
+        partition_objects.push((key, data, writer));
+    }
+
+    // Within each group, both nodes should see their local partition object.
+    for (gi, group) in groups.iter().enumerate() {
+        let key = format!("part-{gi}");
+        for &node in group {
+            let result = c.node(node).get_object("b", &key).await;
+            assert!(
+                result.is_ok(),
+                "node {node} in group {gi} should read {key}"
+            );
+        }
+    }
+
+    // Heal all partitions.
+    for (gi, group_a) in groups.iter().enumerate() {
+        for (gj, group_b) in groups.iter().enumerate() {
+            if gi >= gj {
+                continue;
+            }
+            for &a in group_a {
+                for &b in group_b {
+                    controller.heal(c.node_ids[a], c.node_ids[b]).await;
+                }
+            }
+        }
+    }
+
+    // Retry pending pushes on all writers.
+    for i in 0..6 {
+        c.node(i).retry_pending_pushes().await;
+    }
+
+    // Sync manifests so every node discovers objects from other partitions.
+    for i in 0..6 {
+        let _ = c.node(i).sync_manifests_from_peers().await;
+    }
+
+    // All 6 nodes should see the baseline object.
+    for i in 0..6 {
+        let (got, _) = c
+            .node(i)
+            .get_object("b", "baseline")
+            .await
+            .unwrap_or_else(|e| panic!("node {i} lost baseline after partition: {e}"));
+        assert_eq!(got, data_base, "baseline mismatch on node {i}");
+    }
+
+    // All 6 nodes should see partition-local objects via their writers.
+    for (key, expected, writer) in &partition_objects {
+        let (got, _) = c
+            .node(*writer)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("writer {writer} can't read {key} post-heal: {e}"));
+        assert_eq!(
+            &got, expected,
+            "{key} mismatch on writer {writer} post-heal"
+        );
+    }
+
+    // Stats should confirm some messages were blocked.
+    let stats = controller.stats();
+    assert!(
+        stats.partitioned > 0,
+        "should have partitioned messages: {stats:?}"
+    );
+}
+
+/// Slow store reads during a write storm.
+///
+/// Simulates what happens when the underlying disk is saturated: reads
+/// take 50-100ms while new writes keep arriving. Verifies no data
+/// corruption and that both reads and writes eventually complete.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_slow_store_during_write_storm() {
+    let chaos = ChaosConfig {
+        latency_ms: (2, 10),
+        store_read_latency_ms: (20, 60),
+        store_write_latency_ms: (10, 40),
+        seed: 55,
+        ..Default::default()
+    };
+
+    let c = Arc::new(TestCluster::with_chaos(5, 1024, 2, 1, chaos).await);
+
+    let n_writers = 5;
+    let objects_per_writer = 8;
+
+    // Spawn concurrent writers.
+    let mut handles = Vec::new();
+    for w in 0..n_writers {
+        let cluster = c.clone();
+        handles.push(tokio::spawn(async move {
+            for j in 0..objects_per_writer {
+                let key = format!("storm-w{w}-{j}");
+                let data = test_data(600 + w * 100 + j * 30);
+                cluster
+                    .node(w % 5)
+                    .put_object("b", &key, &data, BTreeMap::new())
+                    .await
+                    .unwrap_or_else(|e| panic!("write {key} failed: {e}"));
+                cluster.broadcast_manifest(w % 5, "b", &key).await;
+            }
+        }));
+    }
+
+    // Concurrently, some readers try to read objects as they become available.
+    let read_cluster = c.clone();
+    let reader_handle = tokio::spawn(async move {
+        // Wait a bit for some objects to exist, then start reading.
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        let mut successful_reads = 0u32;
+        for attempt in 0..20 {
+            let key = format!("storm-w0-{}", attempt % objects_per_writer);
+            if read_cluster.node(1).get_object("b", &key).await.is_ok() {
+                successful_reads += 1;
+            }
+        }
+        successful_reads
+    });
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let reads_during_storm = reader_handle.await.unwrap();
+    // Some reads should have succeeded even during the storm.
+    assert!(
+        reads_during_storm > 0,
+        "at least some reads should succeed during write storm"
+    );
+
+    // After the storm, verify all objects are intact.
+    for w in 0..n_writers {
+        for j in 0..objects_per_writer {
+            let key = format!("storm-w{w}-{j}");
+            let expected = test_data(600 + w * 100 + j * 30);
+            let writer = w % 5;
+            let (got, _) = c
+                .node(writer)
+                .get_object("b", &key)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("post-storm read {key} from writer {writer} failed: {e}")
+                });
+            assert_eq!(got, expected, "post-storm data mismatch for {key}");
+        }
+    }
+}
+
+/// Rolling restart under writes: nodes are killed and revived one at a
+/// time while writes keep happening.
+///
+/// Simulates a rolling upgrade scenario where each node in turn restarts
+/// its QUIC endpoint. With replication=3, the cluster must remain available
+/// throughout.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_write_during_rolling_restart() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 15),
+        seed: 321,
+        ..Default::default()
+    };
+
+    let c = Arc::new(TestCluster::with_chaos_and_replication(5, 1024, 2, 1, 3, chaos).await);
+
+    let n_objects = 20;
+    let mut all_objects: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut obj_counter = 0usize;
+
+    // Rolling restart: kill node i, write some objects, revive node i.
+    for restart_idx in 0..5 {
+        c.kill_node(restart_idx).await;
+
+        // Write a few objects while node is down, using a non-killed writer.
+        let writer = (restart_idx + 1) % 5;
+        for _ in 0..4 {
+            let key = format!("rolling-{obj_counter}");
+            let data = test_data(1000 + obj_counter * 60);
+            c.node(writer)
+                .put_object("b", &key, &data, BTreeMap::new())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "write {key} on node {writer} failed while node {restart_idx} is down: {e}"
+                    )
+                });
+            c.broadcast_manifest(writer, "b", &key).await;
+            all_objects.push((key, data));
+            obj_counter += 1;
+        }
+
+        // Revive the node.
+        c.revive_node(restart_idx).await;
+
+        // Retry pending pushes.
+        for i in 0..5 {
+            c.node(i).retry_pending_pushes().await;
+        }
+    }
+
+    assert_eq!(all_objects.len(), n_objects);
+
+    // After all restarts, every object should be readable from the writer.
+    for (idx, (key, expected)) in all_objects.iter().enumerate() {
+        let writer = ((idx / 4) + 1) % 5;
+        let (got, _) = c
+            .node(writer)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("writer {writer} can't read {key}: {e}"));
+        assert_eq!(
+            &got, expected,
+            "data mismatch for {key} post-rolling-restart"
+        );
+    }
+}
+
+/// Split brain: both sides of a partition write to the same key.
+///
+/// During the partition each side can only read its own version. After
+/// healing and syncing, every writer must still be able to read the
+/// version it wrote (the shards are still on its local store). The key
+/// invariant is **no data corruption** — whatever a node reads must be
+/// one of the two valid versions, never a franken-mix.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_split_brain_same_key() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 10),
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos_and_replication(4, 1024, 2, 1, 2, chaos).await;
+    let controller = c.chaos_controller.as_ref().unwrap();
+
+    let v1 = test_data(3000);
+    let v2 = test_data(4000);
+
+    // Partition: {0,1} vs {2,3}.
+    controller.partition(c.node_ids[0], c.node_ids[2]).await;
+    controller.partition(c.node_ids[0], c.node_ids[3]).await;
+    controller.partition(c.node_ids[1], c.node_ids[2]).await;
+    controller.partition(c.node_ids[1], c.node_ids[3]).await;
+
+    // Side A writes v1, side B writes v2 (same bucket/key).
+    // Do NOT call broadcast_manifest — let the natural unicast from
+    // put_object go through the chaos transport so the partition is
+    // respected. Each side only sees its own version.
+    c.node(0)
+        .put_object("b", "conflict", &v1, BTreeMap::new())
+        .await
+        .unwrap();
+
+    c.node(2)
+        .put_object("b", "conflict", &v2, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Each writer should read its own version (shards are local).
+    let (got_a, _) = c.node(0).get_object("b", "conflict").await.unwrap();
+    assert_eq!(got_a, v1, "side A should see v1 during partition");
+    let (got_b, _) = c.node(2).get_object("b", "conflict").await.unwrap();
+    assert_eq!(got_b, v2, "side B should see v2 during partition");
+
+    // Heal.
+    controller.heal(c.node_ids[0], c.node_ids[2]).await;
+    controller.heal(c.node_ids[0], c.node_ids[3]).await;
+    controller.heal(c.node_ids[1], c.node_ids[2]).await;
+    controller.heal(c.node_ids[1], c.node_ids[3]).await;
+
+    // Retry pending pushes so shards land on their ring owners.
+    for _round in 0..3 {
+        for i in 0..4 {
+            c.node(i).retry_pending_pushes().await;
+        }
+    }
+
+    // Each writer must STILL be able to read its version from local shards
+    // (pending push retries may redistribute, but writers always have copies).
+    let (got_a, _) = c.node(0).get_object("b", "conflict").await.unwrap();
+    let (got_b, _) = c.node(2).get_object("b", "conflict").await.unwrap();
+
+    // The key invariant: no corruption. Each writer reads either v1 or v2.
+    assert!(
+        got_a == v1 || got_a == v2,
+        "node 0 post-heal: data must be v1 or v2, not corrupted (len={})",
+        got_a.len()
+    );
+    assert!(
+        got_b == v1 || got_b == v2,
+        "node 2 post-heal: data must be v1 or v2, not corrupted (len={})",
+        got_b.len()
+    );
+
+    // Verify the chaos layer exercised partitions.
+    let stats = controller.stats();
+    assert!(
+        stats.partitioned > 0,
+        "should have partitioned messages: {stats:?}"
+    );
+}
+
+/// Intermittent transport with many objects: random drops + latency
+/// combined with 100 objects. After retries and sync, all objects must
+/// be readable from their writers.
+///
+/// Simulates a congested WAN link where QUIC streams experience both
+/// latency spikes and packet drops.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_intermittent_transport_many_objects() {
+    let chaos = ChaosConfig {
+        latency_ms: (10, 40),
+        drop_rate: 0.15,
+        seed: 808,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos_and_replication(5, 1024, 2, 1, 2, chaos).await;
+
+    let n_objects = 100;
+    let mut objects: Vec<(String, Vec<u8>, usize)> = Vec::new();
+
+    for i in 0..n_objects {
+        let writer = i % 5;
+        let key = format!("inter-{i:03}");
+        let data = test_data(500 + i * 30);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("write {key} on node {writer} failed: {e}"));
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data, writer));
+    }
+
+    // Multiple retry rounds to flush pending pushes through the lossy link.
+    for _round in 0..5 {
+        for i in 0..5 {
+            c.node(i).retry_pending_pushes().await;
+        }
+    }
+
+    // Sync manifests in case broadcasts were dropped.
+    for i in 0..5 {
+        let _ = c.node(i).sync_manifests_from_peers().await;
+    }
+
+    // All objects must be readable from their writer (writers always have
+    // local shards, so this must succeed regardless of network chaos).
+    for (key, expected, writer) in &objects {
+        let (got, _) = c
+            .node(*writer)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("writer {writer} can't read {key}: {e}"));
+        assert_eq!(&got, expected, "data mismatch for {key} on writer {writer}");
+    }
+
+    // Verify chaos stats show some dropped messages.
+    let stats = c.chaos_controller.as_ref().unwrap().stats();
+    assert!(stats.dropped > 0, "should have dropped messages: {stats:?}");
+    assert!(
+        stats.delivered > stats.dropped,
+        "most messages should still be delivered: {stats:?}"
+    );
+}
+
+/// All faults combined: latency + drops + slow store + partitions + node kills.
+///
+/// The kitchen sink test. If the system survives this, it can handle
+/// whatever QUIC throws at it. A 7-node cluster with:
+/// - 15-60ms transport latency
+/// - 5% message drop rate
+/// - 10-30ms store IO latency
+/// - One node permanently killed
+/// - One node temporarily partitioned then healed
+///
+/// 30 objects written and verified.
+#[tokio::test]
+#[ntest::timeout(60000)]
+async fn test_chaos_all_faults_combined() {
+    let chaos = ChaosConfig {
+        latency_ms: (15, 60),
+        drop_rate: 0.05,
+        store_read_latency_ms: (10, 30),
+        store_write_latency_ms: (10, 30),
+        seed: 1337,
+    };
+
+    let c = TestCluster::with_chaos_and_replication(7, 1024, 2, 1, 3, chaos).await;
+    let controller = c.chaos_controller.as_ref().unwrap();
+
+    // Phase 1: write 10 objects normally.
+    let mut objects: Vec<(String, Vec<u8>, usize)> = Vec::new();
+    for i in 0..10 {
+        let writer = i % 7;
+        let key = format!("chaos-all-{i}");
+        let data = test_data(1000 + i * 100);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data, writer));
+    }
+
+    // Phase 2: kill node 6, partition node 5 from nodes 0-3.
+    c.kill_node(6).await;
+    controller.partition(c.node_ids[5], c.node_ids[0]).await;
+    controller.partition(c.node_ids[5], c.node_ids[1]).await;
+    controller.partition(c.node_ids[5], c.node_ids[2]).await;
+    controller.partition(c.node_ids[5], c.node_ids[3]).await;
+
+    // Phase 3: write 10 more objects under degraded conditions.
+    for i in 10..20 {
+        let writer = i % 5; // only nodes 0-4 as writers
+        let key = format!("chaos-all-{i}");
+        let data = test_data(1000 + i * 100);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("write {key} under chaos failed: {e}"));
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data, writer));
+    }
+
+    // Phase 4: heal partition, write 10 more.
+    controller.heal(c.node_ids[5], c.node_ids[0]).await;
+    controller.heal(c.node_ids[5], c.node_ids[1]).await;
+    controller.heal(c.node_ids[5], c.node_ids[2]).await;
+    controller.heal(c.node_ids[5], c.node_ids[3]).await;
+
+    for i in 20..30 {
+        let writer = i % 6; // nodes 0-5, node 6 still dead
+        let key = format!("chaos-all-{i}");
+        let data = test_data(1000 + i * 100);
+        c.node(writer)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap_or_else(|e| panic!("write {key} post-heal failed: {e}"));
+        c.broadcast_manifest(writer, "b", &key).await;
+        objects.push((key, data, writer));
+    }
+
+    // Phase 5: retry and sync.
+    for _round in 0..3 {
+        for i in 0..6 {
+            c.node(i).retry_pending_pushes().await;
+        }
+    }
+    for i in 0..6 {
+        let _ = c.node(i).sync_manifests_from_peers().await;
+    }
+
+    // Phase 6: verify all 30 objects from their writers.
+    for (key, expected, writer) in &objects {
+        let (got, _) = c
+            .node(*writer)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("writer {writer} can't read {key}: {e}"));
+        assert_eq!(&got, expected, "data mismatch for {key}");
+    }
+
+    // Verify the chaos layer exercised all fault types.
+    let stats = controller.stats();
+    assert!(stats.delivered > 0, "should have delivered: {stats:?}");
+    assert!(stats.dropped > 0, "should have dropped: {stats:?}");
+    assert!(stats.partitioned > 0, "should have partitioned: {stats:?}");
+}
+
+/// Writer reads from local shards even when all peers are partitioned.
+///
+/// When every QUIC connection is broken, the writer must still serve reads
+/// from its own store. This validates the local-first read path.
+///
+/// The key insight: we partition BEFORE writing so all remote pushes fail,
+/// forcing the writer to retain every shard locally (the ACK-based cleanup
+/// only deletes local copies after a *successful* push).
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_chaos_read_under_full_partition_uses_local_shards() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 10),
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos_and_replication(5, 1024, 2, 1, 3, chaos).await;
+    let controller = c.chaos_controller.as_ref().unwrap();
+
+    // Fully isolate node 0 from everyone BEFORE writing.
+    // This ensures all pushes fail and node 0 retains all shards locally.
+    for i in 1..5 {
+        controller.partition(c.node_ids[0], c.node_ids[i]).await;
+    }
+
+    // Write objects while fully partitioned — all pushes will fail.
+    let mut objects = Vec::new();
+    for i in 0..5 {
+        let key = format!("isolated-{i}");
+        let data = test_data(2000 + i * 200);
+        c.node(0)
+            .put_object("b", &key, &data, BTreeMap::new())
+            .await
+            .unwrap();
+        objects.push((key, data));
+    }
+
+    // Node 0 should read all objects from its local shards despite isolation.
+    for (key, expected) in &objects {
+        let (got, _) = c
+            .node(0)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("isolated node 0 can't read {key}: {e}"));
+        assert_eq!(&got, expected, "isolated read mismatch for {key}");
+    }
+
+    // Heal the partition.
+    for i in 1..5 {
+        controller.heal(c.node_ids[0], c.node_ids[i]).await;
+    }
+
+    // Retry pending pushes so shards land on ring owners.
+    for _round in 0..3 {
+        c.node(0).retry_pending_pushes().await;
+    }
+
+    // Broadcast manifests so other nodes learn about the objects.
+    for (key, _) in &objects {
+        c.broadcast_manifest(0, "b", key).await;
+    }
+
+    // Other nodes should now be able to read.
+    for (key, expected) in &objects {
+        let (got, _) = c
+            .node(1)
+            .get_object("b", key)
+            .await
+            .unwrap_or_else(|e| panic!("node 1 can't read {key} post-heal: {e}"));
+        assert_eq!(&got, expected, "post-heal mismatch for {key}");
+    }
+
+    // Verify the chaos layer saw partitioned messages.
+    let stats = controller.stats();
+    assert!(
+        stats.partitioned > 0,
+        "should have partitioned messages: {stats:?}"
     );
 }
