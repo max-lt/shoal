@@ -212,17 +212,22 @@ pub(crate) async fn get_object_handler(
 // -----------------------------------------------------------------------
 
 /// Delete an object.
+///
+/// S3 spec: DELETE is idempotent — deleting a non-existent key returns 204.
 pub(crate) async fn delete_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<axum::response::Response, S3Error> {
-    state
-        .engine
-        .delete_object(&bucket, &key)
-        .await
-        .map_err(|e| engine_to_s3(e, &bucket, &key))?;
-
-    info!(bucket = %bucket, key = %key, "delete_object");
+    match state.engine.delete_object(&bucket, &key).await {
+        Ok(()) => {
+            info!(bucket = %bucket, key = %key, "delete_object");
+        }
+        Err(shoal_engine::EngineError::ObjectNotFound { .. }) => {
+            // S3 spec: DELETE is idempotent, return 204 for non-existent keys.
+            tracing::debug!(bucket = %bucket, key = %key, "delete_object: key not found, returning 204");
+        }
+        Err(e) => return Err(engine_to_s3(e, &bucket, &key)),
+    }
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

@@ -8,18 +8,30 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
 use shoal_cluster::membership::MembershipHandle;
-use shoal_logtree::LogTree;
+use shoal_logtree::{LogEntry, LogTree, LogTreeError};
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
 use shoal_types::{Manifest, NodeId, ObjectId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// Maximum number of entries in the pending buffer before we start dropping.
+const PENDING_BUFFER_CAP: usize = 1000;
+
+/// An entry waiting for its parents to arrive.
+pub(crate) struct PendingEntry {
+    entry: LogEntry,
+    manifest_bytes: Option<Vec<u8>>,
+}
+
+/// Type alias for the shared pending entry buffer.
+pub type PendingBuffer = Arc<Mutex<Vec<PendingEntry>>>;
 
 /// Handles incoming Shoal protocol connections.
 ///
@@ -33,6 +45,8 @@ pub struct ShoalProtocol {
     membership: Arc<MembershipHandle>,
     address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
     log_tree: Option<Arc<LogTree>>,
+    /// Buffer for log entries that arrived before their parents.
+    pending_entries: Arc<Mutex<Vec<PendingEntry>>>,
 }
 
 impl fmt::Debug for ShoalProtocol {
@@ -55,6 +69,7 @@ impl ShoalProtocol {
             membership,
             address_book,
             log_tree: None,
+            pending_entries: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -63,6 +78,71 @@ impl ShoalProtocol {
         self.log_tree = Some(log_tree);
         self
     }
+
+    /// Return a clone of the pending entry buffer for external drain calls.
+    pub fn pending_buffer(&self) -> PendingBuffer {
+        self.pending_entries.clone()
+    }
+}
+
+/// Drain pending log entries from an external context (e.g. after sync).
+///
+/// Call this after `sync_log_from_peers()` to flush entries that arrived
+/// before their parents were synced.
+pub fn drain_pending_log_entries(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usize {
+    drain_pending(log_tree, pending)
+}
+
+/// Try to apply buffered pending entries whose parents may now be available.
+///
+/// Returns the number of entries successfully applied.
+fn drain_pending(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usize {
+    let mut buf = pending.lock().expect("pending lock poisoned");
+
+    if buf.is_empty() {
+        return 0;
+    }
+
+    let mut applied = 0;
+    let mut i = 0;
+
+    while i < buf.len() {
+        let manifest = buf[i]
+            .manifest_bytes
+            .as_ref()
+            .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
+
+        match log_tree.receive_entry(&buf[i].entry, manifest.as_ref()) {
+            Ok(true) => {
+                debug!("applied pending log entry");
+                buf.swap_remove(i);
+                applied += 1;
+                // Don't increment i — swap_remove moved the last element here.
+            }
+            Ok(false) => {
+                // Already known — drop from buffer.
+                buf.swap_remove(i);
+            }
+            Err(LogTreeError::MissingParents(_)) => {
+                // Still missing parents — keep in buffer.
+                i += 1;
+            }
+            Err(e) => {
+                warn!(%e, "dropping invalid pending log entry");
+                buf.swap_remove(i);
+            }
+        }
+    }
+
+    if applied > 0 {
+        debug!(
+            applied,
+            remaining = buf.len(),
+            "drained pending log entries"
+        );
+    }
+
+    applied
 }
 
 impl iroh::protocol::ProtocolHandler for ShoalProtocol {
@@ -82,12 +162,14 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         let store_uni = self.store.clone();
         let meta_uni = self.meta.clone();
         let log_tree_uni = self.log_tree.clone();
+        let pending_uni = self.pending_entries.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
                 let store = store_uni.clone();
                 let meta = meta_uni.clone();
                 let log_tree = log_tree_uni.clone();
+                let pending = pending_uni.clone();
                 async move {
                     match msg {
                         ShoalMessage::SwimData(data) => {
@@ -106,17 +188,42 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             manifest_bytes,
                         } => {
                             if let Some(log_tree) = &log_tree {
-                                match postcard::from_bytes::<shoal_logtree::LogEntry>(&entry_bytes)
-                                {
+                                match postcard::from_bytes::<LogEntry>(&entry_bytes) {
                                     Ok(entry) => {
                                         let manifest = manifest_bytes
                                             .as_ref()
                                             .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
+
                                         match log_tree.receive_entry(&entry, manifest.as_ref()) {
                                             Ok(true) => {
                                                 debug!("stored log entry");
+                                                // Try to drain buffered entries now that
+                                                // a new entry (potential parent) is available.
+                                                drain_pending(log_tree, &pending);
                                             }
                                             Ok(false) => {} // already known
+                                            Err(LogTreeError::MissingParents(_)) => {
+                                                // Buffer for retry — parents may arrive later.
+                                                let mut buf =
+                                                    pending.lock().expect("pending lock poisoned");
+
+                                                if buf.len() >= PENDING_BUFFER_CAP {
+                                                    warn!(
+                                                        cap = PENDING_BUFFER_CAP,
+                                                        "pending entry buffer full, dropping oldest"
+                                                    );
+                                                    buf.remove(0);
+                                                }
+
+                                                buf.push(PendingEntry {
+                                                    entry,
+                                                    manifest_bytes,
+                                                });
+                                                debug!(
+                                                    pending = buf.len(),
+                                                    "buffered log entry with missing parents"
+                                                );
+                                            }
                                             Err(e) => {
                                                 warn!(
                                                     %e,

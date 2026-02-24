@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::put;
@@ -116,6 +116,11 @@ impl S3Server {
                 "/{bucket}",
                 put(handlers::create_bucket).get(handlers::list_objects),
             )
+            // Trailing-slash variant — S3 clients often send GET /bucket/.
+            .route(
+                "/{bucket}/",
+                put(handlers::create_bucket).get(handlers::list_objects),
+            )
             // Object-level operations (key may contain slashes).
             .route(
                 "/{bucket}/{*key}",
@@ -129,6 +134,8 @@ impl S3Server {
                 state.clone(),
                 auth_middleware,
             ))
+            // Allow uploads up to 5 GiB (S3 single-PUT max).
+            .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
             .with_state(state)
     }
 
