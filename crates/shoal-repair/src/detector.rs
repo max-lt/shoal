@@ -7,7 +7,8 @@
 //! - Periodically: scans local shards, verifies they match ring placement,
 //!   and reports anomalies.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
@@ -22,6 +23,9 @@ pub struct RepairDetector {
     meta: Arc<MetaStore>,
     store: Arc<dyn ShardStore>,
     replication_factor: usize,
+    /// Nodes already processed as dead/left — prevents duplicate repair enqueues
+    /// when the same event arrives via multiple channels (foca + gossip peers).
+    processed_dead: Mutex<HashSet<NodeId>>,
 }
 
 impl RepairDetector {
@@ -37,6 +41,7 @@ impl RepairDetector {
             meta,
             store,
             replication_factor,
+            processed_dead: Mutex::new(HashSet::new()),
         }
     }
 
@@ -64,13 +69,25 @@ impl RepairDetector {
     async fn handle_event(&self, event: ClusterEvent) {
         match event {
             ClusterEvent::NodeDead(node_id) => {
+                if !self.processed_dead.lock().unwrap().insert(node_id) {
+                    debug!(%node_id, "ignoring duplicate NodeDead event");
+                    return;
+                }
+
                 info!(%node_id, "node declared dead — scanning for affected shards");
+
                 if let Err(e) = self.handle_node_dead(node_id).await {
                     error!(%node_id, error = %e, "failed to enqueue repairs for dead node");
                 }
             }
             ClusterEvent::NodeLeft(node_id) => {
+                if !self.processed_dead.lock().unwrap().insert(node_id) {
+                    debug!(%node_id, "ignoring duplicate NodeLeft event");
+                    return;
+                }
+
                 info!(%node_id, "node left — scanning for affected shards");
+
                 if let Err(e) = self.handle_node_dead(node_id).await {
                     error!(%node_id, error = %e, "failed to enqueue repairs for departed node");
                 }
@@ -80,6 +97,10 @@ impl RepairDetector {
                 if let Err(e) = self.enqueue_shard(shard_id).await {
                     error!(%shard_id, error = %e, "failed to enqueue shard for repair");
                 }
+            }
+            ClusterEvent::NodeJoined(member) => {
+                // Clear from processed set so a future death is handled.
+                self.processed_dead.lock().unwrap().remove(&member.node_id);
             }
             _ => {}
         }
