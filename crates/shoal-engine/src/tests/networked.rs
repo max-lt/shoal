@@ -396,10 +396,23 @@ impl TestCluster {
         }
     }
 
-    /// Mark a node as "down" — transport calls to it will fail.
+    /// Mark a node as "down" — transport calls to it will fail and the ring
+    /// is updated to remove it.
     async fn kill_node(&self, i: usize) {
         self.down_nodes.write().await.insert(self.node_ids[i]);
         self.cluster.mark_dead(&self.node_ids[i]).await;
+    }
+
+    /// Make a node unreachable at the transport level WITHOUT removing it
+    /// from the ring. This simulates a transient network failure: the node
+    /// is still in the ring (shards are assigned to it) but pushes/pulls fail.
+    async fn disconnect_node(&self, i: usize) {
+        self.down_nodes.write().await.insert(self.node_ids[i]);
+    }
+
+    /// Reconnect a previously disconnected node (transport only).
+    async fn reconnect_node(&self, i: usize) {
+        self.down_nodes.write().await.remove(&self.node_ids[i]);
     }
 
     /// Mark a node as "alive" again after being killed.
@@ -1710,4 +1723,171 @@ async fn test_logtree_overwrite_after_sync() {
     // Node 2 should read v2 via LWW.
     let (got, _) = c.node(2).get_object("b", "key.txt").await.unwrap();
     assert_eq!(got, v2, "node 2 should read v2 after sync");
+}
+
+// =========================================================================
+// Regression: writer stores all shards locally (shard push failure durability)
+// =========================================================================
+
+/// When ALL remote shard pushes fail during write (all peers disconnected),
+/// the writer must hold ALL shards locally so other nodes can pull them later.
+///
+/// Regression test for: "not enough shards for chunk 0: need 2, found 1"
+/// when reading from a non-writer node after push targets were unreachable.
+#[tokio::test]
+async fn test_write_with_disconnected_peers_then_read_from_other() {
+    // 3-node cluster, k=2 m=1 → 3 shards per chunk, shard_replication=1.
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+    let data = test_data(10_000); // ~10 chunks
+
+    // Disconnect nodes 1 and 2 at the transport level — they stay in the
+    // ring (shards are assigned to them) but pushes will fail.
+    c.disconnect_node(1).await;
+    c.disconnect_node(2).await;
+
+    // Write from node 0. The ring assigns shards to all 3 nodes, but
+    // pushes to nodes 1 and 2 fail. All pushes fail, so ACK cleanup
+    // doesn't trigger and the writer keeps everything.
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Verify: the writer should have stored ALL shards locally because
+    // every push failed (nothing was ACK'd and cleaned up).
+    let writer_shards = c.local_shard_count(0).await;
+    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
+    assert_eq!(
+        writer_shards, total_shards,
+        "writer must store ALL {total_shards} shards locally when all pushes fail, but only has {writer_shards}"
+    );
+
+    // Reconnect nodes and propagate manifest.
+    c.reconnect_node(1).await;
+    c.reconnect_node(2).await;
+    c.broadcast_manifest(0, "b", "k");
+
+    // Non-writer (node 1) should pull all shards from the writer and
+    // read successfully.
+    let (got, _) = c.node(1).get_object("b", "k").await.unwrap();
+    assert_eq!(got, data, "non-writer should read by pulling from writer");
+}
+
+// =========================================================================
+// ACK-based shard cleanup
+// =========================================================================
+
+/// When all peers are reachable, the writer should delete local copies of
+/// shards that were successfully pushed to their ring owners (and which the
+/// writer does not own). This prevents the writer from keeping all k+m
+/// shards per chunk, which would defeat erasure coding distribution.
+#[tokio::test]
+async fn test_ack_cleanup_frees_non_owned_shards() {
+    // 6-node cluster, k=4 m=2 → 6 shards per chunk. All nodes reachable.
+    let c = TestCluster::new(6, 1024, 4, 2).await;
+    let data = test_data(5000); // ~5 chunks → 30 total shards
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "k");
+
+    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
+
+    // The writer should have FEWER shards than total because ACK'd
+    // non-owned copies were deleted.
+    let writer_shards = c.local_shard_count(0).await;
+    assert!(
+        writer_shards < total_shards,
+        "writer should have fewer than {total_shards} shards after ACK cleanup, got {writer_shards}"
+    );
+
+    // All 6 nodes can still read the object.
+    for i in 0..6 {
+        let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
+        assert_eq!(got, data, "node {i} should read the object");
+    }
+}
+
+/// When some peers are disconnected during write, the writer queues failed
+/// pushes for background retry while still cleaning up ACK'd pushes.
+#[tokio::test]
+async fn test_partial_disconnect_queues_failed_pushes() {
+    // 3-node cluster, k=2 m=1 → 3 shards per chunk.
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+
+    // Disconnect node 2 only — node 1 stays reachable.
+    c.disconnect_node(2).await;
+
+    let data = test_data(5000); // ~5 chunks
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Writer should have pending pushes (shards destined for node 2).
+    let pending = c.node(0).pending_push_count();
+    assert!(
+        pending > 0,
+        "writer should have pending pushes for disconnected node 2, got {pending}"
+    );
+
+    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
+
+    // The writer should NOT have all shards — ACK'd pushes to node 1
+    // should have been cleaned up.
+    let writer_shards = c.local_shard_count(0).await;
+    assert!(
+        writer_shards < total_shards,
+        "writer should have fewer than {total_shards} shards (ACK'd ones cleaned), got {writer_shards}"
+    );
+}
+
+/// After reconnecting a previously disconnected node, calling
+/// `retry_pending_pushes()` should successfully push the queued shards
+/// and clean up local copies.
+#[tokio::test]
+async fn test_retry_pending_pushes_cleans_up() {
+    // 3-node cluster, k=2 m=1 → 3 shards per chunk.
+    let c = TestCluster::new(3, 1024, 2, 1).await;
+
+    // Disconnect node 2.
+    c.disconnect_node(2).await;
+
+    let data = test_data(5000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "k");
+
+    // Verify pending pushes exist.
+    assert!(
+        c.node(0).pending_push_count() > 0,
+        "should have pending pushes before retry"
+    );
+
+    // Reconnect node 2 and retry.
+    c.reconnect_node(2).await;
+    let succeeded = c.node(0).retry_pending_pushes().await;
+    assert!(succeeded > 0, "retry should succeed after reconnect");
+
+    // No more pending pushes.
+    assert_eq!(
+        c.node(0).pending_push_count(),
+        0,
+        "pending pushes should be drained after retry"
+    );
+
+    // All nodes can read the object.
+    for i in 0..3 {
+        let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
+        assert_eq!(got, data, "node {i} should read after retry");
+    }
 }

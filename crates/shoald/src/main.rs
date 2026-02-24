@@ -473,6 +473,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         address_book.clone(),
     )
     .with_log_tree(log_tree.clone());
+    let pending_entries = protocol.pending_buffer();
     let router = Router::builder(endpoint.clone())
         .accept(cluster_alpn, protocol)
         .accept(GOSSIP_ALPN, gossip)
@@ -622,6 +623,20 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         "repair subsystem started"
     );
 
+    // --- Pending push retry loop ---
+    // Retries shard pushes that failed during writes (transient network issues).
+    // On success the local copy is deleted, freeing storage on the writer.
+    {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                let _ = engine.retry_pending_pushes().await;
+            }
+        });
+    }
+
     // --- Log sync (catch up on historical mutations from peers) ---
     // This is necessary because log entry broadcasts are point-in-time: if
     // this node is joining an existing cluster, it missed all previous
@@ -629,6 +644,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     // DAG tips, allowing efficient delta sync.
     if !config.cluster.peers.is_empty() {
         let engine_sync = engine.clone();
+        let log_tree_sync = log_tree.clone();
+        let pending_sync = pending_entries.clone();
         tokio::spawn(async move {
             // Small delay to let SWIM handshake establish connections.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -636,6 +653,12 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                 Ok(0) => debug!("log sync: nothing new from peers"),
                 Ok(n) => info!(count = n, "log sync: caught up on historical mutations"),
                 Err(e) => warn!(%e, "log sync failed (will retry on next restart)"),
+            }
+            // Drain any entries that were buffered while waiting for sync.
+            let drained = handler::drain_pending_log_entries(&log_tree_sync, &pending_sync);
+
+            if drained > 0 {
+                info!(count = drained, "applied buffered log entries after sync");
             }
         });
     }

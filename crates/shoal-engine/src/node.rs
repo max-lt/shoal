@@ -5,7 +5,7 @@
 //! objects.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use iroh::EndpointAddr;
 use shoal_cas::{Chunker, build_manifest};
@@ -21,6 +21,12 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ShardCache;
 use crate::error::EngineError;
+
+/// A shard that failed to push to its ring owner and needs retry.
+struct PendingPush {
+    shard_id: ShardId,
+    target_node: NodeId,
+}
 
 /// Configuration for creating a [`ShoalNode`].
 pub struct ShoalNodeConfig {
@@ -108,6 +114,11 @@ pub struct ShoalNode {
     /// manifest cache) and replaces ManifestPut broadcasts with LogEntry
     /// broadcasts.
     log_tree: Option<Arc<LogTree>>,
+    /// Shards that failed to push to ring owners and need background retry.
+    ///
+    /// Uses `std::sync::Mutex` (not tokio) — the critical section is pure
+    /// in-memory Vec ops with no I/O.
+    pending_pushes: Mutex<Vec<PendingPush>>,
 }
 
 impl ShoalNode {
@@ -134,6 +145,7 @@ impl ShoalNode {
             shard_cache: ShardCache::new(config.cache_max_bytes),
             deleted_keys: RwLock::new(HashSet::new()),
             log_tree: None,
+            pending_pushes: Mutex::new(Vec::new()),
         }
     }
 
@@ -181,6 +193,98 @@ impl ShoalNode {
     }
 
     // ------------------------------------------------------------------
+    // Pending push retry
+    // ------------------------------------------------------------------
+
+    /// Retry pushing shards that failed during previous writes.
+    ///
+    /// Takes all pending pushes, attempts to send each to the correct ring
+    /// owner, and deletes the local copy on success. Failed retries are
+    /// re-queued for the next cycle.
+    ///
+    /// Returns the number of successfully retried pushes.
+    pub async fn retry_pending_pushes(&self) -> usize {
+        let transport = match &self.transport {
+            Some(t) => t.clone(),
+            None => return 0,
+        };
+
+        let pushes: Vec<PendingPush> =
+            { std::mem::take(&mut *self.pending_pushes.lock().expect("lock poisoned")) };
+
+        if pushes.is_empty() {
+            return 0;
+        }
+
+        let ring = self.cluster.ring().await;
+        let mut still_pending = Vec::new();
+        let mut succeeded = 0usize;
+
+        for push in pushes {
+            // Shard cleaned up or no longer locally stored? Skip.
+            if !self.store.contains(push.shard_id).await.unwrap_or(false) {
+                continue;
+            }
+
+            let owners = ring.owners(&push.shard_id, self.shard_replication);
+
+            // We became the owner (ring changed)? No push needed.
+            if owners.contains(&self.node_id) {
+                succeeded += 1;
+                continue;
+            }
+
+            // Re-target if the ring changed and original target is no longer an owner.
+            let target = if owners.contains(&push.target_node) {
+                push.target_node
+            } else {
+                owners[0]
+            };
+
+            let data = match self.store.get(push.shard_id).await.ok().flatten() {
+                Some(d) => d,
+                None => continue,
+            };
+
+            if let Some(addr) = self.resolve_addr(&target).await {
+                match transport.push_shard(addr, push.shard_id, data).await {
+                    Ok(()) => {
+                        let _ = self.store.delete(push.shard_id).await;
+                        succeeded += 1;
+                    }
+                    Err(_) => still_pending.push(PendingPush {
+                        shard_id: push.shard_id,
+                        target_node: target,
+                    }),
+                }
+            } else {
+                still_pending.push(PendingPush {
+                    shard_id: push.shard_id,
+                    target_node: target,
+                });
+            }
+        }
+
+        if !still_pending.is_empty() {
+            self.pending_pushes
+                .lock()
+                .expect("lock poisoned")
+                .extend(still_pending);
+        }
+
+        if succeeded > 0 {
+            info!(succeeded, "completed pending shard pushes");
+        }
+
+        succeeded
+    }
+
+    /// Return the number of shards awaiting retry.
+    pub fn pending_push_count(&self) -> usize {
+        self.pending_pushes.lock().expect("lock poisoned").len()
+    }
+
+    // ------------------------------------------------------------------
     // Write path
     // ------------------------------------------------------------------
 
@@ -224,30 +328,32 @@ impl ShoalNode {
                 // Determine owners via placement ring.
                 let owners = ring.owners(&shard.id, self.shard_replication);
 
-                // Store locally only if this node is an owner (or if there
-                // is no transport — single-node / test mode).
-                let local_is_owner = owners.contains(&self.node_id);
-                if local_is_owner || self.transport.is_none() {
-                    let already_exists = self.store.contains(shard.id).await?;
+                // Always store every shard locally. The writer is the only
+                // node guaranteed to have the data; remote pushes can fail
+                // (transient network issues, slow peer startup) and with
+                // shard_replication=1 a failed push means the shard is lost.
+                // Keeping a full local copy ensures reads can always pull
+                // from the writer as a fallback. Non-owned shards will be
+                // cleaned up by background rebalancing once pushes succeed.
+                let already_exists = self.store.contains(shard.id).await?;
 
-                    self.store.put(shard.id, shard.data.clone()).await?;
+                self.store.put(shard.id, shard.data.clone()).await?;
 
-                    if already_exists {
-                        local_existing += 1;
-                        debug!(
-                            shard = %shard.id,
-                            index = shard.index,
-                            "shard already exists locally, skipped"
-                        );
-                    } else {
-                        local_new += 1;
-                        debug!(
-                            shard = %shard.id,
-                            index = shard.index,
-                            size = shard.data.len(),
-                            "new shard stored locally"
-                        );
-                    }
+                if already_exists {
+                    local_existing += 1;
+                    debug!(
+                        shard = %shard.id,
+                        index = shard.index,
+                        "shard already exists locally, skipped"
+                    );
+                } else {
+                    local_new += 1;
+                    debug!(
+                        shard = %shard.id,
+                        index = shard.index,
+                        size = shard.data.len(),
+                        "new shard stored locally"
+                    );
                 }
 
                 // Push to remote owners (spawned in parallel).
@@ -256,6 +362,7 @@ impl ShoalNode {
                         if *owner == self.node_id {
                             continue;
                         }
+
                         if let Some(addr) = self.resolve_addr(owner).await {
                             remote_pushed += 1;
                             let transport = transport.clone();
@@ -263,14 +370,17 @@ impl ShoalNode {
                             let shard_id = shard.id;
                             let data = shard.data.clone();
                             push_tasks.spawn(async move {
-                                if let Err(e) = transport.push_shard(addr, shard_id, data).await {
+                                let success =
+                                    transport.push_shard(addr, shard_id, data).await.is_ok();
+
+                                if !success {
                                     warn!(
                                         target_node = %owner_id,
-                                        shard_id = %shard_id,
-                                        %e,
+                                        %shard_id,
                                         "failed to push shard to remote owner"
                                     );
                                 }
+                                (shard_id, owner_id, success)
                             });
                         }
                     }
@@ -294,11 +404,44 @@ impl ShoalNode {
             });
         }
 
-        // Wait for all remote shard pushes to complete.
-        while let Some(res) = push_tasks.join_next().await {
-            if let Err(e) = res {
-                warn!(%e, "shard push task panicked");
+        // Wait for all remote shard pushes to complete, tracking results.
+        let mut failed_pushes: Vec<PendingPush> = Vec::new();
+
+        while let Some(join_result) = push_tasks.join_next().await {
+            match join_result {
+                Ok((shard_id, target_node, true)) => {
+                    // ACK'd — delete local copy if writer is not a ring owner.
+                    let owners = ring.owners(&shard_id, self.shard_replication);
+
+                    if !owners.contains(&self.node_id) {
+                        self.store.delete(shard_id).await?;
+                        debug!(
+                            shard = %shard_id,
+                            target = %target_node,
+                            "deleted local copy after successful push"
+                        );
+                    }
+                }
+                Ok((shard_id, target_node, false)) => {
+                    // Push failed — keep local copy, queue for retry.
+                    failed_pushes.push(PendingPush {
+                        shard_id,
+                        target_node,
+                    });
+                }
+                Err(e) => warn!(%e, "shard push task panicked"),
             }
+        }
+
+        if !failed_pushes.is_empty() {
+            info!(
+                count = failed_pushes.len(),
+                "queued failed pushes for background retry"
+            );
+            self.pending_pushes
+                .lock()
+                .expect("lock poisoned")
+                .extend(failed_pushes);
         }
 
         info!(
