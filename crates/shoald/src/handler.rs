@@ -156,17 +156,15 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .await
             .insert(remote_node_id, remote_addr);
 
-        // Spawn a handler for uni-directional streams (SWIM data, shard push, manifest, log entries).
+        // Spawn a handler for uni-directional streams (SWIM data, manifest, log entries).
         let conn_uni = conn.clone();
         let membership = self.membership.clone();
-        let store_uni = self.store.clone();
         let meta_uni = self.meta.clone();
         let log_tree_uni = self.log_tree.clone();
         let pending_uni = self.pending_entries.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
-                let store = store_uni.clone();
                 let meta = meta_uni.clone();
                 let log_tree = log_tree_uni.clone();
                 let pending = pending_uni.clone();
@@ -175,12 +173,6 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                         ShoalMessage::SwimData(data) => {
                             if let Err(e) = membership.feed_data(data) {
                                 warn!(%e, "failed to feed SWIM data");
-                            }
-                        }
-                        ShoalMessage::ShardPush { shard_id, data } => {
-                            debug!(%shard_id, len = data.len(), "received shard push");
-                            if let Err(e) = store.put(shard_id, bytes::Bytes::from(data)).await {
-                                warn!(%shard_id, %e, "failed to store pushed shard");
                             }
                         }
                         ShoalMessage::LogEntryBroadcast {
@@ -293,6 +285,14 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                 let log_tree = log_tree_bi.clone();
                 async move {
                     match msg {
+                        ShoalMessage::ShardPush { shard_id, data } => {
+                            debug!(%shard_id, len = data.len(), "received shard push (bi-stream)");
+                            let ok = store.put(shard_id, bytes::Bytes::from(data)).await.is_ok();
+                            if !ok {
+                                warn!(%shard_id, "failed to store pushed shard");
+                            }
+                            Some(ShoalMessage::ShardPushAck { shard_id, ok })
+                        }
                         ShoalMessage::ShardRequest { shard_id } => {
                             let data = store.get(shard_id).await.ok().flatten();
                             Some(ShoalMessage::ShardResponse {

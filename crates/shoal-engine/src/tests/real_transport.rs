@@ -144,11 +144,33 @@ impl Transport for QuinnTransport {
             .await
             .ok_or_else(|| NetError::Connect("unknown peer".into()))?;
         let conn = self.get_connection(sock).await?;
+
+        // Bi-stream: send ShardPush, wait for ShardPushAck.
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
         let msg = ShoalMessage::ShardPush {
             shard_id,
             data: data.to_vec(),
         };
-        Self::send_message(&conn, &msg).await
+        Self::send_on_stream(&mut send, &msg).await?;
+
+        let response = Self::recv_message(&mut recv).await?;
+        match response {
+            ShoalMessage::ShardPushAck { ok, .. } => {
+                if !ok {
+                    return Err(NetError::Connect(format!(
+                        "remote rejected shard {shard_id}"
+                    )));
+                }
+                Ok(())
+            }
+            other => Err(NetError::Serialization(format!(
+                "expected ShardPushAck, got: {other:?}"
+            ))),
+        }
     }
 
     async fn pull_shard(
@@ -290,9 +312,9 @@ impl Transport for QuinnTransport {
 /// Spawn a protocol handler loop for incoming connections on a quinn endpoint.
 ///
 /// Mirrors the production `ShoalProtocol` handler in `shoald/src/handler.rs`:
-/// - Uni streams: `ShardPush`, `ManifestPut`
-/// - Bi streams: `ShardRequest`→`ShardResponse`, `ManifestRequest`→`ManifestResponse`,
-///   `ManifestSyncRequest`→`ManifestSyncResponse`
+/// - Uni streams: `ManifestPut`
+/// - Bi streams: `ShardPush`→`ShardPushAck`, `ShardRequest`→`ShardResponse`,
+///   `ManifestRequest`→`ManifestResponse`, `ManifestSyncRequest`→`ManifestSyncResponse`
 fn spawn_protocol_handler(
     endpoint: iroh_quinn::Endpoint,
     store: Arc<dyn ShardStore>,
@@ -305,9 +327,8 @@ fn spawn_protocol_handler(
                 Err(_) => continue,
             };
 
-            // Spawn uni-stream handler.
+            // Spawn uni-stream handler (ManifestPut only — ShardPush moved to bi-stream).
             let conn_uni = conn.clone();
-            let store_uni = store.clone();
             let meta_uni = meta.clone();
             tokio::spawn(async move {
                 while let Ok(mut recv) = conn_uni.accept_uni().await {
@@ -315,11 +336,6 @@ fn spawn_protocol_handler(
                         break;
                     };
                     match msg {
-                        ShoalMessage::ShardPush { shard_id, data } => {
-                            if let Err(e) = store_uni.put(shard_id, Bytes::from(data)).await {
-                                warn!(%shard_id, %e, "handler: failed to store shard");
-                            }
-                        }
                         ShoalMessage::ManifestPut {
                             bucket,
                             key,
@@ -348,6 +364,10 @@ fn spawn_protocol_handler(
                             return;
                         };
                         let response = match request {
+                            ShoalMessage::ShardPush { shard_id, data } => {
+                                let ok = store.put(shard_id, Bytes::from(data)).await.is_ok();
+                                Some(ShoalMessage::ShardPushAck { shard_id, ok })
+                            }
                             ShoalMessage::ShardRequest { shard_id } => {
                                 let data = store.get(shard_id).await.ok().flatten();
                                 Some(ShoalMessage::ShardResponse {
@@ -635,14 +655,12 @@ async fn test_quic_large_object() {
     let c = QuicTestCluster::new(4, 65536, 2, 2).await;
     let data = test_data(1_000_000); // 1 MB
 
-    // PUT on node 0.
+    // PUT on node 0. With ACK-based push, shards are confirmed stored on
+    // remote nodes before put_object returns — no sleep needed.
     c.node(0)
         .put_object("bucket", "bigfile", &data, BTreeMap::new())
         .await
         .unwrap();
-
-    // Wait for all uni-stream pushes to be processed by remote nodes.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Broadcast manifest.
     c.broadcast_manifest(0, "bucket", "bigfile").await;
@@ -706,14 +724,12 @@ async fn test_quic_concurrent_writes() {
         handles.push(handle);
     }
 
-    // Wait for all writes to complete.
+    // Wait for all writes to complete. ACK-based push guarantees shards
+    // are stored on remote nodes — no sleep needed.
     let mut results: Vec<(String, Vec<u8>)> = Vec::new();
     for h in handles {
         results.push(h.await.unwrap());
     }
-
-    // Wait for all uni-stream pushes to be processed by remote nodes.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Broadcast all manifests.
     for (key, _) in &results {
@@ -753,8 +769,9 @@ async fn test_quic_manifest_sync_from_peers() {
         objects.push((key, data));
     }
 
-    // Wait for all shard pushes and manifest broadcasts to settle.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Manifest broadcasts are uni-stream (fire-and-forget), so a short
+    // yield is sufficient for the async runtime to process them.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     // Verify all nodes received manifests via broadcast.
     for i in 0..4 {

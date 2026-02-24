@@ -11,12 +11,26 @@ use shoal_types::{ClusterEvent, Member, ObjectId, ShardId};
 /// over a QUIC stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShoalMessage {
-    /// Push a shard to a remote node.
+    /// Push a shard to a remote node (bi-directional, expects [`ShardPushAck`]).
+    ///
+    /// Sent on a bi-stream so the sender can wait for an ACK confirming the
+    /// receiver has stored the shard before deleting its local copy.
     ShardPush {
         /// Content-addressed ID of the shard.
         shard_id: ShardId,
         /// Raw shard data.
         data: Vec<u8>,
+    },
+
+    /// Acknowledgement that a pushed shard was stored successfully.
+    ///
+    /// Sent as a response on the same bi-stream as the [`ShardPush`].
+    /// The sender must not delete its local copy until this ACK is received.
+    ShardPushAck {
+        /// ID of the shard that was stored.
+        shard_id: ShardId,
+        /// Whether the store succeeded.
+        ok: bool,
     },
 
     /// Request a shard from a remote node.
