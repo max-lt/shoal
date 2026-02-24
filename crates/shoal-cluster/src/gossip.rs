@@ -21,7 +21,7 @@ use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::proto::TopicId;
 use rand::RngCore;
-use shoal_types::{ClusterEvent, GossipMessage, GossipPayload};
+use shoal_types::{GossipMessage, GossipPayload};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -175,12 +175,6 @@ pub struct GossipHandle {
 }
 
 impl GossipHandle {
-    /// Broadcast a cluster event to all peers.
-    pub async fn broadcast_event(&self, event: &ClusterEvent) -> Result<(), ClusterError> {
-        self.broadcast_payload(&GossipPayload::Event(event.clone()))
-            .await
-    }
-
     /// Broadcast an arbitrary gossip payload to all peers.
     ///
     /// Each message is wrapped in a [`GossipMessage`] with a random nonce
@@ -204,38 +198,29 @@ impl GossipHandle {
 
 /// Background receiver loop that processes incoming gossip payloads.
 ///
-/// Membership events are applied to `ClusterState` directly. Data payloads
-/// (manifests, log entries) are forwarded to `payload_tx` for external
-/// processing by the caller.
+/// Data payloads (manifests, log entries, want/have) are forwarded to
+/// `payload_tx` for external processing. Membership events propagate
+/// via foca SWIM, not gossip.
 async fn run_receiver_loop(
     mut receiver: GossipReceiver,
-    state: Arc<ClusterState>,
+    _state: Arc<ClusterState>,
     payload_tx: mpsc::UnboundedSender<GossipPayload>,
 ) {
     info!("gossip receiver loop started");
 
     while let Some(event) = receiver.next().await {
         match event {
-            Ok(Event::Received(msg)) => {
-                match postcard::from_bytes::<GossipMessage>(&msg.content) {
-                    Ok(envelope) => match envelope.payload {
-                        GossipPayload::Event(cluster_event) => {
-                            debug!(?cluster_event, "received gossip event");
-                            state.emit_event(cluster_event);
-                        }
-                        payload => {
-                            // Forward manifest/log entry payloads to the caller.
-                            if payload_tx.send(payload).is_err() {
-                                warn!("gossip payload receiver dropped, stopping loop");
-                                break;
-                            }
-                        }
-                    },
-                    Err(e) => {
-                        warn!("failed to decode gossip message: {e}");
+            Ok(Event::Received(msg)) => match postcard::from_bytes::<GossipMessage>(&msg.content) {
+                Ok(envelope) => {
+                    if payload_tx.send(envelope.payload).is_err() {
+                        warn!("gossip payload receiver dropped, stopping loop");
+                        break;
                     }
                 }
-            }
+                Err(e) => {
+                    warn!("failed to decode gossip message: {e}");
+                }
+            },
             Ok(Event::NeighborUp(id)) => {
                 debug!(%id, "gossip neighbor up");
             }

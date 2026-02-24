@@ -14,7 +14,7 @@ use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
 use shoal_store::ShardStore;
 use shoal_types::{Manifest, NodeId, ShardId, ShardMeta};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::error::RepairError;
 use crate::throttle::Throttle;
@@ -137,7 +137,7 @@ impl RepairExecutor {
         // Update shard map.
         self.meta.put_shard_owners(&shard_id, &target_owners)?;
 
-        info!(%shard_id, size = shard_size, "shard repair complete");
+        debug!(%shard_id, size = shard_size, "shard repair complete");
         Ok(())
     }
 

@@ -1,6 +1,7 @@
 //! [`MetaStore`] implementation with Fjall (disk) and in-memory backends.
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::RwLock;
 
@@ -22,6 +23,7 @@ enum Backend {
         shardmap: Keyspace,
         membership: Keyspace,
         repair_queue: Keyspace,
+        peers: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -38,6 +40,8 @@ struct MemoryBackend {
     membership: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// priority (8 bytes BE) ++ ShardId → ShardId bytes.
     repair_queue: RwLock<BTreeMap<Vec<u8>, [u8; 32]>>,
+    /// NodeId bytes → serialized Vec<SocketAddr>.
+    peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -75,6 +79,7 @@ impl MetaStore {
                 shardmap: RwLock::new(HashMap::new()),
                 membership: RwLock::new(HashMap::new()),
                 repair_queue: RwLock::new(BTreeMap::new()),
+                peers: RwLock::new(HashMap::new()),
             })),
         }
     }
@@ -85,6 +90,7 @@ impl MetaStore {
         let shardmap = db.keyspace("shardmap", KeyspaceCreateOptions::default)?;
         let membership = db.keyspace("membership", KeyspaceCreateOptions::default)?;
         let repair_queue = db.keyspace("repair_queue", KeyspaceCreateOptions::default)?;
+        let peers = db.keyspace("peers", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -92,6 +98,7 @@ impl MetaStore {
             shardmap,
             membership,
             repair_queue,
+            peers,
         })
     }
 
@@ -367,6 +374,70 @@ impl MetaStore {
             }
         }
         debug!(node_id = %id, "removed member");
+        Ok(())
+    }
+
+    // ----- Peer addresses (local cache, for reconnecting after restart) -----
+
+    /// Store the known listen addresses of a peer.
+    pub fn put_peer_addrs(&self, node_id: &NodeId, addrs: &[SocketAddr]) -> Result<()> {
+        let value = postcard::to_allocvec(addrs)?;
+        match &self.backend {
+            Backend::Fjall { peers, .. } => {
+                peers.insert(node_id.as_bytes(), value.as_slice())?;
+            }
+            Backend::Memory(m) => {
+                m.peers.write().unwrap().insert(*node_id.as_bytes(), value);
+            }
+        }
+        debug!(node_id = %node_id, addr_count = addrs.len(), "stored peer addresses");
+        Ok(())
+    }
+
+    /// List all known peer addresses.
+    ///
+    /// Returns `(NodeId, Vec<SocketAddr>)` pairs for all persisted peers.
+    pub fn list_peer_addrs(&self) -> Result<Vec<(NodeId, Vec<SocketAddr>)>> {
+        match &self.backend {
+            Backend::Fjall { peers, .. } => {
+                let mut result = Vec::new();
+
+                for guard in peers.iter() {
+                    let (k, v) = guard.into_inner()?;
+                    let arr: [u8; 32] = k[..32].try_into().map_err(|_| {
+                        MetaError::CorruptData(format!("NodeId expected 32 bytes, got {}", k.len()))
+                    })?;
+                    let addrs: Vec<SocketAddr> = postcard::from_bytes(&v)?;
+                    result.push((NodeId::from(arr), addrs));
+                }
+
+                Ok(result)
+            }
+            Backend::Memory(m) => {
+                let map = m.peers.read().unwrap();
+                let mut result = Vec::new();
+
+                for (key, bytes) in map.iter() {
+                    let addrs: Vec<SocketAddr> = postcard::from_bytes(bytes)?;
+                    result.push((NodeId::from(*key), addrs));
+                }
+
+                Ok(result)
+            }
+        }
+    }
+
+    /// Remove a peer's persisted addresses.
+    pub fn remove_peer_addrs(&self, node_id: &NodeId) -> Result<()> {
+        match &self.backend {
+            Backend::Fjall { peers, .. } => {
+                peers.remove(node_id.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.peers.write().unwrap().remove(node_id.as_bytes());
+            }
+        }
+        debug!(node_id = %node_id, "removed peer addresses");
         Ok(())
     }
 
@@ -1160,5 +1231,69 @@ mod tests {
             assert_eq!(got.chunks.len(), 50);
             assert_eq!(got.chunks[0].shards.len(), 6);
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer address persistence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_peer_addrs_put_list() {
+        with_both_backends(|store| {
+            let node1 = NodeId::from_data(b"peer-1");
+            let node2 = NodeId::from_data(b"peer-2");
+
+            let addrs1: Vec<std::net::SocketAddr> = vec!["192.168.1.10:4820".parse().unwrap()];
+            let addrs2: Vec<std::net::SocketAddr> = vec![
+                "10.0.0.5:4820".parse().unwrap(),
+                "[::1]:4820".parse().unwrap(),
+            ];
+
+            store.put_peer_addrs(&node1, &addrs1).unwrap();
+            store.put_peer_addrs(&node2, &addrs2).unwrap();
+
+            let peers = store.list_peer_addrs().unwrap();
+            assert_eq!(peers.len(), 2);
+
+            let map: HashMap<NodeId, Vec<std::net::SocketAddr>> = peers.into_iter().collect();
+            assert_eq!(map[&node1], addrs1);
+            assert_eq!(map[&node2], addrs2);
+        });
+    }
+
+    #[test]
+    fn test_peer_addrs_remove() {
+        with_both_backends(|store| {
+            let node = NodeId::from_data(b"removable-peer");
+            let addrs: Vec<std::net::SocketAddr> = vec!["1.2.3.4:4820".parse().unwrap()];
+
+            store.put_peer_addrs(&node, &addrs).unwrap();
+            assert_eq!(store.list_peer_addrs().unwrap().len(), 1);
+
+            store.remove_peer_addrs(&node).unwrap();
+            assert!(store.list_peer_addrs().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn test_peer_addrs_persist_across_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let node = NodeId::from_data(b"persistent-peer");
+        let addrs: Vec<std::net::SocketAddr> = vec!["10.0.0.1:4820".parse().unwrap()];
+
+        {
+            let store = MetaStore::open(&path).unwrap();
+            store.put_peer_addrs(&node, &addrs).unwrap();
+        }
+
+        {
+            let store = MetaStore::open(&path).unwrap();
+            let peers = store.list_peer_addrs().unwrap();
+            assert_eq!(peers.len(), 1);
+            assert_eq!(peers[0].0, node);
+            assert_eq!(peers[0].1, addrs);
+        }
     }
 }

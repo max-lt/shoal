@@ -328,11 +328,17 @@ async fn handle_notification(
                 );
             }
 
-            // Persist to meta store if available.
-            if let Some(meta) = meta
-                && let Err(e) = meta.put_member(&member)
-            {
-                error!("failed to persist member: {e}");
+            // Persist member and peer addresses to meta store.
+            if let Some(meta) = meta {
+                if let Err(e) = meta.put_member(&member) {
+                    error!("failed to persist member: {e}");
+                }
+
+                if !identity.listen_addrs.is_empty()
+                    && let Err(e) = meta.put_peer_addrs(&identity.node_id, &identity.listen_addrs)
+                {
+                    error!("failed to persist peer addresses: {e}");
+                }
             }
 
             state.add_member(member).await;

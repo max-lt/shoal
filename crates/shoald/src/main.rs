@@ -371,7 +371,42 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         Some(address_book.clone()),
     ));
 
-    // --- Connect to peer nodes ---
+    // --- Load persisted peers from previous runs ---
+    match meta.list_peer_addrs() {
+        Ok(peers) if !peers.is_empty() => {
+            info!(count = peers.len(), "loading persisted peers");
+
+            for (peer_node_id, addrs) in &peers {
+                if *peer_node_id == node_id {
+                    continue; // Skip self.
+                }
+
+                if let Ok(eid) = iroh::EndpointId::from_bytes(peer_node_id.as_bytes()) {
+                    let mut addr = EndpointAddr::new(eid);
+
+                    for socket_addr in addrs {
+                        addr = addr.with_ip_addr(*socket_addr);
+                    }
+
+                    address_book.write().await.insert(*peer_node_id, addr);
+
+                    let peer_identity =
+                        ClusterIdentity::new(*peer_node_id, 1, u64::MAX, NodeTopology::default())
+                            .with_listen_addrs(addrs.clone());
+
+                    if let Err(e) = membership_handle.join(peer_identity) {
+                        debug!(node_id = %peer_node_id, %e, "failed to announce to persisted peer");
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(%e, "failed to load persisted peers");
+        }
+    }
+
+    // --- Connect to peer nodes from CLI/config ---
     for peer_str in &config.cluster.peers {
         match parse_peer(peer_str) {
             Ok((peer_endpoint_addr, peer_node_id)) => {
@@ -532,32 +567,6 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         Some((handle, rx)) => (Some(handle), Some(rx)),
         None => (None, None),
     };
-
-    // --- Gossip broadcast bridge ---
-    // Forwards local cluster events (from foca/membership) to gossip so
-    // other nodes learn about membership changes and shard events.
-    if let Some(gossip_handle) = gossip_handle.as_ref() {
-        let handle = gossip_handle.clone();
-        let mut events = cluster.subscribe_local();
-        tokio::spawn(async move {
-            loop {
-                match events.recv().await {
-                    Ok(event) => {
-                        if let Err(e) = handle.broadcast_event(&event).await {
-                            debug!(%e, "failed to broadcast cluster event via gossip");
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        warn!(skipped = n, "gossip broadcast bridge lagged");
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        info!("gossip broadcast bridge shutting down");
-                        break;
-                    }
-                }
-            }
-        });
-    }
 
     // --- Gossip data payload receiver ---
     // Processes ManifestPut, LogEntry, and WantEntries payloads received via
@@ -739,7 +748,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                         }
                     }
                     GossipPayload::Event(_) => {
-                        // Events are handled by the gossip receiver loop directly.
+                        // Membership events propagate via foca SWIM, not gossip.
                     }
                 }
             }
