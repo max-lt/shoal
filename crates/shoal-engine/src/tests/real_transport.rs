@@ -593,7 +593,7 @@ impl QuicTestCluster {
 
     /// Broadcast a manifest from one node to all others over real QUIC.
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
+        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         let manifest_bytes = postcard::to_allocvec(&manifest).unwrap();
 
         let msg = ShoalMessage::ManifestPut {
@@ -777,7 +777,7 @@ async fn test_quic_manifest_sync_from_peers() {
     for i in 0..4 {
         for (key, _) in &objects {
             assert!(
-                c.node(i).head_object("bucket", key).is_ok(),
+                c.node(i).head_object("bucket", key).await.is_ok(),
                 "node {i} should have manifest for {key} after broadcast"
             );
         }

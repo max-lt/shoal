@@ -360,7 +360,27 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         Arc::new(RwLock::new(HashMap::new()));
 
     // --- Membership service (foca SWIM) ---
-    let listen_addrs = endpoint.bound_sockets();
+    // Replace wildcard (0.0.0.0 / [::]) addresses with localhost so that
+    // peers can actually connect. When the user binds to a specific IP,
+    // it is kept as-is.
+    let listen_addrs: Vec<SocketAddr> = endpoint
+        .bound_sockets()
+        .into_iter()
+        .map(|addr| {
+            if addr.ip().is_unspecified() {
+                SocketAddr::new(
+                    if addr.ip().is_ipv4() {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                    } else {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+                    },
+                    addr.port(),
+                )
+            } else {
+                addr
+            }
+        })
+        .collect();
     let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default())
         .with_listen_addrs(listen_addrs);
     let membership_handle = Arc::new(membership::start_with_address_book(

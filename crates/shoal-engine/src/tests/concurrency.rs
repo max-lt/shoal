@@ -6,6 +6,7 @@ use std::sync::Arc;
 use super::helpers::{single_node, test_data};
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_concurrent_puts_different_keys() {
     let node = Arc::new(single_node(1024, 2, 1).await);
 
@@ -35,6 +36,7 @@ async fn test_concurrent_puts_different_keys() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_concurrent_reads_same_key() {
     let node = Arc::new(single_node(1024, 2, 1).await);
     let data = test_data(5000);
@@ -58,6 +60,7 @@ async fn test_concurrent_reads_same_key() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_concurrent_put_and_read() {
     // One task writes objects while another reads previously written ones.
     let node = Arc::new(single_node(1024, 2, 1).await);

@@ -427,8 +427,8 @@ impl TestCluster {
     }
 
     /// Simulate manifest broadcast from one node to all others.
-    fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
+    async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
+        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         for (i, node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;
@@ -486,8 +486,13 @@ impl TestCluster {
 /// Simulate what the ManifestPut broadcast handler does:
 /// store the manifest and key mapping on the target node, but do NOT
 /// store shard owners.
-fn simulate_manifest_broadcast(source: &ShoalNode, target: &ShoalNode, bucket: &str, key: &str) {
-    let manifest = source.head_object(bucket, key).unwrap();
+async fn simulate_manifest_broadcast(
+    source: &ShoalNode,
+    target: &ShoalNode,
+    bucket: &str,
+    key: &str,
+) {
+    let manifest = source.head_object(bucket, key).await.unwrap();
     target.meta().put_manifest(&manifest).unwrap();
     target
         .meta()
@@ -582,6 +587,7 @@ async fn writer_reader_pair_with_transport(
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_non_writer_read_after_manifest_broadcast() {
     let (node_a, node_b) = writer_reader_pair_with_transport(1024, 2, 1).await;
     let data = test_data(5000);
@@ -590,13 +596,14 @@ async fn test_non_writer_read_after_manifest_broadcast() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    simulate_manifest_broadcast(&node_a, &node_b, "b", "k");
+    simulate_manifest_broadcast(&node_a, &node_b, "b", "k").await;
 
     let (got, _) = node_b.get_object("b", "k").await.unwrap();
     assert_eq!(got, data, "non-writer node should reconstruct the object");
 }
 
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_non_writer_read_k4_m2_after_broadcast() {
     let (node_a, node_b) = writer_reader_pair_with_transport(1024, 4, 2).await;
     let data = test_data(10_000);
@@ -605,13 +612,14 @@ async fn test_non_writer_read_k4_m2_after_broadcast() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    simulate_manifest_broadcast(&node_a, &node_b, "b", "k");
+    simulate_manifest_broadcast(&node_a, &node_b, "b", "k").await;
 
     let (got, _) = node_b.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
 }
 
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_writer_stores_shard_owners_in_meta() {
     let (node_a, _node_b) = writer_reader_pair_with_transport(1024, 2, 1).await;
     let data = test_data(2000);
@@ -621,7 +629,7 @@ async fn test_writer_stores_shard_owners_in_meta() {
         .await
         .unwrap();
 
-    let manifest = node_a.head_object("b", "k").unwrap();
+    let manifest = node_a.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
         for shard_meta in &chunk_meta.shards {
             let owners = node_a
@@ -638,6 +646,7 @@ async fn test_writer_stores_shard_owners_in_meta() {
 }
 
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_manifest_broadcast_does_not_store_shard_owners() {
     let (node_a, node_b) = writer_reader_pair_with_transport(1024, 2, 1).await;
     let data = test_data(2000);
@@ -646,9 +655,9 @@ async fn test_manifest_broadcast_does_not_store_shard_owners() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    simulate_manifest_broadcast(&node_a, &node_b, "b", "k");
+    simulate_manifest_broadcast(&node_a, &node_b, "b", "k").await;
 
-    let manifest = node_b.head_object("b", "k").unwrap();
+    let manifest = node_b.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
         for shard_meta in &chunk_meta.shards {
             let owners = node_b
@@ -670,6 +679,7 @@ async fn test_manifest_broadcast_does_not_store_shard_owners() {
 
 /// 3-node cluster: write on node 0, read from all nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_write_read_from_all() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(5000);
@@ -678,7 +688,7 @@ async fn test_3_node_write_read_from_all() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     for i in 0..3 {
         let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
@@ -688,6 +698,7 @@ async fn test_3_node_write_read_from_all() {
 
 /// 5-node cluster: write on node 2, read from all nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_write_read_from_all() {
     let c = TestCluster::new(5, 1024, 4, 2).await;
     let data = test_data(20_000);
@@ -696,7 +707,7 @@ async fn test_5_node_write_read_from_all() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(2, "b", "k");
+    c.broadcast_manifest(2, "b", "k").await;
 
     for i in 0..5 {
         let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
@@ -706,6 +717,7 @@ async fn test_5_node_write_read_from_all() {
 
 /// 10-node cluster: write and read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_10_node_cluster() {
     let c = TestCluster::new(10, 2048, 4, 2).await;
     let data = test_data(50_000);
@@ -714,7 +726,7 @@ async fn test_10_node_cluster() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(7, "b", "k");
+    c.broadcast_manifest(7, "b", "k").await;
 
     // Every node can read.
     for i in 0..10 {
@@ -725,6 +737,7 @@ async fn test_10_node_cluster() {
 
 /// 10-node cluster: shards should be distributed across multiple nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_10_node_shard_distribution() {
     let c = TestCluster::new(10, 1024, 4, 2).await;
     let data = test_data(10_000);
@@ -754,6 +767,7 @@ async fn test_10_node_shard_distribution() {
 
 /// k=1, m=1 (mirroring): every chunk has 2 copies.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_k1_m1_mirroring() {
     let c = TestCluster::new(3, 1024, 1, 1).await;
     let data = test_data(3000);
@@ -762,7 +776,7 @@ async fn test_3_node_k1_m1_mirroring() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     for i in 0..3 {
         let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
@@ -772,6 +786,7 @@ async fn test_3_node_k1_m1_mirroring() {
 
 /// k=2, m=2: can lose 2 shards per chunk.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_k2_m2() {
     let c = TestCluster::new(5, 1024, 2, 2).await;
     let data = test_data(4000);
@@ -780,7 +795,7 @@ async fn test_5_node_k2_m2() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(1, "b", "k");
+    c.broadcast_manifest(1, "b", "k").await;
 
     for i in 0..5 {
         let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
@@ -790,6 +805,7 @@ async fn test_5_node_k2_m2() {
 
 /// k=8, m=4: large erasure group.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_12_node_k8_m4() {
     let c = TestCluster::new(12, 4096, 8, 4).await;
     let data = test_data(100_000);
@@ -798,7 +814,7 @@ async fn test_12_node_k8_m4() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(5, "b", "k");
+    c.broadcast_manifest(5, "b", "k").await;
 
     // Read from a few nodes.
     for &i in &[0, 3, 7, 11] {
@@ -814,6 +830,7 @@ async fn test_12_node_k8_m4() {
 /// Kill 1 node in a 3-node k=2,m=1 cluster with replication=2:
 /// each shard is on 2 nodes, so losing 1 node still leaves enough copies.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_kill_one_still_reads() {
     let c = TestCluster::with_replication(3, 1024, 2, 1, 2).await;
     let data = test_data(5000);
@@ -822,7 +839,7 @@ async fn test_3_node_kill_one_still_reads() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill node 1.
     c.kill_node(1).await;
@@ -835,6 +852,7 @@ async fn test_3_node_kill_one_still_reads() {
 /// Kill 2 nodes in a 5-node k=4,m=2 cluster with replication=3:
 /// each shard is on 3 nodes, so losing 2 still leaves copies available.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_kill_two_still_reads() {
     let c = TestCluster::with_replication(5, 1024, 4, 2, 3).await;
     let data = test_data(20_000);
@@ -843,7 +861,7 @@ async fn test_5_node_kill_two_still_reads() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill 2 nodes.
     c.kill_node(3).await;
@@ -859,6 +877,7 @@ async fn test_5_node_kill_two_still_reads() {
 /// Kill the writer node: other nodes should still read via remaining shards.
 /// replication=2 ensures shards survive writer death.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_kill_writer() {
     let c = TestCluster::with_replication(5, 1024, 4, 2, 2).await;
     let data = test_data(15_000);
@@ -867,7 +886,7 @@ async fn test_5_node_kill_writer() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill the writer.
     c.kill_node(0).await;
@@ -882,6 +901,7 @@ async fn test_5_node_kill_writer() {
 /// Kill 2 of 3 nodes: with replication=3 (full replication), the writer
 /// has all shards locally and can still read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_kill_two_writer_still_reads() {
     let c = TestCluster::with_replication(3, 1024, 2, 1, 3).await;
     let data = test_data(5000);
@@ -890,7 +910,7 @@ async fn test_3_node_kill_two_writer_still_reads() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill 2 out of 3 nodes. With k=2,m=1, we need at least 2 shards per chunk.
     // If 2 of 3 nodes are down and the reading node doesn't have enough local
@@ -910,6 +930,7 @@ async fn test_3_node_kill_two_writer_still_reads() {
 /// Kill a node, then revive it: reads should work before and after.
 /// replication=2 ensures shards survive the temporary node loss.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_node_kill_and_revive() {
     let c = TestCluster::with_replication(3, 1024, 2, 1, 2).await;
     let data = test_data(5000);
@@ -918,7 +939,7 @@ async fn test_node_kill_and_revive() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill node 1.
     c.kill_node(1).await;
@@ -938,6 +959,7 @@ async fn test_node_kill_and_revive() {
 /// Kill all nodes except the writer, revive them all, verify reads.
 /// replication=5 (all nodes) ensures the writer has all shards locally.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_mass_failure_and_recovery() {
     let c = TestCluster::with_replication(5, 1024, 4, 2, 5).await;
     let data = test_data(20_000);
@@ -946,7 +968,7 @@ async fn test_mass_failure_and_recovery() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill everyone except node 0.
     for i in 1..5 {
@@ -975,6 +997,7 @@ async fn test_mass_failure_and_recovery() {
 
 /// 1-byte object across a 3-node cluster.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_single_byte_object() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = vec![42u8];
@@ -983,7 +1006,7 @@ async fn test_3_node_single_byte_object() {
         .put_object("b", "tiny", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "tiny");
+    c.broadcast_manifest(0, "b", "tiny").await;
 
     for i in 0..3 {
         let (got, _) = c.node(i).get_object("b", "tiny").await.unwrap();
@@ -993,6 +1016,7 @@ async fn test_3_node_single_byte_object() {
 
 /// Empty object across a 3-node cluster.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_empty_object() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data: Vec<u8> = vec![];
@@ -1001,7 +1025,7 @@ async fn test_3_node_empty_object() {
         .put_object("b", "empty", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(1, "b", "empty");
+    c.broadcast_manifest(1, "b", "empty").await;
 
     for i in 0..3 {
         let (got, _) = c.node(i).get_object("b", "empty").await.unwrap();
@@ -1011,6 +1035,7 @@ async fn test_3_node_empty_object() {
 
 /// Object exactly chunk_size bytes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_exact_chunk_size() {
     let c = TestCluster::new(5, 1024, 4, 2).await;
     let data = test_data(1024);
@@ -1019,7 +1044,7 @@ async fn test_5_node_exact_chunk_size() {
         .put_object("b", "exact", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(3, "b", "exact");
+    c.broadcast_manifest(3, "b", "exact").await;
 
     for i in 0..5 {
         let (got, _) = c.node(i).get_object("b", "exact").await.unwrap();
@@ -1029,6 +1054,7 @@ async fn test_5_node_exact_chunk_size() {
 
 /// Object of chunk_size - 1 bytes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_one_byte_under_chunk() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(1023);
@@ -1037,7 +1063,7 @@ async fn test_3_node_one_byte_under_chunk() {
         .put_object("b", "under", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "under");
+    c.broadcast_manifest(0, "b", "under").await;
 
     for i in 0..3 {
         let (got, _) = c.node(i).get_object("b", "under").await.unwrap();
@@ -1047,6 +1073,7 @@ async fn test_3_node_one_byte_under_chunk() {
 
 /// Object of chunk_size + 1 bytes (forces 2 chunks).
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_one_byte_over_chunk() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(1025);
@@ -1055,9 +1082,9 @@ async fn test_3_node_one_byte_over_chunk() {
         .put_object("b", "over", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(2, "b", "over");
+    c.broadcast_manifest(2, "b", "over").await;
 
-    let manifest = c.node(2).head_object("b", "over").unwrap();
+    let manifest = c.node(2).head_object("b", "over").await.unwrap();
     assert_eq!(manifest.chunks.len(), 2, "should be exactly 2 chunks");
 
     for i in 0..3 {
@@ -1068,6 +1095,7 @@ async fn test_3_node_one_byte_over_chunk() {
 
 /// 1MB object with small chunk size: many chunks.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_1mb_many_chunks() {
     let c = TestCluster::new(5, 4096, 4, 2).await;
     let data = test_data(1_048_576);
@@ -1076,9 +1104,9 @@ async fn test_5_node_1mb_many_chunks() {
         .put_object("b", "big", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "big");
+    c.broadcast_manifest(0, "b", "big").await;
 
-    let manifest = c.node(0).head_object("b", "big").unwrap();
+    let manifest = c.node(0).head_object("b", "big").await.unwrap();
     assert_eq!(manifest.chunks.len(), 256, "1MB / 4096 = 256 chunks");
 
     // Read from two different non-writer nodes.
@@ -1094,6 +1122,7 @@ async fn test_5_node_1mb_many_chunks() {
 
 /// Write 50 objects from different nodes, read all from every node.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_50_objects() {
     let c = TestCluster::new(5, 1024, 2, 1).await;
     let mut objects = Vec::new();
@@ -1107,7 +1136,7 @@ async fn test_5_node_50_objects() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -1124,6 +1153,7 @@ async fn test_5_node_50_objects() {
 /// Write from different nodes, kill one node, all objects still readable.
 /// replication=2 ensures enough shard copies survive.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_write_kill_read_all() {
     let c = TestCluster::with_replication(5, 1024, 4, 2, 2).await;
     let mut objects = Vec::new();
@@ -1137,7 +1167,7 @@ async fn test_5_node_write_kill_read_all() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -1160,6 +1190,7 @@ async fn test_5_node_write_kill_read_all() {
 
 /// Verify user metadata is preserved when reading from a different node.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_metadata_preserved_across_nodes() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
@@ -1171,10 +1202,10 @@ async fn test_metadata_preserved_across_nodes() {
         .put_object("b", "k", &data, meta.clone())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Read manifest from another node, check metadata is intact.
-    let manifest = c.node(1).head_object("b", "k").unwrap();
+    let manifest = c.node(1).head_object("b", "k").await.unwrap();
     assert_eq!(manifest.metadata, meta);
 }
 
@@ -1184,6 +1215,7 @@ async fn test_metadata_preserved_across_nodes() {
 
 /// Node 0 writes, node 1 deletes, node 2 should see 404.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_delete_from_different_node() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
@@ -1192,7 +1224,7 @@ async fn test_delete_from_different_node() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Node 1 can read.
     let (got, _) = c.node(1).get_object("b", "k").await.unwrap();
@@ -1212,6 +1244,7 @@ async fn test_delete_from_different_node() {
 
 /// Verify different chunk sizes produce correct results.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_various_chunk_sizes() {
     for chunk_size in [128, 256, 512, 1024, 4096] {
         let c = TestCluster::new(3, chunk_size, 2, 1).await;
@@ -1221,12 +1254,12 @@ async fn test_various_chunk_sizes() {
             .put_object("b", "k", &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(0, "b", "k");
+        c.broadcast_manifest(0, "b", "k").await;
 
         let (got, _) = c.node(2).get_object("b", "k").await.unwrap();
         assert_eq!(got, data, "chunk_size={chunk_size}");
 
-        let manifest = c.node(0).head_object("b", "k").unwrap();
+        let manifest = c.node(0).head_object("b", "k").await.unwrap();
         let expected_chunks = (10_000 + chunk_size as usize - 1) / chunk_size as usize;
         assert_eq!(
             manifest.chunks.len(),
@@ -1243,6 +1276,7 @@ async fn test_various_chunk_sizes() {
 /// Node 0 writes version 1, node 1 overwrites with version 2, all nodes
 /// should see the new version.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_overwrite_from_different_node() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let v1 = test_data(3000);
@@ -1253,7 +1287,7 @@ async fn test_overwrite_from_different_node() {
         .put_object("b", "k", &v1, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Verify v1 readable.
     let (got, _) = c.node(2).get_object("b", "k").await.unwrap();
@@ -1264,7 +1298,7 @@ async fn test_overwrite_from_different_node() {
         .put_object("b", "k", &v2, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(1, "b", "k");
+    c.broadcast_manifest(1, "b", "k").await;
 
     // All nodes see v2.
     for i in 0..3 {
@@ -1279,6 +1313,7 @@ async fn test_overwrite_from_different_node() {
 
 /// Multiple nodes write different objects concurrently. All should be readable.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_5_node_concurrent_writes() {
     let c = Arc::new(TestCluster::new(5, 1024, 2, 1).await);
 
@@ -1294,7 +1329,7 @@ async fn test_5_node_concurrent_writes() {
                     .put_object("b", &key, &data, BTreeMap::new())
                     .await
                     .unwrap();
-                cluster.broadcast_manifest(writer, "b", &key);
+                cluster.broadcast_manifest(writer, "b", &key).await;
             }
         }));
     }
@@ -1323,6 +1358,7 @@ async fn test_5_node_concurrent_writes() {
 /// After a non-writer reads an object, the pulled shards should be cached
 /// in the bounded LRU shard cache for future reads.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_pulled_shards_cached_locally() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
@@ -1331,7 +1367,7 @@ async fn test_pulled_shards_cached_locally() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Before read: the shard cache on node 2 should be empty.
     let cache_before = c.node(2).shard_cache().len();
@@ -1354,6 +1390,7 @@ async fn test_pulled_shards_cached_locally() {
 
 /// Minimal 2-node cluster with k=1, m=1 (mirroring).
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_2_node_k1_m1() {
     let c = TestCluster::new(2, 512, 1, 1).await;
     let data = test_data(3000);
@@ -1362,7 +1399,7 @@ async fn test_2_node_k1_m1() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     let (got, _) = c.node(1).get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
@@ -1371,6 +1408,7 @@ async fn test_2_node_k1_m1() {
 /// 2-node cluster with replication=2: both nodes have all shards.
 /// Kill one, the other should still read.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_2_node_kill_one() {
     let c = TestCluster::with_replication(2, 512, 1, 1, 2).await;
     let data = test_data(3000);
@@ -1379,7 +1417,7 @@ async fn test_2_node_kill_one() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     c.kill_node(1).await;
 
@@ -1394,6 +1432,7 @@ async fn test_2_node_kill_one() {
 
 /// Objects in different buckets don't interfere across nodes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_3_node_multiple_buckets() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data_a = test_data(2000);
@@ -1408,8 +1447,8 @@ async fn test_3_node_multiple_buckets() {
         .await
         .unwrap();
 
-    c.broadcast_manifest(0, "photos", "img.jpg");
-    c.broadcast_manifest(1, "docs", "readme.md");
+    c.broadcast_manifest(0, "photos", "img.jpg").await;
+    c.broadcast_manifest(1, "docs", "readme.md").await;
 
     // Node 2 reads both.
     let (got_a, _) = c.node(2).get_object("photos", "img.jpg").await.unwrap();
@@ -1428,6 +1467,7 @@ async fn test_3_node_multiple_buckets() {
 
 /// After broadcast, listing on any node returns all keys.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_list_objects_after_broadcast() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
 
@@ -1439,12 +1479,12 @@ async fn test_list_objects_after_broadcast() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
     }
 
     // All 3 nodes should list all 10 items.
     for i in 0..3 {
-        let keys = c.node(i).list_objects("b", "").unwrap();
+        let keys = c.node(i).list_objects("b", "").await.unwrap();
         assert_eq!(keys.len(), 10, "node {i} should list 10 objects");
     }
 }
@@ -1457,6 +1497,7 @@ async fn test_list_objects_after_broadcast() {
 /// because it joined after the objects were stored) can't list objects.
 /// After calling `sync_manifests_from_peers`, it should see everything.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_new_node_lists_objects_after_manifest_sync() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
 
@@ -1480,19 +1521,8 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
     // Revive node 2 — simulating a late join.
     c.revive_node(2).await;
 
-    // Node 2 has NO manifests (was dead during writes).
-    let keys_before = c.node(2).list_objects("b", "").unwrap();
-    assert_eq!(
-        keys_before.len(),
-        0,
-        "node 2 should have 0 objects before sync"
-    );
-
-    // After manifest sync, node 2 should see both objects.
-    let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
-    assert_eq!(synced, 2, "should have synced 2 manifests");
-
-    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    // list_objects auto-syncs from peers, so node 2 discovers both objects.
+    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
     keys_after.sort();
     assert_eq!(
         keys_after,
@@ -1509,6 +1539,7 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
 
 /// Sync is idempotent: calling it twice doesn't duplicate entries.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_manifest_sync_idempotent() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
@@ -1531,7 +1562,7 @@ async fn test_manifest_sync_idempotent() {
     let synced2 = c.node(2).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced2, 0);
 
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 1);
 }
 
@@ -1546,6 +1577,7 @@ async fn test_manifest_sync_idempotent() {
 /// 3. Node 0 overwrites key.txt with v2 — node 2 misses the broadcast
 /// 4. Node 2 comes back up and syncs — should get v2, not stay on v1
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_manifest_sync_updates_stale_key_after_overwrite() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let v1 = test_data(2000);
@@ -1593,6 +1625,7 @@ async fn test_manifest_sync_updates_stale_key_after_overwrite() {
 
 /// Sync across multiple buckets works correctly.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_manifest_sync_multiple_buckets() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
 
@@ -1614,8 +1647,8 @@ async fn test_manifest_sync_multiple_buckets() {
     let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced, 2);
 
-    assert_eq!(c.node(2).list_objects("photos", "").unwrap().len(), 1);
-    assert_eq!(c.node(2).list_objects("docs", "").unwrap().len(), 1);
+    assert_eq!(c.node(2).list_objects("photos", "").await.unwrap().len(), 1);
+    assert_eq!(c.node(2).list_objects("docs", "").await.unwrap().len(), 1);
 }
 
 // =========================================================================
@@ -1624,6 +1657,7 @@ async fn test_manifest_sync_multiple_buckets() {
 
 /// With LogTree: put_object appends a log entry and broadcasts to peers.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_logtree_put_broadcasts_to_peers() {
     let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
     let data = test_data(5000);
@@ -1643,6 +1677,7 @@ async fn test_logtree_put_broadcasts_to_peers() {
 
 /// With LogTree: delete_object appends a delete log entry.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_logtree_delete_object() {
     let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
     let data = test_data(2000);
@@ -1666,6 +1701,7 @@ async fn test_logtree_delete_object() {
 
 /// With LogTree: get_object reads from LogTree's materialized state.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_logtree_get_reads_from_materialized_state() {
     let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
     let data = test_data(3000);
@@ -1676,16 +1712,74 @@ async fn test_logtree_get_reads_from_materialized_state() {
         .unwrap();
 
     // Verify has_object and list_objects also use LogTree.
-    assert!(c.node(0).has_object("b", "k").unwrap());
-    assert!(c.node(1).has_object("b", "k").unwrap());
+    assert!(c.node(0).has_object("b", "k").await.unwrap());
+    assert!(c.node(1).has_object("b", "k").await.unwrap());
 
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0], "k");
 }
 
 /// With LogTree: sync_log_from_peers recovers missed entries.
+/// With LogTree: put_object also stores manifest in MetaStore so that
+/// ManifestRequest handlers (peer pulls) can serve it immediately.
+/// This is critical for read-after-write consistency: when node B asks
+/// the writer for a manifest via QUIC, the handler looks in MetaStore.
 #[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_logtree_put_also_writes_metastore() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let data = test_data(5000);
+
+    let oid = c
+        .node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // The manifest must be in MetaStore (not just LogTree) so the
+    // ManifestRequest handler can serve it to peers.
+    let meta = c.node(0).meta();
+    let got_oid = meta.get_object_key("b", "k").unwrap();
+    assert_eq!(
+        got_oid,
+        Some(oid),
+        "MetaStore should have object key after LogTree put"
+    );
+
+    let got_manifest = meta.get_manifest(&oid).unwrap();
+    assert!(
+        got_manifest.is_some(),
+        "MetaStore should have manifest after LogTree put"
+    );
+}
+
+/// With LogTree: delete_object also removes from MetaStore so that
+/// ManifestRequest handlers don't serve stale manifests.
+#[tokio::test]
+#[ntest::timeout(30000)]
+async fn test_logtree_delete_also_clears_metastore() {
+    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let data = test_data(2000);
+
+    c.node(0)
+        .put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    assert!(c.node(0).meta().get_object_key("b", "k").unwrap().is_some());
+
+    c.node(0).delete_object("b", "k").await.unwrap();
+
+    assert!(
+        c.node(0).meta().get_object_key("b", "k").unwrap().is_none(),
+        "MetaStore should not have object key after delete"
+    );
+}
+
+/// With LogTree: sync_log_from_peers recovers missed entries.
+#[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_logtree_sync_from_peers() {
     let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
 
@@ -1708,7 +1802,7 @@ async fn test_logtree_sync_from_peers() {
     c.revive_node(2).await;
 
     // Node 2 has no objects before sync.
-    let keys_before = c.node(2).list_objects("b", "").unwrap();
+    let keys_before = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(
         keys_before.len(),
         0,
@@ -1723,7 +1817,7 @@ async fn test_logtree_sync_from_peers() {
     );
 
     // Node 2 should now see both objects.
-    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
     keys_after.sort();
     assert_eq!(keys_after, vec!["key1.txt", "key2.txt"]);
 
@@ -1736,6 +1830,7 @@ async fn test_logtree_sync_from_peers() {
 
 /// With LogTree: overwrite scenario — put v1, kill node, put v2, revive, sync → reads v2.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_logtree_overwrite_after_sync() {
     let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
     let v1 = test_data(2000);
@@ -1779,6 +1874,7 @@ async fn test_logtree_overwrite_after_sync() {
 /// Regression test for: "not enough shards for chunk 0: need 2, found 1"
 /// when reading from a non-writer node after push targets were unreachable.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_write_with_disconnected_peers_then_read_from_other() {
     // 3-node cluster, k=2 m=1 → 3 shards per chunk, shard_replication=1.
     let c = TestCluster::new(3, 1024, 2, 1).await;
@@ -1800,7 +1896,7 @@ async fn test_write_with_disconnected_peers_then_read_from_other() {
     // Verify: the writer should have stored ALL shards locally because
     // every push failed (nothing was ACK'd and cleaned up).
     let writer_shards = c.local_shard_count(0).await;
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
     assert_eq!(
         writer_shards, total_shards,
@@ -1810,7 +1906,7 @@ async fn test_write_with_disconnected_peers_then_read_from_other() {
     // Reconnect nodes and propagate manifest.
     c.reconnect_node(1).await;
     c.reconnect_node(2).await;
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Non-writer (node 1) should pull all shards from the writer and
     // read successfully.
@@ -1827,6 +1923,7 @@ async fn test_write_with_disconnected_peers_then_read_from_other() {
 /// writer does not own). This prevents the writer from keeping all k+m
 /// shards per chunk, which would defeat erasure coding distribution.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_ack_cleanup_frees_non_owned_shards() {
     // 6-node cluster, k=4 m=2 → 6 shards per chunk. All nodes reachable.
     let c = TestCluster::new(6, 1024, 4, 2).await;
@@ -1836,9 +1933,9 @@ async fn test_ack_cleanup_frees_non_owned_shards() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
 
     // The writer should have FEWER shards than total because ACK'd
@@ -1859,6 +1956,7 @@ async fn test_ack_cleanup_frees_non_owned_shards() {
 /// When some peers are disconnected during write, the writer queues failed
 /// pushes for background retry while still cleaning up ACK'd pushes.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_partial_disconnect_queues_failed_pushes() {
     // 3-node cluster, k=2 m=1 → 3 shards per chunk.
     let c = TestCluster::new(3, 1024, 2, 1).await;
@@ -1880,7 +1978,7 @@ async fn test_partial_disconnect_queues_failed_pushes() {
         "writer should have pending pushes for disconnected node 2, got {pending}"
     );
 
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
 
     // The writer should NOT have all shards — ACK'd pushes to node 1
@@ -1896,6 +1994,7 @@ async fn test_partial_disconnect_queues_failed_pushes() {
 /// `retry_pending_pushes()` should successfully push the queued shards
 /// and clean up local copies.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_retry_pending_pushes_cleans_up() {
     // 3-node cluster, k=2 m=1 → 3 shards per chunk.
     let c = TestCluster::new(3, 1024, 2, 1).await;
@@ -1909,7 +2008,7 @@ async fn test_retry_pending_pushes_cleans_up() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Verify pending pushes exist.
     assert!(
@@ -1956,6 +2055,7 @@ async fn test_retry_pending_pushes_cleans_up() {
 /// because QUIC pushes may succeed from the transport's perspective but the
 /// remote node drops the shard (e.g. backpressure, disk full).
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_bug1_large_object_read_after_ack_cleanup() {
     // 4-node cluster matching torture test: k=2 m=2 → 4 shards/chunk.
     // shard_replication=1 (each shard on exactly one node).
@@ -1969,11 +2069,11 @@ async fn test_bug1_large_object_read_after_ack_cleanup() {
         .put_object("b", "large-binary", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "large-binary");
+    c.broadcast_manifest(0, "b", "large-binary").await;
 
     // After ACK cleanup, the writer should NOT have all shards — only the
     // ones it's a ring owner for.
-    let manifest = c.node(0).head_object("b", "large-binary").unwrap();
+    let manifest = c.node(0).head_object("b", "large-binary").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
     let writer_shards = c.local_shard_count(0).await;
     assert!(
@@ -2015,6 +2115,7 @@ async fn test_bug1_large_object_read_after_ack_cleanup() {
 /// for LogTree mode. This test covers the non-LogTree (MetaStore) path
 /// which is what the torture test's `shoald` cluster uses by default.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
     // 4-node cluster matching torture test setup (ports 4821-4824).
     let c = TestCluster::new(4, 1024, 2, 2).await;
@@ -2044,7 +2145,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
 
     // Also verify list_objects works across nodes.
     for i in 1..4 {
-        let keys = c.node(i).list_objects("b", "").unwrap();
+        let keys = c.node(i).list_objects("b", "").await.unwrap();
         assert!(
             keys.contains(&"cross-node-test".to_string()),
             "BUG 4: node {i} list_objects doesn't include the key"
@@ -2054,6 +2155,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
 
 /// Same as Bug 4 but with LogTree mode (which is what the real shoald uses).
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_bug4_cross_node_visibility_logtree_mode() {
     let c = TestCluster::with_log_tree(4, 1024, 2, 2).await;
     let data = test_data(5000);
@@ -2086,6 +2188,7 @@ async fn test_bug4_cross_node_visibility_logtree_mode() {
 /// With transport latency injected, shards must still be fully distributed
 /// before PUT returns, and reads from all nodes must succeed.
 #[tokio::test]
+#[ntest::timeout(60000)]
 async fn test_chaos_large_object_read_with_latency() {
     let chaos = ChaosConfig {
         latency_ms: (10, 50),
@@ -2103,7 +2206,7 @@ async fn test_chaos_large_object_read_with_latency() {
         .put_object("b", "large", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "large");
+    c.broadcast_manifest(0, "b", "large").await;
 
     // Read from the writer.
     let (got, _) = c
@@ -2129,6 +2232,7 @@ async fn test_chaos_large_object_read_with_latency() {
 /// With per-operation store latency, 50 concurrent writes must all succeed
 /// and be readable afterward.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_chaos_concurrent_writes_with_slow_store() {
     let chaos = ChaosConfig {
         store_write_latency_ms: (5, 15),
@@ -2153,7 +2257,7 @@ async fn test_chaos_concurrent_writes_with_slow_store() {
                 .put_object("b", &key, &data, BTreeMap::new())
                 .await
                 .unwrap_or_else(|e| panic!("concurrent write {key} failed: {e}"));
-            cluster.broadcast_manifest(j % 3, "b", &key);
+            cluster.broadcast_manifest(j % 3, "b", &key).await;
         }));
     }
 
@@ -2183,6 +2287,7 @@ async fn test_chaos_concurrent_writes_with_slow_store() {
 /// reach all nodes. After retrying via `sync_manifests_from_peers`, the
 /// object must become visible.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_chaos_cross_node_with_drop() {
     let chaos = ChaosConfig {
         latency_ms: (10, 30),
@@ -2199,7 +2304,7 @@ async fn test_chaos_cross_node_with_drop() {
         .put_object("b", "dropped", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "dropped");
+    c.broadcast_manifest(0, "b", "dropped").await;
 
     // Try to read from node 1. If the broadcast was dropped, sync first.
     let result = c.node(1).get_object("b", "dropped").await;
@@ -2226,6 +2331,7 @@ async fn test_chaos_cross_node_with_drop() {
 /// node 0 won't reach node 2 via broadcast. After healing, retrying
 /// pending pushes, and syncing manifests, node 2 must see the object.
 #[tokio::test]
+#[ntest::timeout(30000)]
 async fn test_chaos_partition_then_heal() {
     let chaos = ChaosConfig {
         latency_ms: (5, 10),
@@ -2243,15 +2349,16 @@ async fn test_chaos_partition_then_heal() {
         .put_object("b", "before", &data_before, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "before");
+    c.broadcast_manifest(0, "b", "before").await;
 
     // All nodes can read it.
     let (got, _) = c.node(2).get_object("b", "before").await.unwrap();
     assert_eq!(got, data_before, "node 2 should read 'before' object");
 
-    // Partition node 2 from nodes 0 and 1.
+    // Partition node 2 from ALL other nodes (full isolation).
     controller.partition(c.node_ids[0], c.node_ids[2]).await;
     controller.partition(c.node_ids[1], c.node_ids[2]).await;
+    controller.partition(c.node_ids[3], c.node_ids[2]).await;
 
     // Write a new object on node 0 — the transport broadcast to node 2
     // will be blocked by the partition. Shard pushes to node 2 also fail.
@@ -2261,7 +2368,7 @@ async fn test_chaos_partition_then_heal() {
         .unwrap();
 
     // Node 2 should NOT see the "during" object (missed the broadcast).
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert!(
         !keys.contains(&"during".to_string()),
         "node 2 should not see 'during' while partitioned"
@@ -2274,6 +2381,7 @@ async fn test_chaos_partition_then_heal() {
     // Heal the partition.
     controller.heal(c.node_ids[0], c.node_ids[2]).await;
     controller.heal(c.node_ids[1], c.node_ids[2]).await;
+    controller.heal(c.node_ids[3], c.node_ids[2]).await;
 
     // Retry pending pushes on the writer — pushes that failed during the
     // partition (shards destined for node 2) will now succeed.
@@ -2288,7 +2396,7 @@ async fn test_chaos_partition_then_heal() {
     assert!(synced >= 1, "sync should find the 'during' manifest");
 
     // Node 2 can now list both objects.
-    let mut keys = c.node(2).list_objects("b", "").unwrap();
+    let mut keys = c.node(2).list_objects("b", "").await.unwrap();
     keys.sort();
     assert!(
         keys.contains(&"during".to_string()),

@@ -11,6 +11,7 @@ use super::helpers::{TEST_MAX_BYTES, test_data, three_node_cluster};
 /// get placed on the only ring member (the peer). This simulates what
 /// happens in cmd_start when the local node forgets to add itself.
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_bug_writer_not_in_ring_all_shards_go_to_peer() {
     let writer_id = NodeId::from([1u8; 32]);
     let peer_id = NodeId::from([2u8; 32]);
@@ -52,6 +53,7 @@ async fn test_bug_writer_not_in_ring_all_shards_go_to_peer() {
 /// After fix: when both nodes are in the ring, shards should be
 /// distributed roughly 50/50 between the two nodes.
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_fix_both_nodes_in_ring_shards_distributed() {
     let node_a = NodeId::from([1u8; 32]);
     let node_b = NodeId::from([2u8; 32]);
@@ -108,6 +110,7 @@ async fn test_fix_both_nodes_in_ring_shards_distributed() {
 /// (k=4, m=2) for a single chunk goes to exactly 1 node, and at least 2
 /// distinct nodes are used (not all on the same node).
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_shard_replication_1_distributes_across_nodes() {
     // Use the three_node_cluster helper but check shard placement via ring.
     let node_ids: Vec<NodeId> = (1..=3u8).map(|i| NodeId::from([i; 32])).collect();
@@ -154,6 +157,7 @@ async fn test_shard_replication_1_distributes_across_nodes() {
 /// This test documents the current behavior that should change:
 /// in distributed mode, the writer should only store shards it owns.
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_writer_stores_all_shards_locally_without_transport() {
     let nodes = three_node_cluster(1024, 2, 1).await;
     let data = test_data(1024);
@@ -164,7 +168,7 @@ async fn test_writer_stores_all_shards_locally_without_transport() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     // Without transport, the writer stores ALL shards (k+m = 3) locally.
     let mut local_count = 0;

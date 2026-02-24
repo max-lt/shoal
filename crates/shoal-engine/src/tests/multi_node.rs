@@ -11,6 +11,7 @@ use super::helpers::{test_data, three_node_cluster};
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_three_node_put_get_same_node() {
     let nodes = three_node_cluster(1024, 2, 1).await;
     let data = test_data(5000);
@@ -32,6 +33,7 @@ async fn test_three_node_put_get_same_node() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_three_node_lose_one_shard_per_chunk() {
     // k=2, m=1 across 3 nodes. Lose 1 shard per chunk -> still reads.
     let nodes = three_node_cluster(512, 2, 1).await;
@@ -42,7 +44,7 @@ async fn test_three_node_lose_one_shard_per_chunk() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     // Delete 1 shard per chunk from the writing node's store.
     for chunk_meta in &manifest.chunks {
@@ -59,6 +61,7 @@ async fn test_three_node_lose_one_shard_per_chunk() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_three_node_k4_m2_lose_two_shards() {
     // k=4, m=2 across 3 nodes. Lose 2 shards per chunk -> still reads.
     let nodes = three_node_cluster(1024, 4, 2).await;
@@ -69,7 +72,7 @@ async fn test_three_node_k4_m2_lose_two_shards() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     // Delete 2 shards per chunk (parity shards).
     for chunk_meta in &manifest.chunks {
@@ -87,6 +90,7 @@ async fn test_three_node_k4_m2_lose_two_shards() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_three_node_k4_m2_lose_three_shards_fails() {
     // k=4, m=2. Lose 3 shards per chunk -> only 3 left < k=4, should fail.
     let nodes = three_node_cluster(1024, 4, 2).await;
@@ -97,7 +101,7 @@ async fn test_three_node_k4_m2_lose_three_shards_fails() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     for chunk_meta in &manifest.chunks {
         let mut deleted = 0;

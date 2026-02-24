@@ -11,6 +11,7 @@ use super::helpers::{single_node, test_data};
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_single_node_put_get() {
     let node = single_node(1024, 2, 1).await;
     let data = test_data(5000);
@@ -27,6 +28,7 @@ async fn test_single_node_put_get() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_single_node_put_get_exact_chunk() {
     let node = single_node(1024, 2, 1).await;
     // Exactly 2 chunks (2048 bytes, chunk_size=1024).
@@ -45,6 +47,7 @@ async fn test_single_node_put_get_exact_chunk() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_small_object() {
     let node = single_node(1024, 2, 1).await;
     let data = b"tiny data!".to_vec();
@@ -60,6 +63,7 @@ async fn test_small_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_single_byte_object() {
     let node = single_node(1024, 2, 1).await;
     let data = vec![42u8];
@@ -77,6 +81,7 @@ async fn test_single_byte_object() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_metadata_preserved() {
     let node = single_node(1024, 2, 1).await;
     let mut meta = BTreeMap::new();
@@ -96,17 +101,18 @@ async fn test_metadata_preserved() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_delete_object() {
     let node = single_node(1024, 2, 1).await;
     node.put_object("b", "del", b"data", BTreeMap::new())
         .await
         .unwrap();
 
-    assert!(node.has_object("b", "del").unwrap());
+    assert!(node.has_object("b", "del").await.unwrap());
 
     node.delete_object("b", "del").await.unwrap();
 
-    assert!(!node.has_object("b", "del").unwrap());
+    assert!(!node.has_object("b", "del").await.unwrap());
 
     // Get after delete returns ObjectNotFound.
     let err = node.get_object("b", "del").await.unwrap_err();
@@ -114,6 +120,7 @@ async fn test_delete_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_delete_nonexistent() {
     let node = single_node(1024, 2, 1).await;
     let err = node.delete_object("b", "nope").await.unwrap_err();
@@ -121,6 +128,7 @@ async fn test_delete_nonexistent() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_delete_then_reput() {
     let node = single_node(1024, 2, 1).await;
 
@@ -141,18 +149,20 @@ async fn test_delete_then_reput() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_has_object() {
     let node = single_node(1024, 2, 1).await;
-    assert!(!node.has_object("b", "k").unwrap());
+    assert!(!node.has_object("b", "k").await.unwrap());
 
     node.put_object("b", "k", b"val", BTreeMap::new())
         .await
         .unwrap();
 
-    assert!(node.has_object("b", "k").unwrap());
+    assert!(node.has_object("b", "k").await.unwrap());
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_list_objects() {
     let node = single_node(1024, 2, 1).await;
     node.put_object("b", "photos/a.jpg", b"a", BTreeMap::new())
@@ -165,17 +175,18 @@ async fn test_list_objects() {
         .await
         .unwrap();
 
-    let photos = node.list_objects("b", "photos/").unwrap();
+    let photos = node.list_objects("b", "photos/").await.unwrap();
     assert_eq!(photos.len(), 2);
 
-    let docs = node.list_objects("b", "docs/").unwrap();
+    let docs = node.list_objects("b", "docs/").await.unwrap();
     assert_eq!(docs.len(), 1);
 
-    let all = node.list_objects("b", "").unwrap();
+    let all = node.list_objects("b", "").await.unwrap();
     assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_list_objects_nested_prefixes() {
     let node = single_node(1024, 2, 1).await;
 
@@ -194,26 +205,27 @@ async fn test_list_objects_nested_prefixes() {
             .unwrap();
     }
 
-    let abc = node.list_objects("b", "a/b/c/").unwrap();
+    let abc = node.list_objects("b", "a/b/c/").await.unwrap();
     assert_eq!(abc.len(), 2);
 
-    let ab = node.list_objects("b", "a/b/").unwrap();
+    let ab = node.list_objects("b", "a/b/").await.unwrap();
     assert_eq!(ab.len(), 3);
 
-    let a = node.list_objects("b", "a/").unwrap();
+    let a = node.list_objects("b", "a/").await.unwrap();
     assert_eq!(a.len(), 4);
 
-    let all = node.list_objects("b", "").unwrap();
+    let all = node.list_objects("b", "").await.unwrap();
     assert_eq!(all.len(), 5);
 
-    let f = node.list_objects("b", "f/").unwrap();
+    let f = node.list_objects("b", "f/").await.unwrap();
     assert_eq!(f.len(), 1);
 
-    let nothing = node.list_objects("b", "z/").unwrap();
+    let nothing = node.list_objects("b", "z/").await.unwrap();
     assert!(nothing.is_empty());
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_head_object() {
     let node = single_node(1024, 2, 1).await;
     let data = test_data(3000);
@@ -228,20 +240,22 @@ async fn test_head_object() {
         .await
         .unwrap();
 
-    let manifest = node.head_object("b", "head").unwrap();
+    let manifest = node.head_object("b", "head").await.unwrap();
     assert_eq!(manifest.object_id, oid);
     assert_eq!(manifest.total_size, 3000);
     assert_eq!(manifest.metadata, meta);
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_head_nonexistent() {
     let node = single_node(1024, 2, 1).await;
-    let err = node.head_object("b", "nope").unwrap_err();
+    let err = node.head_object("b", "nope").await.unwrap_err();
     assert!(matches!(err, EngineError::ObjectNotFound { .. }));
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_head_object_chunk_count() {
     let node = single_node(256, 2, 1).await;
 
@@ -262,7 +276,7 @@ async fn test_head_object_chunk_count() {
         node.put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        let manifest = node.head_object("b", &key).unwrap();
+        let manifest = node.head_object("b", &key).await.unwrap();
         assert_eq!(
             manifest.chunks.len(),
             expected_chunks,
@@ -276,6 +290,7 @@ async fn test_head_object_chunk_count() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_overwrite_object() {
     let node = single_node(1024, 2, 1).await;
 
@@ -293,6 +308,7 @@ async fn test_overwrite_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_overwrite_changes_metadata() {
     let node = single_node(1024, 2, 1).await;
 
@@ -318,6 +334,7 @@ async fn test_overwrite_changes_metadata() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_object_id_deterministic() {
     let node = single_node(1024, 2, 1).await;
     let data = test_data(2000);
@@ -336,6 +353,7 @@ async fn test_object_id_deterministic() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_different_data_different_id() {
     let node = single_node(1024, 2, 1).await;
 
@@ -356,6 +374,7 @@ async fn test_different_data_different_id() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_multiple_buckets() {
     let node = single_node(1024, 2, 1).await;
 
@@ -378,6 +397,7 @@ async fn test_multiple_buckets() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_get_nonexistent_bucket() {
     let node = single_node(1024, 2, 1).await;
     let err = node
@@ -392,11 +412,12 @@ async fn test_get_nonexistent_bucket() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_manifest_version_field() {
     let node = single_node(1024, 2, 1).await;
     node.put_object("b", "k", b"data", BTreeMap::new())
         .await
         .unwrap();
-    let manifest = node.head_object("b", "k").unwrap();
+    let manifest = node.head_object("b", "k").await.unwrap();
     assert_eq!(manifest.version, shoal_types::MANIFEST_VERSION);
 }

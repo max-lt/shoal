@@ -335,11 +335,17 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             })
                         }
                         ShoalMessage::ManifestRequest { bucket, key } => {
+                            // Try MetaStore first, then fall back to LogTree.
                             let manifest_bytes = meta
                                 .get_object_key(&bucket, &key)
                                 .ok()
                                 .flatten()
                                 .and_then(|oid| meta.get_manifest(&oid).ok().flatten())
+                                .or_else(|| {
+                                    let lt = log_tree.as_ref()?;
+                                    let oid = lt.resolve(&bucket, &key).ok()??;
+                                    lt.get_manifest(&oid).ok()?
+                                })
                                 .and_then(|m| postcard::to_allocvec(&m).ok());
                             Some(ShoalMessage::ManifestResponse {
                                 bucket,

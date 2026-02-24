@@ -9,6 +9,7 @@ use super::helpers::{single_node, test_data};
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_empty_object() {
     let node = single_node(1024, 2, 1).await;
 
@@ -26,6 +27,7 @@ async fn test_empty_object() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_special_chars_in_key() {
     let node = single_node(1024, 2, 1).await;
     let data = b"special chars test".to_vec();
@@ -52,6 +54,7 @@ async fn test_special_chars_in_key() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_unicode_bucket_and_key() {
     let node = single_node(1024, 2, 1).await;
     let data = b"unicode test".to_vec();
@@ -72,6 +75,7 @@ async fn test_unicode_bucket_and_key() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_empty_key_name() {
     let node = single_node(1024, 2, 1).await;
     let data = b"empty key".to_vec();
@@ -88,6 +92,7 @@ async fn test_empty_key_name() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_data_exactly_one_chunk() {
     let node = single_node(256, 2, 1).await;
     let data = test_data(256);
@@ -101,6 +106,7 @@ async fn test_data_exactly_one_chunk() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_data_one_byte_over_chunk() {
     let node = single_node(256, 2, 1).await;
     let data = test_data(257);
@@ -116,6 +122,7 @@ async fn test_data_one_byte_over_chunk() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_data_one_byte_under_chunk() {
     let node = single_node(256, 2, 1).await;
     let data = test_data(255);
@@ -133,6 +140,7 @@ async fn test_data_one_byte_under_chunk() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_large_object() {
     let node = single_node(1024, 2, 1).await;
     let data = test_data(10_000);
@@ -149,6 +157,7 @@ async fn test_large_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_100kb_object() {
     let node = single_node(4096, 4, 2).await;
     let data = test_data(100_000);
@@ -166,6 +175,7 @@ async fn test_100kb_object() {
 }
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_1mb_object() {
     let node = single_node(8192, 4, 2).await;
     let data = test_data(1_000_000);
@@ -183,6 +193,7 @@ async fn test_1mb_object() {
 // -----------------------------------------------------------------------
 
 #[tokio::test]
+#[ntest::timeout(10000)]
 async fn test_many_objects_same_bucket() {
     let node = single_node(1024, 2, 1).await;
 
@@ -193,7 +204,7 @@ async fn test_many_objects_same_bucket() {
             .unwrap();
     }
 
-    let keys = node.list_objects("b", "").unwrap();
+    let keys = node.list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 100);
 
     // Spot check a few.
