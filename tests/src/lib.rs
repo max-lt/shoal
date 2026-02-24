@@ -317,8 +317,8 @@ impl IntegrationCluster {
     }
 
     /// Simulate manifest broadcast from one node to all others.
-    pub fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
+    pub async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
+        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         for (i, node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;

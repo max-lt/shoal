@@ -35,7 +35,7 @@ async fn test_5_node_consistent_ring() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // All 5 nodes should use the same ring for shard placement.
     // Verify by reading from each node.
@@ -86,7 +86,7 @@ async fn test_10_node_cluster() {
         .put_object("b", "big", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(3, "b", "big");
+    c.broadcast_manifest(3, "b", "big").await;
 
     // Read from various nodes.
     for &i in &[0, 4, 7, 9] {

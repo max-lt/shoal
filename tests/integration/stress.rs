@@ -34,7 +34,7 @@ async fn test_concurrent_writers_1000_objects() {
                     .put_object("stress", &key, &data, BTreeMap::new())
                     .await
                     .unwrap();
-                cluster.broadcast_manifest(node, "stress", &key);
+                cluster.broadcast_manifest(node, "stress", &key).await;
             }
         }));
     }
@@ -73,7 +73,7 @@ async fn test_concurrent_read_write() {
             .put_object("rw", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i as usize % 5, "rw", &key);
+        c.broadcast_manifest(i as usize % 5, "rw", &key).await;
     }
 
     // Spawn 5 writer tasks writing new objects.
@@ -95,7 +95,7 @@ async fn test_concurrent_read_write() {
                     .put_object("rw", &key, &data, BTreeMap::new())
                     .await
                     .unwrap();
-                cluster.broadcast_manifest(writer_id, "rw", &key);
+                cluster.broadcast_manifest(writer_id, "rw", &key).await;
             }
         }));
     }
@@ -156,7 +156,7 @@ async fn test_no_data_corruption() {
             .put_object("verify", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i % 5, "verify", &key);
+        c.broadcast_manifest(i % 5, "verify", &key).await;
     }
 
     // Read back from different nodes, verify every byte.

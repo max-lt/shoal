@@ -24,7 +24,7 @@ async fn test_100_objects_varying_sizes() {
             .put_object("test", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "test", &key);
+        c.broadcast_manifest(writer, "test", &key).await;
 
         objects.push((key, data));
     }
@@ -76,7 +76,7 @@ async fn test_write_then_read_different_node() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         let (got, _) = c.node(reader).get_object("b", &key).await.unwrap();
         assert_eq!(got, data, "cross-node read failed for {key}");
@@ -96,7 +96,7 @@ async fn test_large_objects_1mb() {
             .put_object("big", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i as usize % 5, "big", &key);
+        c.broadcast_manifest(i as usize % 5, "big", &key).await;
 
         let reader = (i as usize + 3) % 5;
         let (got, _) = c.node(reader).get_object("big", &key).await.unwrap();
@@ -119,12 +119,12 @@ async fn test_all_nodes_list_same_objects() {
             .put_object("catalog", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "catalog", &key);
+        c.broadcast_manifest(writer, "catalog", &key).await;
     }
 
     // Every node should list 30 objects.
     for i in 0..5 {
-        let keys = c.node(i).list_objects("catalog", "").unwrap();
+        let keys = c.node(i).list_objects("catalog", "").await.unwrap();
         assert_eq!(
             keys.len(),
             30,
@@ -157,14 +157,16 @@ async fn test_list_objects_with_prefix() {
             .await
             .unwrap();
 
-        c.broadcast_manifest(0, "b", &format!("images/photo-{i}.jpg"));
-        c.broadcast_manifest(0, "b", &format!("docs/readme-{i}.md"));
+        c.broadcast_manifest(0, "b", &format!("images/photo-{i}.jpg"))
+            .await;
+        c.broadcast_manifest(0, "b", &format!("docs/readme-{i}.md"))
+            .await;
     }
 
     for i in 0..5 {
-        let images = c.node(i).list_objects("b", "images/").unwrap();
-        let docs = c.node(i).list_objects("b", "docs/").unwrap();
-        let all = c.node(i).list_objects("b", "").unwrap();
+        let images = c.node(i).list_objects("b", "images/").await.unwrap();
+        let docs = c.node(i).list_objects("b", "docs/").await.unwrap();
+        let all = c.node(i).list_objects("b", "").await.unwrap();
 
         assert_eq!(images.len(), 10, "node {i}: images prefix");
         assert_eq!(docs.len(), 10, "node {i}: docs prefix");

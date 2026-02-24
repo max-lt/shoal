@@ -53,7 +53,7 @@ async fn test_random_kill_no_data_loss() {
                     .await
                 {
                     Ok(_) => {
-                        cluster.broadcast_manifest(node, "chaos", &key);
+                        cluster.broadcast_manifest(node, "chaos", &key).await;
                         keys.write().await.push((key, data));
                         wc.fetch_add(1, Ordering::Relaxed);
                     }
