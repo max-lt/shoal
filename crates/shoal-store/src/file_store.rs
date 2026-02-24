@@ -443,6 +443,55 @@ mod tests {
         );
     }
 
+    /// Reproduction of torture test Bug 2: ENOENT race condition on concurrent
+    /// writes. Under 50+ parallel PUT requests, the FileStore hits
+    /// `No such file or directory (os error 2)`. The hypothesis is that
+    /// concurrent `create_dir_all` + `write` + `rename` operations on a
+    /// fresh directory tree race with each other.
+    #[tokio::test]
+    async fn test_bug2_concurrent_writes_no_enoent() {
+        let (store, _dir) = make_store().await;
+        let store = std::sync::Arc::new(store);
+
+        // Create 100 different shards (more than the 50 in the torture test
+        // to increase the chance of triggering the race).
+        let shards: Vec<(ShardId, Bytes)> = (0..100)
+            .map(|i| {
+                let data = Bytes::from(format!("concurrent-shard-data-{i:04}"));
+                let id = ShardId::from_data(&data);
+                (id, data)
+            })
+            .collect();
+
+        // Write all 100 in parallel — this is the pattern that triggers the
+        // ENOENT race on a fresh FileStore where directories don't exist yet.
+        let mut handles = Vec::new();
+
+        for (id, data) in shards.clone() {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move { store.put(id, data).await }));
+        }
+
+        for (i, handle) in handles.into_iter().enumerate() {
+            let result = handle.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "BUG 2: concurrent put {i} failed with ENOENT: {:?}",
+                result.err()
+            );
+        }
+
+        // Verify all shards are readable.
+        for (id, expected) in &shards {
+            let got = store.get(*id).await.unwrap();
+            assert_eq!(
+                got.as_deref(),
+                Some(expected.as_ref()),
+                "shard {id} should be readable after concurrent write"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_atomic_write_no_tmp_file_left() {
         let (store, dir) = make_store().await;

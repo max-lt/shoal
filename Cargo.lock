@@ -3727,6 +3727,7 @@ dependencies = [
  "blake3",
  "bytes",
  "libc",
+ "rand",
  "shoal-types",
  "tempfile",
  "thiserror 2.0.18",

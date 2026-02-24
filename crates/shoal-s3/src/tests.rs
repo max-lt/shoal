@@ -715,6 +715,66 @@ fn test_xml_escape() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Bug 3 repro: maxKeys parameter ignored in ListObjectsV2
+// -----------------------------------------------------------------------
+
+/// Reproduction of torture test Bug 3: when `max-keys=2` is passed as a
+/// query parameter in ListObjectsV2, the response should only contain 2
+/// keys and `IsTruncated` should be `true`. Currently the server ignores
+/// `max-keys` entirely and always returns all matching objects.
+#[tokio::test]
+async fn test_bug3_list_objects_max_keys_ignored() {
+    let app = test_router().await;
+
+    // Write 5 objects with a shared prefix.
+    for i in 0..5 {
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/mybucket/page/item-{i}"))
+                    .body(Body::from(format!("value-{i}")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    // List with max-keys=2.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mybucket?list-type=2&prefix=page/&max-keys=2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    // BUG 3: maxKeys is ignored — all 5 objects are returned instead of 2.
+    // The XML response hardcodes <MaxKeys>1000</MaxKeys> and
+    // <IsTruncated>false</IsTruncated> regardless of query params.
+    assert!(
+        body.contains("<KeyCount>2</KeyCount>"),
+        "BUG 3: expected max-keys=2 to limit results to 2, but got: {body}"
+    );
+    assert!(
+        body.contains("<IsTruncated>true</IsTruncated>"),
+        "BUG 3: response should be truncated when max-keys < total keys: {body}"
+    );
+    assert!(
+        body.contains("<MaxKeys>2</MaxKeys>"),
+        "BUG 3: MaxKeys should echo the requested value (2), not 1000: {body}"
+    );
+}
+
 #[test]
 fn test_parse_complete_multipart_request() {
     let body = "\

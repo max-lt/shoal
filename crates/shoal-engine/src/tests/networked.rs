@@ -11,12 +11,13 @@ use shoal_cluster::ClusterState;
 use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
-use shoal_store::{MemoryStore, ShardStore};
+use shoal_store::{MemoryStore, ShardStore, SlowStore};
 use shoal_types::*;
 use tokio::sync::RwLock;
 
 use crate::node::{ShoalNode, ShoalNodeConfig};
 
+use super::chaos::{ChaosConfig, ChaosController, ChaosTransport};
 use super::helpers::{TEST_MAX_BYTES, test_data};
 
 // =========================================================================
@@ -225,13 +226,16 @@ struct TestCluster {
     /// The nodes hold their own Arc clones via `.with_log_tree()`.
     #[allow(dead_code)]
     log_trees: Vec<Option<Arc<LogTree>>>,
+    /// Optional chaos controller for fault injection tests.
+    #[allow(dead_code)]
+    chaos_controller: Option<Arc<ChaosController>>,
 }
 
 impl TestCluster {
     /// Create an N-node cluster. Seeds start at 1 (seed=0 gives an invalid key).
     /// Uses shard_replication=1 (each shard on exactly one node).
     async fn new(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
-        Self::build(n, chunk_size, k, m, 1, false).await
+        Self::build(n, chunk_size, k, m, 1, false, None).await
     }
 
     /// Create an N-node cluster with a custom shard replication factor.
@@ -243,12 +247,17 @@ impl TestCluster {
         m: usize,
         shard_replication: usize,
     ) -> Self {
-        Self::build(n, chunk_size, k, m, shard_replication, false).await
+        Self::build(n, chunk_size, k, m, shard_replication, false, None).await
     }
 
     /// Create an N-node cluster with LogTree enabled.
     async fn with_log_tree(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
-        Self::build(n, chunk_size, k, m, 1, true).await
+        Self::build(n, chunk_size, k, m, 1, true, None).await
+    }
+
+    /// Create an N-node cluster with chaos fault injection.
+    async fn with_chaos(n: usize, chunk_size: u32, k: usize, m: usize, chaos: ChaosConfig) -> Self {
+        Self::build(n, chunk_size, k, m, 1, false, Some(chaos)).await
     }
 
     /// Internal builder that supports all configuration options.
@@ -259,6 +268,7 @@ impl TestCluster {
         m: usize,
         shard_replication: usize,
         use_log_tree: bool,
+        chaos_config: Option<ChaosConfig>,
     ) -> Self {
         assert!(n >= 2, "need at least 2 nodes");
         assert!(n <= 200, "seed byte overflow");
@@ -280,8 +290,31 @@ impl TestCluster {
                 .await;
         }
 
+        // Create the chaos controller if configured.
+        let chaos_controller = chaos_config
+            .as_ref()
+            .map(|c| Arc::new(ChaosController::new(c.clone())));
+
         let stores: Vec<Arc<dyn ShardStore>> = (0..n)
-            .map(|_| Arc::new(MemoryStore::new(TEST_MAX_BYTES)) as Arc<dyn ShardStore>)
+            .map(|i| {
+                let mem: Arc<dyn ShardStore> = Arc::new(MemoryStore::new(TEST_MAX_BYTES));
+
+                if let Some(ref cfg) = chaos_config {
+                    let (rmin, rmax) = cfg.store_read_latency_ms;
+                    let (wmin, wmax) = cfg.store_write_latency_ms;
+
+                    if rmax > 0 || wmax > 0 {
+                        return Arc::new(
+                            SlowStore::new(mem)
+                                .read_latency(rmin, rmax)
+                                .write_latency(wmin, wmax)
+                                .seed(cfg.seed.wrapping_add(i as u64)),
+                        ) as Arc<dyn ShardStore>;
+                    }
+                }
+
+                mem
+            })
             .collect();
 
         let down_nodes: Arc<RwLock<HashSet<NodeId>>> = Arc::new(RwLock::new(HashSet::new()));
@@ -332,12 +365,22 @@ impl TestCluster {
 
         let mut nodes = Vec::with_capacity(n);
         for i in 0..n {
-            let transport: Arc<dyn Transport> = Arc::new(FailableMockTransport {
+            let base_transport: Arc<dyn Transport> = Arc::new(FailableMockTransport {
                 stores: store_map.clone(),
                 metas: meta_map.clone(),
                 log_trees: log_tree_map.clone(),
                 down_nodes: down_nodes.clone(),
             });
+
+            let transport: Arc<dyn Transport> = if let Some(ref ctrl) = chaos_controller {
+                Arc::new(ChaosTransport::new(
+                    node_ids[i],
+                    ctrl.clone(),
+                    base_transport,
+                ))
+            } else {
+                base_transport
+            };
             let book: HashMap<NodeId, iroh::EndpointAddr> = full_book
                 .iter()
                 .filter(|(nid, _)| **nid != node_ids[i])
@@ -375,6 +418,7 @@ impl TestCluster {
             cluster,
             down_nodes,
             log_trees: log_tree_instances,
+            chaos_controller,
         }
     }
 
@@ -1890,4 +1934,379 @@ async fn test_retry_pending_pushes_cleans_up() {
         let (got, _) = c.node(i).get_object("b", "k").await.unwrap();
         assert_eq!(got, data, "node {i} should read after retry");
     }
+}
+
+// =========================================================================
+// Torture test bug reproductions
+// =========================================================================
+
+/// Reproduction of torture test Bug 1: read fails on large binary objects
+/// after ACK-based cleanup.
+///
+/// Error from torture test:
+///   `engine error: read failed: not enough shards for chunk 0: need 2, found 1`
+///
+/// The hypothesis: ACK cleanup deletes non-owned shards from the writer
+/// after successful push. With shard_replication=1, each shard lives on
+/// exactly one ring owner. If the reader can't reach some ring owners
+/// (or the ring assigns shards to a node that doesn't have them), reads fail.
+///
+/// With mock transport (all nodes reachable), this should pass. If it fails,
+/// the ACK cleanup logic has a bug. In the real cluster, this manifests
+/// because QUIC pushes may succeed from the transport's perspective but the
+/// remote node drops the shard (e.g. backpressure, disk full).
+#[tokio::test]
+async fn test_bug1_large_object_read_after_ack_cleanup() {
+    // 4-node cluster matching torture test: k=2 m=2 → 4 shards/chunk.
+    // shard_replication=1 (each shard on exactly one node).
+    let c = TestCluster::new(4, 262_144, 2, 2).await;
+
+    // 15 MB of random-ish data (matches torture test's failing case).
+    let data = test_data(15 * 1024 * 1024);
+
+    // Write from node 0.
+    c.node(0)
+        .put_object("b", "large-binary", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "large-binary");
+
+    // After ACK cleanup, the writer should NOT have all shards — only the
+    // ones it's a ring owner for.
+    let manifest = c.node(0).head_object("b", "large-binary").unwrap();
+    let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
+    let writer_shards = c.local_shard_count(0).await;
+    assert!(
+        writer_shards < total_shards,
+        "ACK cleanup should have removed some shards from writer: {writer_shards}/{total_shards}"
+    );
+
+    // BUG 1: read from writer — if ACK cleanup was too aggressive or shards
+    // weren't properly stored on remote nodes, this fails with:
+    //   "not enough shards for chunk N: need 2, found 1"
+    let (got, _) = c
+        .node(0)
+        .get_object("b", "large-binary")
+        .await
+        .expect("BUG 1: read failed after ACK cleanup on large object");
+    assert_eq!(got.len(), data.len(), "data length mismatch");
+    assert_eq!(got, data, "data content mismatch");
+
+    // Also verify all other nodes can read.
+    for i in 1..4 {
+        let (got, _) = c
+            .node(i)
+            .get_object("b", "large-binary")
+            .await
+            .unwrap_or_else(|e| panic!("BUG 1: node {i} failed to read large object: {e}"));
+        assert_eq!(got, data, "node {i} data mismatch");
+    }
+}
+
+/// Reproduction of torture test Bug 4: no cross-node replication.
+///
+/// An object written to node 0 should be visible from node 1 WITHOUT
+/// manual `broadcast_manifest`. In the mock transport, `send_to` delivers
+/// `ManifestPut` messages directly to the peer's MetaStore. If this test
+/// passes with mock transport but fails in the real cluster, the bug is
+/// in the iroh QUIC transport layer (messages not being delivered).
+///
+/// Note: the existing `test_logtree_put_broadcasts_to_peers` tests this
+/// for LogTree mode. This test covers the non-LogTree (MetaStore) path
+/// which is what the torture test's `shoald` cluster uses by default.
+#[tokio::test]
+async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
+    // 4-node cluster matching torture test setup (ports 4821-4824).
+    let c = TestCluster::new(4, 1024, 2, 2).await;
+    let data = test_data(5000);
+
+    // Write on node 0 — put_object internally broadcasts the manifest
+    // to all peers via transport.send_to (ManifestPut message).
+    c.node(0)
+        .put_object("b", "cross-node-test", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // BUG 4: read from other nodes WITHOUT calling broadcast_manifest.
+    // In the real cluster, this fails with NoSuchKey because the LogTree/
+    // manifest broadcast never reaches the other nodes.
+    for i in 1..4 {
+        let result = c.node(i).get_object("b", "cross-node-test").await;
+        assert!(
+            result.is_ok(),
+            "BUG 4: node {i} cannot see object written to node 0 — \
+             cross-node replication failed: {:?}",
+            result.err()
+        );
+        let (got, _) = result.unwrap();
+        assert_eq!(got, data, "node {i} data mismatch");
+    }
+
+    // Also verify list_objects works across nodes.
+    for i in 1..4 {
+        let keys = c.node(i).list_objects("b", "").unwrap();
+        assert!(
+            keys.contains(&"cross-node-test".to_string()),
+            "BUG 4: node {i} list_objects doesn't include the key"
+        );
+    }
+}
+
+/// Same as Bug 4 but with LogTree mode (which is what the real shoald uses).
+#[tokio::test]
+async fn test_bug4_cross_node_visibility_logtree_mode() {
+    let c = TestCluster::with_log_tree(4, 1024, 2, 2).await;
+    let data = test_data(5000);
+
+    // Write on node 0.
+    c.node(0)
+        .put_object("b", "cross-node-lt", &data, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Read from all other nodes without any manual sync.
+    for i in 1..4 {
+        let result = c.node(i).get_object("b", "cross-node-lt").await;
+        assert!(
+            result.is_ok(),
+            "BUG 4 (LogTree): node {i} cannot see object written to node 0: {:?}",
+            result.err()
+        );
+        let (got, _) = result.unwrap();
+        assert_eq!(got, data, "node {i} data mismatch");
+    }
+}
+
+// =========================================================================
+// Chaos tests — fault injection scenarios
+// =========================================================================
+
+/// Chaos test for Bug 1: large object read with network latency.
+///
+/// With transport latency injected, shards must still be fully distributed
+/// before PUT returns, and reads from all nodes must succeed.
+#[tokio::test]
+async fn test_chaos_large_object_read_with_latency() {
+    let chaos = ChaosConfig {
+        latency_ms: (10, 50),
+        drop_rate: 0.0,
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos(4, 4096, 2, 2, chaos).await;
+
+    // 1 MB object — enough chunks to exercise the pipeline under latency.
+    let data = test_data(1_048_576);
+
+    c.node(0)
+        .put_object("b", "large", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "large");
+
+    // Read from the writer.
+    let (got, _) = c
+        .node(0)
+        .get_object("b", "large")
+        .await
+        .expect("writer should read its own large object under latency");
+    assert_eq!(got, data);
+
+    // Read from all other nodes.
+    for i in 1..4 {
+        let (got, _) = c
+            .node(i)
+            .get_object("b", "large")
+            .await
+            .unwrap_or_else(|e| panic!("node {i} failed to read large object under latency: {e}"));
+        assert_eq!(got, data, "node {i} data mismatch");
+    }
+}
+
+/// Chaos test for Bug 2: concurrent writes with slow store IO.
+///
+/// With per-operation store latency, 50 concurrent writes must all succeed
+/// and be readable afterward.
+#[tokio::test]
+async fn test_chaos_concurrent_writes_with_slow_store() {
+    let chaos = ChaosConfig {
+        store_write_latency_ms: (5, 15),
+        store_read_latency_ms: (2, 8),
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = Arc::new(TestCluster::with_chaos(3, 1024, 2, 1, chaos).await);
+    let n_objects = 50;
+
+    // Spawn concurrent writers.
+    let mut handles = Vec::new();
+
+    for j in 0..n_objects {
+        let cluster = c.clone();
+        handles.push(tokio::spawn(async move {
+            let key = format!("obj-{j}");
+            let data = test_data(500 + j * 37);
+            cluster
+                .node(j % 3)
+                .put_object("b", &key, &data, BTreeMap::new())
+                .await
+                .unwrap_or_else(|e| panic!("concurrent write {key} failed: {e}"));
+            cluster.broadcast_manifest(j % 3, "b", &key);
+        }));
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // Read back all objects from each node.
+    for j in 0..n_objects {
+        let key = format!("obj-{j}");
+        let expected = test_data(500 + j * 37);
+
+        for reader in 0..3 {
+            let (got, _) = c
+                .node(reader)
+                .get_object("b", &key)
+                .await
+                .unwrap_or_else(|e| panic!("node {reader} failed to read {key}: {e}"));
+            assert_eq!(got, expected, "node {reader} data mismatch for {key}");
+        }
+    }
+}
+
+/// Chaos test for Bug 4: cross-node visibility with packet drops.
+///
+/// With a 10% drop rate, the manifest broadcast from `put_object` may not
+/// reach all nodes. After retrying via `sync_manifests_from_peers`, the
+/// object must become visible.
+#[tokio::test]
+async fn test_chaos_cross_node_with_drop() {
+    let chaos = ChaosConfig {
+        latency_ms: (10, 30),
+        drop_rate: 0.10,
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos(4, 1024, 2, 2, chaos).await;
+    let data = test_data(5000);
+
+    // Write on node 0 — broadcast may be dropped for some peers.
+    c.node(0)
+        .put_object("b", "dropped", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "dropped");
+
+    // Try to read from node 1. If the broadcast was dropped, sync first.
+    let result = c.node(1).get_object("b", "dropped").await;
+
+    if result.is_err() {
+        // Manifest didn't arrive — sync from peers (this uses pull_all_manifests
+        // which also goes through chaos, but retries internally).
+        let synced = c.node(1).sync_manifests_from_peers().await.unwrap();
+        assert!(synced >= 1, "sync should recover the dropped manifest");
+    }
+
+    // Now it must be readable.
+    let (got, _) = c
+        .node(1)
+        .get_object("b", "dropped")
+        .await
+        .expect("node 1 should read after sync recovery from drops");
+    assert_eq!(got, data);
+}
+
+/// Chaos test: network partition then heal.
+///
+/// Node 2 is partitioned from nodes 0 and 1. A new object written on
+/// node 0 won't reach node 2 via broadcast. After healing, retrying
+/// pending pushes, and syncing manifests, node 2 must see the object.
+#[tokio::test]
+async fn test_chaos_partition_then_heal() {
+    let chaos = ChaosConfig {
+        latency_ms: (5, 10),
+        seed: 42,
+        ..Default::default()
+    };
+
+    let c = TestCluster::with_chaos(4, 1024, 2, 2, chaos).await;
+    let data_before = test_data(3000);
+    let data_during = test_data(5000);
+    let controller = c.chaos_controller.as_ref().unwrap();
+
+    // Write an object while all nodes are reachable.
+    c.node(0)
+        .put_object("b", "before", &data_before, BTreeMap::new())
+        .await
+        .unwrap();
+    c.broadcast_manifest(0, "b", "before");
+
+    // All nodes can read it.
+    let (got, _) = c.node(2).get_object("b", "before").await.unwrap();
+    assert_eq!(got, data_before, "node 2 should read 'before' object");
+
+    // Partition node 2 from nodes 0 and 1.
+    controller.partition(c.node_ids[0], c.node_ids[2]).await;
+    controller.partition(c.node_ids[1], c.node_ids[2]).await;
+
+    // Write a new object on node 0 — the transport broadcast to node 2
+    // will be blocked by the partition. Shard pushes to node 2 also fail.
+    c.node(0)
+        .put_object("b", "during", &data_during, BTreeMap::new())
+        .await
+        .unwrap();
+
+    // Node 2 should NOT see the "during" object (missed the broadcast).
+    let keys = c.node(2).list_objects("b", "").unwrap();
+    assert!(
+        !keys.contains(&"during".to_string()),
+        "node 2 should not see 'during' while partitioned"
+    );
+
+    // Node 2 can still read the pre-partition object.
+    let (got, _) = c.node(2).get_object("b", "before").await.unwrap();
+    assert_eq!(got, data_before, "pre-partition object still readable");
+
+    // Heal the partition.
+    controller.heal(c.node_ids[0], c.node_ids[2]).await;
+    controller.heal(c.node_ids[1], c.node_ids[2]).await;
+
+    // Retry pending pushes on the writer — pushes that failed during the
+    // partition (shards destined for node 2) will now succeed.
+    let retried = c.node(0).retry_pending_pushes().await;
+    assert!(
+        retried > 0 || c.node(0).pending_push_count() == 0,
+        "pending pushes should either succeed or already be drained"
+    );
+
+    // Node 2 syncs manifests from peers — should learn about "during".
+    let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
+    assert!(synced >= 1, "sync should find the 'during' manifest");
+
+    // Node 2 can now list both objects.
+    let mut keys = c.node(2).list_objects("b", "").unwrap();
+    keys.sort();
+    assert!(
+        keys.contains(&"during".to_string()),
+        "node 2 should see 'during' after sync"
+    );
+
+    // Node 2 reads the new object (shards are available now via retry).
+    let (got, _) = c
+        .node(2)
+        .get_object("b", "during")
+        .await
+        .expect("node 2 should read 'during' after partition healed");
+    assert_eq!(got, data_during);
+
+    // Verify chaos stats show some partitioned messages.
+    let stats = controller.stats();
+    assert!(
+        stats.partitioned > 0,
+        "chaos stats should show partitioned messages: {stats:?}"
+    );
 }

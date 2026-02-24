@@ -9,9 +9,11 @@
 mod error;
 mod file_store;
 mod memory_store;
+pub mod slow_store;
 mod traits;
 
 pub use error::StoreError;
 pub use file_store::FileStore;
 pub use memory_store::MemoryStore;
+pub use slow_store::SlowStore;
 pub use traits::{ShardStore, StorageCapacity};
