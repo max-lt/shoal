@@ -68,6 +68,18 @@ pub trait Transport: Send + Sync {
         addr: iroh::EndpointAddr,
         my_tips: &[[u8; 32]],
     ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError>;
+
+    /// Targeted pull: request specific entries and their ancestor chain.
+    ///
+    /// Sends the hashes of entries we need (e.g. missing parents from the
+    /// pending buffer) plus our tips. The responder walks backward from
+    /// `entry_hashes` and returns the transitive closure up to our tips.
+    async fn pull_log_sync(
+        &self,
+        addr: iroh::EndpointAddr,
+        entry_hashes: &[[u8; 32]],
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

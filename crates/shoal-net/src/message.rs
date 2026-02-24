@@ -136,6 +136,28 @@ pub enum ShoalMessage {
         /// Associated manifests: (ObjectId, postcard-serialized Manifest).
         manifests: Vec<(ObjectId, Vec<u8>)>,
     },
+
+    /// Targeted pull: request specific entries and their ancestor chain.
+    ///
+    /// The responder does BFS backward from `entry_hashes` through parents,
+    /// stopping at entries in `requester_tips` (already known to the requester)
+    /// or at DAG roots. Returns entries in topological order.
+    ///
+    /// This is LOCAL-ONLY on the responder side — no recursive peer pull.
+    LogSyncPull {
+        /// Hashes of entries the requester needs (typically missing parents).
+        entry_hashes: Vec<[u8; 32]>,
+        /// The requester's current DAG tip hashes (stop traversal here).
+        requester_tips: Vec<[u8; 32]>,
+    },
+
+    /// Response to a [`ShoalMessage::LogSyncPull`].
+    LogSyncPullResponse {
+        /// Entries in topological order (parents before children).
+        entries: Vec<Vec<u8>>,
+        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
+        manifests: Vec<(ObjectId, Vec<u8>)>,
+    },
 }
 
 /// A single manifest entry in a [`ShoalMessage::ManifestSyncResponse`].

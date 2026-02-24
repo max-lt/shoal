@@ -131,7 +131,7 @@ async fn test_overwrite_consistency() {
     }
 
     // Only 1 key should be listed.
-    let keys = c.node(0).list_objects("overwrite", "").unwrap();
+    let keys = c.node(0).list_objects("overwrite", "").await.unwrap();
     assert_eq!(keys.len(), 1, "should have exactly 1 key after overwrites");
 }
 
@@ -336,9 +336,9 @@ async fn test_concurrent_mixed_operations() {
         let lc = list_count.clone();
         handles.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                let _ = cluster.node(0).list_objects("mix", "");
-                let _ = cluster.node(0).list_objects("mix", "mix-w0");
-                let _ = cluster.node(0).list_objects("mix", "mix-w1");
+                let _ = cluster.node(0).list_objects("mix", "").await;
+                let _ = cluster.node(0).list_objects("mix", "mix-w0").await;
+                let _ = cluster.node(0).list_objects("mix", "mix-w1").await;
                 lc.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -637,7 +637,7 @@ async fn test_metadata_round_trip() {
     c.broadcast_manifest(0, "meta", "tagged.bin").await;
 
     // HEAD from a different node.
-    let manifest = c.node(2).head_object("meta", "tagged.bin").unwrap();
+    let manifest = c.node(2).head_object("meta", "tagged.bin").await.unwrap();
     assert_eq!(manifest.metadata, metadata);
     assert_eq!(manifest.total_size, 3000);
 
@@ -686,7 +686,7 @@ async fn test_delete_then_list_consistency() {
     }
 
     // List should return exactly the kept keys.
-    let mut listed = c.node(0).list_objects("dl", "").unwrap();
+    let mut listed = c.node(0).list_objects("dl", "").await.unwrap();
     listed.sort();
     kept.sort();
     assert_eq!(listed, kept, "list after delete should match kept keys");
@@ -730,7 +730,7 @@ async fn test_multi_bucket_isolation() {
 
     // Verify each bucket's objects are independent.
     for (bi, bucket) in buckets.iter().enumerate() {
-        let keys = c.node(0).list_objects(bucket, "").unwrap();
+        let keys = c.node(0).list_objects(bucket, "").await.unwrap();
         assert_eq!(
             keys.len(),
             10,

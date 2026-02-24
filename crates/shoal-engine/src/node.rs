@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ShardCache;
 use crate::error::EngineError;
+use crate::pending::{self, PendingBuffer};
 
 /// A shard that failed to push to its ring owner and needs retry.
 struct PendingPush {
@@ -123,6 +124,12 @@ pub struct ShoalNode {
     /// Uses `std::sync::Mutex` (not tokio) — the critical section is pure
     /// in-memory Vec ops with no I/O.
     pending_pushes: Mutex<Vec<PendingPush>>,
+    /// Shared buffer for log entries waiting for missing parents.
+    ///
+    /// Set via [`with_pending_buffer`](ShoalNode::with_pending_buffer).
+    /// Used by `has_object`/`head_object` to detect pending entries
+    /// and trigger targeted pulls from the entry's author.
+    pending_entries: Option<PendingBuffer>,
 }
 
 impl ShoalNode {
@@ -151,6 +158,7 @@ impl ShoalNode {
             log_tree: None,
             gossip: None,
             pending_pushes: Mutex::new(Vec::new()),
+            pending_entries: None,
         }
     }
 
@@ -178,6 +186,17 @@ impl ShoalNode {
     /// instead of unicast QUIC streams.
     pub fn with_gossip(mut self, handle: GossipHandle) -> Self {
         self.gossip = Some(handle);
+        self
+    }
+
+    /// Set the pending entry buffer for targeted pull on miss.
+    ///
+    /// This buffer is shared with the protocol handler. When
+    /// `has_object`/`head_object` miss locally, the engine checks
+    /// this buffer for pending entries referencing the key. If found,
+    /// a targeted pull is triggered from the entry's author.
+    pub fn with_pending_buffer(mut self, buf: PendingBuffer) -> Self {
+        self.pending_entries = Some(buf);
         self
     }
 
@@ -762,25 +781,45 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Check if an object exists (local-only).
+    /// Check if an object exists.
     ///
-    /// Returns `true` if the object key is known locally (LogTree or
-    /// MetaStore). Does NOT query peers — this is a fast path used
-    /// by the S3 layer and tests. Use `get_object` for the full
-    /// read path with peer fallback.
-    pub fn has_object(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
+    /// Local-first: checks LogTree or MetaStore. If the key is not found
+    /// but there are pending log entries for this key (entries whose
+    /// parents haven't arrived yet), triggers a targeted pull from the
+    /// entry's author and retries.
+    pub async fn has_object(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
+        // Fast path: local resolve.
+        if self.has_object_local(bucket, key)? {
+            return Ok(true);
+        }
+
+        // Check pending buffer — if an entry for this key is buffered,
+        // its parents may be missing. Pull from the author and retry.
+        if self.targeted_pull_for_key(bucket, key).await? {
+            return self.has_object_local(bucket, key);
+        }
+
+        Ok(false)
+    }
+
+    /// Local-only check without network.
+    fn has_object_local(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
         if let Some(log_tree) = &self.log_tree {
             return Ok(log_tree.resolve(bucket, key)?.is_some());
         }
         Ok(self.meta.get_object_key(bucket, key)?.is_some())
     }
 
-    /// List objects in a bucket with an optional prefix (local-only).
+    /// List objects in a bucket with an optional prefix.
     ///
-    /// Returns keys known locally via LogTree or MetaStore. Does NOT
-    /// query peers — cross-node visibility is handled by gossip and
+    /// Returns keys known locally via LogTree or MetaStore. Listing is
+    /// always local — cross-node visibility is handled by gossip and
     /// periodic sync, not inline on every list call.
-    pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
+    pub async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, EngineError> {
         if let Some(log_tree) = &self.log_tree {
             Ok(log_tree.list_keys(bucket, prefix)?)
         } else {
@@ -788,12 +827,32 @@ impl ShoalNode {
         }
     }
 
-    /// Retrieve object metadata (manifest) without fetching data (local-only).
+    /// Retrieve object metadata (manifest) without fetching data.
     ///
-    /// Looks up the manifest from LogTree or MetaStore. Does NOT query
-    /// peers — use `get_object` for the full read path with peer
-    /// fallback, or call `sync_manifests_from_peers` explicitly first.
-    pub fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+    /// Local-first: checks LogTree and MetaStore. If not found but there
+    /// are pending log entries for this key, triggers a targeted pull
+    /// from the entry's author and retries.
+    pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+        // Fast path: try local.
+        if let Ok(m) = self.head_object_local(bucket, key) {
+            return Ok(m);
+        }
+
+        // Check pending buffer and targeted pull.
+        if self.targeted_pull_for_key(bucket, key).await?
+            && let Ok(m) = self.head_object_local(bucket, key)
+        {
+            return Ok(m);
+        }
+
+        Err(EngineError::ObjectNotFound {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        })
+    }
+
+    /// Local-only head_object without network.
+    fn head_object_local(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
         // LogTree mode.
         if let Some(log_tree) = &self.log_tree
             && let Some(object_id) = log_tree.resolve(bucket, key)?
@@ -1019,6 +1078,95 @@ impl ShoalNode {
     // ------------------------------------------------------------------
     // Private helpers
     // ------------------------------------------------------------------
+
+    /// Targeted pull: if we have pending log entries for this key,
+    /// pull missing parents from the entry's author.
+    ///
+    /// Returns `true` if a pull was attempted (regardless of success),
+    /// indicating the caller should retry its local lookup.
+    async fn targeted_pull_for_key(&self, bucket: &str, key: &str) -> Result<bool, EngineError> {
+        let (log_tree, pending, transport) =
+            match (&self.log_tree, &self.pending_entries, &self.transport) {
+                (Some(lt), Some(pe), Some(tr)) => (lt, pe, tr),
+                _ => return Ok(false),
+            };
+
+        // Check if any pending entry references this key.
+        let author = match pending::pending_author_for_key(pending, bucket, key) {
+            Some(a) => a,
+            None => return Ok(false),
+        };
+
+        // Collect the missing parent hashes.
+        let missing = pending::missing_parents_for_key(pending, log_tree, bucket, key);
+
+        if missing.is_empty() {
+            // Parents aren't missing — just drain pending.
+            pending::drain_pending(log_tree, pending);
+            return Ok(true);
+        }
+
+        debug!(
+            %bucket, %key,
+            author = %author,
+            missing_count = missing.len(),
+            "targeted pull: pulling missing parents from author"
+        );
+
+        // Resolve the author's address.
+        let Some(addr) = self.resolve_addr(&author).await else {
+            return Ok(false);
+        };
+
+        let my_tips = log_tree.tips()?;
+
+        // Pull the transitive closure of missing entries.
+        match transport.pull_log_sync(addr, &missing, &my_tips).await {
+            Ok((entry_bytes_list, manifest_pairs)) => {
+                let mut entries = Vec::new();
+
+                for eb in &entry_bytes_list {
+                    match postcard::from_bytes::<shoal_logtree::LogEntry>(eb) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => {
+                            warn!(
+                                from = %author,
+                                %e,
+                                "failed to deserialize log entry from targeted pull"
+                            );
+                        }
+                    }
+                }
+
+                let mut manifests = Vec::new();
+
+                for (oid, mb) in &manifest_pairs {
+                    match postcard::from_bytes::<Manifest>(mb) {
+                        Ok(manifest) => manifests.push((*oid, manifest)),
+                        Err(e) => {
+                            warn!(
+                                from = %author,
+                                %e,
+                                "failed to deserialize manifest from targeted pull"
+                            );
+                        }
+                    }
+                }
+
+                if let Err(e) = log_tree.apply_sync_entries(&entries, &manifests) {
+                    warn!(from = %author, %e, "failed to apply targeted pull entries");
+                }
+
+                // Drain pending — the pull should have unblocked buffered entries.
+                pending::drain_pending(log_tree, pending);
+            }
+            Err(e) => {
+                debug!(from = %author, %e, "targeted pull failed");
+            }
+        }
+
+        Ok(true)
+    }
 
     /// Look up a manifest locally, falling back to asking peers.
     ///

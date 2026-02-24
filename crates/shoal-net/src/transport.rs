@@ -568,6 +568,51 @@ impl ShoalTransport {
         }
     }
 
+    /// Targeted pull: request specific entries and their ancestor chain.
+    ///
+    /// Opens a bidirectional stream: sends a `LogSyncPull`, receives a
+    /// `LogSyncPullResponse` with the transitive closure of entries.
+    pub async fn pull_log_sync(
+        &self,
+        addr: EndpointAddr,
+        entry_hashes: &[[u8; 32]],
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::LogSyncPull {
+            entry_hashes: entry_hashes.to_vec(),
+            requester_tips: my_tips.to_vec(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::LogSyncPullResponse { entries, manifests } => {
+                debug!(
+                    entries = entries.len(),
+                    manifests = manifests.len(),
+                    "received log sync pull response"
+                );
+                Ok((entries, manifests))
+            }
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
     /// Gracefully close the transport.
     pub async fn close(&self) {
         self.endpoint.close().await;
@@ -623,5 +668,14 @@ impl crate::Transport for ShoalTransport {
         my_tips: &[[u8; 32]],
     ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), crate::NetError> {
         self.pull_log_entries(addr, my_tips).await
+    }
+
+    async fn pull_log_sync(
+        &self,
+        addr: EndpointAddr,
+        entry_hashes: &[[u8; 32]],
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), crate::NetError> {
+        self.pull_log_sync(addr, entry_hashes, my_tips).await
     }
 }

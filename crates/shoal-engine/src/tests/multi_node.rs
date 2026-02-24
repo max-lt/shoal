@@ -44,7 +44,7 @@ async fn test_three_node_lose_one_shard_per_chunk() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     // Delete 1 shard per chunk from the writing node's store.
     for chunk_meta in &manifest.chunks {
@@ -72,7 +72,7 @@ async fn test_three_node_k4_m2_lose_two_shards() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     // Delete 2 shards per chunk (parity shards).
     for chunk_meta in &manifest.chunks {
@@ -101,7 +101,7 @@ async fn test_three_node_k4_m2_lose_three_shards_fails() {
         .await
         .unwrap();
 
-    let manifest = nodes[0].head_object("b", "k").unwrap();
+    let manifest = nodes[0].head_object("b", "k").await.unwrap();
 
     for chunk_meta in &manifest.chunks {
         let mut deleted = 0;

@@ -169,7 +169,7 @@ async fn test_new_node_lists_objects_after_sync() {
     let idx = c.add_node().await;
 
     // Before sync: new node has 0 objects.
-    let before = c.node(idx).list_objects("b", "").unwrap();
+    let before = c.node(idx).list_objects("b", "").await.unwrap();
     assert_eq!(
         before.len(),
         0,
@@ -180,7 +180,7 @@ async fn test_new_node_lists_objects_after_sync() {
     let synced = c.node(idx).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced, 20, "should sync 20 manifests");
 
-    let after = c.node(idx).list_objects("b", "").unwrap();
+    let after = c.node(idx).list_objects("b", "").await.unwrap();
     assert_eq!(
         after.len(),
         20,

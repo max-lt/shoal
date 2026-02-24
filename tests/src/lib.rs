@@ -149,6 +149,15 @@ impl Transport for MockTransport {
         // Integration tests use MetaStore mode, not LogTree.
         Ok((vec![], vec![]))
     }
+
+    async fn pull_log_sync(
+        &self,
+        _addr: iroh::EndpointAddr,
+        _entry_hashes: &[[u8; 32]],
+        _my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+        Ok((vec![], vec![]))
+    }
 }
 
 // =========================================================================
@@ -318,7 +327,7 @@ impl IntegrationCluster {
 
     /// Simulate manifest broadcast from one node to all others.
     pub async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
+        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         for (i, node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;

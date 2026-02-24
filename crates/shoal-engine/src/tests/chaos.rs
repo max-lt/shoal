@@ -235,4 +235,14 @@ impl Transport for ChaosTransport {
         self.apply_chaos(&addr).await?;
         self.inner.pull_log_entries(addr, my_tips).await
     }
+
+    async fn pull_log_sync(
+        &self,
+        addr: iroh::EndpointAddr,
+        entry_hashes: &[[u8; 32]],
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+        self.apply_chaos(&addr).await?;
+        self.inner.pull_log_sync(addr, entry_hashes, my_tips).await
+    }
 }

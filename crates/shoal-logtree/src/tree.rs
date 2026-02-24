@@ -392,6 +392,102 @@ impl LogTree {
         Ok(result)
     }
 
+    /// Compute entries needed by a requester given specific entry hashes.
+    ///
+    /// BFS backward from `entry_hashes` through parents, stopping at
+    /// entries in `requester_tips` (already known to the requester) or at
+    /// DAG roots. Returns entries in topological order (parents before
+    /// children) using Kahn's algorithm.
+    ///
+    /// This is the responder side of a targeted pull — it is LOCAL-ONLY
+    /// and never triggers recursive peer pulls.
+    pub fn compute_pull_delta(
+        &self,
+        entry_hashes: &[[u8; 32]],
+        requester_tips: &[[u8; 32]],
+    ) -> Result<Vec<LogEntry>> {
+        use std::collections::HashMap;
+
+        let tip_set: HashSet<[u8; 32]> = requester_tips.iter().copied().collect();
+
+        // Phase 1: BFS backward from requested hashes to discover entries.
+        let mut queue: VecDeque<[u8; 32]> = entry_hashes.iter().copied().collect();
+        let mut entries: HashMap<[u8; 32], LogEntry> = HashMap::new();
+
+        while let Some(hash) = queue.pop_front() {
+            if entries.contains_key(&hash) {
+                continue;
+            }
+
+            // Stop at entries the requester already has.
+            if tip_set.contains(&hash) {
+                continue;
+            }
+
+            if let Some(entry) = self.store.get_entry(&hash)? {
+                for parent in &entry.parents {
+                    if !tip_set.contains(parent) && !entries.contains_key(parent) {
+                        queue.push_back(*parent);
+                    }
+                }
+
+                entries.insert(hash, entry);
+            }
+        }
+
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: Kahn's topological sort (parents before children).
+        let delta_set: HashSet<[u8; 32]> = entries.keys().copied().collect();
+        let mut in_degree: HashMap<[u8; 32], usize> = HashMap::new();
+        let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+
+        for (hash, entry) in &entries {
+            let deg = entry
+                .parents
+                .iter()
+                .filter(|p| delta_set.contains(*p))
+                .count();
+            in_degree.insert(*hash, deg);
+
+            for parent in &entry.parents {
+                if delta_set.contains(parent) {
+                    children.entry(*parent).or_default().push(*hash);
+                }
+            }
+        }
+
+        let mut ready: VecDeque<[u8; 32]> = in_degree
+            .iter()
+            .filter(|(_, deg)| **deg == 0)
+            .map(|(h, _)| *h)
+            .collect();
+
+        let mut result = Vec::with_capacity(entries.len());
+
+        while let Some(hash) = ready.pop_front() {
+            if let Some(entry) = entries.remove(&hash) {
+                result.push(entry);
+            }
+
+            if let Some(kids) = children.get(&hash) {
+                for kid in kids {
+                    if let Some(deg) = in_degree.get_mut(kid) {
+                        *deg -= 1;
+
+                        if *deg == 0 {
+                            ready.push_back(*kid);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     /// Apply received entries (from sync). Verifies each, updates state.
     ///
     /// Returns the number of new entries applied.

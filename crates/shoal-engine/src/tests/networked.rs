@@ -202,6 +202,17 @@ impl Transport for FailableMockTransport {
 
         Ok((entries, manifests))
     }
+
+    async fn pull_log_sync(
+        &self,
+        addr: iroh::EndpointAddr,
+        entry_hashes: &[[u8; 32]],
+        my_tips: &[[u8; 32]],
+    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+        // Delegate to pull_log_entries as a simple implementation
+        let _ = entry_hashes;
+        self.pull_log_entries(addr, my_tips).await
+    }
 }
 
 /// Derive a valid (NodeId, EndpointAddr) pair from a seed byte.
@@ -428,7 +439,7 @@ impl TestCluster {
 
     /// Simulate manifest broadcast from one node to all others.
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
-        let manifest = self.nodes[from].head_object(bucket, key).unwrap();
+        let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         for (i, node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;
@@ -492,7 +503,7 @@ async fn simulate_manifest_broadcast(
     bucket: &str,
     key: &str,
 ) {
-    let manifest = source.head_object(bucket, key).unwrap();
+    let manifest = source.head_object(bucket, key).await.unwrap();
     target.meta().put_manifest(&manifest).unwrap();
     target
         .meta()
@@ -629,7 +640,7 @@ async fn test_writer_stores_shard_owners_in_meta() {
         .await
         .unwrap();
 
-    let manifest = node_a.head_object("b", "k").unwrap();
+    let manifest = node_a.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
         for shard_meta in &chunk_meta.shards {
             let owners = node_a
@@ -657,7 +668,7 @@ async fn test_manifest_broadcast_does_not_store_shard_owners() {
         .unwrap();
     simulate_manifest_broadcast(&node_a, &node_b, "b", "k").await;
 
-    let manifest = node_b.head_object("b", "k").unwrap();
+    let manifest = node_b.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
         for shard_meta in &chunk_meta.shards {
             let owners = node_b
@@ -1084,7 +1095,7 @@ async fn test_3_node_one_byte_over_chunk() {
         .unwrap();
     c.broadcast_manifest(2, "b", "over").await;
 
-    let manifest = c.node(2).head_object("b", "over").unwrap();
+    let manifest = c.node(2).head_object("b", "over").await.unwrap();
     assert_eq!(manifest.chunks.len(), 2, "should be exactly 2 chunks");
 
     for i in 0..3 {
@@ -1106,7 +1117,7 @@ async fn test_5_node_1mb_many_chunks() {
         .unwrap();
     c.broadcast_manifest(0, "b", "big").await;
 
-    let manifest = c.node(0).head_object("b", "big").unwrap();
+    let manifest = c.node(0).head_object("b", "big").await.unwrap();
     assert_eq!(manifest.chunks.len(), 256, "1MB / 4096 = 256 chunks");
 
     // Read from two different non-writer nodes.
@@ -1205,7 +1216,7 @@ async fn test_metadata_preserved_across_nodes() {
     c.broadcast_manifest(0, "b", "k").await;
 
     // Read manifest from another node, check metadata is intact.
-    let manifest = c.node(1).head_object("b", "k").unwrap();
+    let manifest = c.node(1).head_object("b", "k").await.unwrap();
     assert_eq!(manifest.metadata, meta);
 }
 
@@ -1259,7 +1270,7 @@ async fn test_various_chunk_sizes() {
         let (got, _) = c.node(2).get_object("b", "k").await.unwrap();
         assert_eq!(got, data, "chunk_size={chunk_size}");
 
-        let manifest = c.node(0).head_object("b", "k").unwrap();
+        let manifest = c.node(0).head_object("b", "k").await.unwrap();
         let expected_chunks = (10_000 + chunk_size as usize - 1) / chunk_size as usize;
         assert_eq!(
             manifest.chunks.len(),
@@ -1484,7 +1495,7 @@ async fn test_list_objects_after_broadcast() {
 
     // All 3 nodes should list all 10 items.
     for i in 0..3 {
-        let keys = c.node(i).list_objects("b", "").unwrap();
+        let keys = c.node(i).list_objects("b", "").await.unwrap();
         assert_eq!(keys.len(), 10, "node {i} should list 10 objects");
     }
 }
@@ -1522,7 +1533,7 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
     c.revive_node(2).await;
 
     // Before sync: node 2 knows nothing (list_objects is local-only).
-    let before = c.node(2).list_objects("b", "").unwrap();
+    let before = c.node(2).list_objects("b", "").await.unwrap();
     assert!(
         before.is_empty(),
         "node 2 should have 0 objects before sync"
@@ -1531,7 +1542,7 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
     // Explicit sync pulls manifests from peers.
     c.node(2).sync_manifests_from_peers().await.unwrap();
 
-    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
     keys_after.sort();
     assert_eq!(
         keys_after,
@@ -1571,7 +1582,7 @@ async fn test_manifest_sync_idempotent() {
     let synced2 = c.node(2).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced2, 0);
 
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 1);
 }
 
@@ -1656,8 +1667,8 @@ async fn test_manifest_sync_multiple_buckets() {
     let synced = c.node(2).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced, 2);
 
-    assert_eq!(c.node(2).list_objects("photos", "").unwrap().len(), 1);
-    assert_eq!(c.node(2).list_objects("docs", "").unwrap().len(), 1);
+    assert_eq!(c.node(2).list_objects("photos", "").await.unwrap().len(), 1);
+    assert_eq!(c.node(2).list_objects("docs", "").await.unwrap().len(), 1);
 }
 
 // =========================================================================
@@ -1721,10 +1732,10 @@ async fn test_logtree_get_reads_from_materialized_state() {
         .unwrap();
 
     // Verify has_object and list_objects also use LogTree.
-    assert!(c.node(0).has_object("b", "k").unwrap());
-    assert!(c.node(1).has_object("b", "k").unwrap());
+    assert!(c.node(0).has_object("b", "k").await.unwrap());
+    assert!(c.node(1).has_object("b", "k").await.unwrap());
 
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0], "k");
 }
@@ -1811,7 +1822,7 @@ async fn test_logtree_sync_from_peers() {
     c.revive_node(2).await;
 
     // Node 2 has no objects before sync.
-    let keys_before = c.node(2).list_objects("b", "").unwrap();
+    let keys_before = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(
         keys_before.len(),
         0,
@@ -1826,7 +1837,7 @@ async fn test_logtree_sync_from_peers() {
     );
 
     // Node 2 should now see both objects.
-    let mut keys_after = c.node(2).list_objects("b", "").unwrap();
+    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
     keys_after.sort();
     assert_eq!(keys_after, vec!["key1.txt", "key2.txt"]);
 
@@ -1905,7 +1916,7 @@ async fn test_write_with_disconnected_peers_then_read_from_other() {
     // Verify: the writer should have stored ALL shards locally because
     // every push failed (nothing was ACK'd and cleaned up).
     let writer_shards = c.local_shard_count(0).await;
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
     assert_eq!(
         writer_shards, total_shards,
@@ -1944,7 +1955,7 @@ async fn test_ack_cleanup_frees_non_owned_shards() {
         .unwrap();
     c.broadcast_manifest(0, "b", "k").await;
 
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
 
     // The writer should have FEWER shards than total because ACK'd
@@ -1987,7 +1998,7 @@ async fn test_partial_disconnect_queues_failed_pushes() {
         "writer should have pending pushes for disconnected node 2, got {pending}"
     );
 
-    let manifest = c.node(0).head_object("b", "k").unwrap();
+    let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
 
     // The writer should NOT have all shards — ACK'd pushes to node 1
@@ -2082,7 +2093,7 @@ async fn test_bug1_large_object_read_after_ack_cleanup() {
 
     // After ACK cleanup, the writer should NOT have all shards — only the
     // ones it's a ring owner for.
-    let manifest = c.node(0).head_object("b", "large-binary").unwrap();
+    let manifest = c.node(0).head_object("b", "large-binary").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
     let writer_shards = c.local_shard_count(0).await;
     assert!(
@@ -2154,7 +2165,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
 
     // Also verify list_objects works across nodes.
     for i in 1..4 {
-        let keys = c.node(i).list_objects("b", "").unwrap();
+        let keys = c.node(i).list_objects("b", "").await.unwrap();
         assert!(
             keys.contains(&"cross-node-test".to_string()),
             "BUG 4: node {i} list_objects doesn't include the key"
@@ -2377,7 +2388,7 @@ async fn test_chaos_partition_then_heal() {
         .unwrap();
 
     // Node 2 should NOT see the "during" object (missed the broadcast).
-    let keys = c.node(2).list_objects("b", "").unwrap();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert!(
         !keys.contains(&"during".to_string()),
         "node 2 should not see 'during' while partitioned"
@@ -2405,7 +2416,7 @@ async fn test_chaos_partition_then_heal() {
     assert!(synced >= 1, "sync should find the 'during' manifest");
 
     // Node 2 can now list both objects.
-    let mut keys = c.node(2).list_objects("b", "").unwrap();
+    let mut keys = c.node(2).list_objects("b", "").await.unwrap();
     keys.sort();
     assert!(
         keys.contains(&"during".to_string()),

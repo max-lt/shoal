@@ -532,7 +532,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         membership_handle.clone(),
         address_book.clone(),
     )
-    .with_log_tree(log_tree.clone());
+    .with_log_tree(log_tree.clone())
+    .with_transport(transport.clone() as Arc<dyn shoal_net::Transport>);
     let pending_entries = protocol.pending_buffer();
     let router = Router::builder(endpoint.clone())
         .accept(cluster_alpn, protocol)
@@ -655,7 +656,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                 match log_tree_gossip.receive_entry(&entry, manifest.as_ref()) {
                                     Ok(true) => {
                                         debug!("stored log entry from gossip");
-                                        handler::drain_pending_log_entries(
+                                        shoal_engine::drain_pending(
                                             &log_tree_gossip,
                                             &pending_gossip,
                                         );
@@ -670,7 +671,10 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                             buf.swap_remove(0);
                                         }
 
-                                        buf.push(handler::PendingEntry::new(entry, manifest_bytes));
+                                        buf.push(shoal_engine::PendingEntry::new(
+                                            entry,
+                                            manifest_bytes,
+                                        ));
                                         trace!(
                                             pending = buf.len(),
                                             "buffered log entry with missing parents (gossip)"
@@ -713,7 +717,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     )
     .with_transport(transport.clone())
     .with_address_book(address_book.clone())
-    .with_log_tree(log_tree.clone());
+    .with_log_tree(log_tree.clone())
+    .with_pending_buffer(pending_entries.clone());
 
     if let Some(handle) = gossip_handle {
         engine_builder = engine_builder.with_gossip(handle);
@@ -808,7 +813,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                     Err(e) => debug!(%e, "log sync attempt failed"),
                 }
 
-                let drained = handler::drain_pending_log_entries(&log_tree_sync, &pending_sync);
+                let drained = shoal_engine::drain_pending(&log_tree_sync, &pending_sync);
 
                 if drained > 0 {
                     info!(count = drained, "applied buffered log entries after sync");

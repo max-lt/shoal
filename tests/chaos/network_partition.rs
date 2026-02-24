@@ -77,7 +77,11 @@ async fn test_network_partition_and_heal() {
             .await
             .unwrap();
         // Only broadcast to partition A nodes.
-        let manifest = c.node(i as usize % 3).head_object("part", &key).unwrap();
+        let manifest = c
+            .node(i as usize % 3)
+            .head_object("part", &key)
+            .await
+            .unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
@@ -151,7 +155,11 @@ async fn test_split_brain_writes_both_sides() {
             .await
             .unwrap();
         // Broadcast only to side A.
-        let manifest = c.node(i as usize % 3).head_object("split", &key).unwrap();
+        let manifest = c
+            .node(i as usize % 3)
+            .head_object("split", &key)
+            .await
+            .unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
@@ -177,6 +185,7 @@ async fn test_split_brain_writes_both_sides() {
         let manifest = c
             .node(3 + i as usize % 3)
             .head_object("split", &key)
+            .await
             .unwrap();
         for target in 3..6 {
             if target != 3 + i as usize % 3 {
