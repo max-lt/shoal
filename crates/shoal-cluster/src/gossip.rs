@@ -1,9 +1,9 @@
-//! Gossip-based event broadcast using iroh-gossip.
+//! Gossip-based broadcast using iroh-gossip.
 //!
 //! The [`GossipService`] wraps an iroh-gossip topic to broadcast and receive
-//! [`ClusterEvent`]s across all nodes in the cluster. This is used for
-//! high-level events (shard stored, repair needed) while foca handles
-//! low-level membership detection.
+//! [`GossipPayload`]s across all nodes in the cluster. This handles all
+//! cluster-wide dissemination: membership events, manifest broadcasts, and
+//! log entry broadcasts. foca SWIM handles low-level failure detection only.
 //!
 //! **Note**: This service requires a running iroh [`Endpoint`] and
 //! [`Router`](iroh::protocol::Router). In environments where iroh cannot
@@ -20,17 +20,19 @@ use iroh_gossip::Gossip;
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::proto::TopicId;
-use shoal_types::ClusterEvent;
+use shoal_types::{ClusterEvent, GossipPayload};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ClusterError;
 use crate::state::ClusterState;
 
-/// Gossip-based event broadcast service.
+/// Gossip-based broadcast service.
 ///
 /// Joins a cluster-wide gossip topic and:
-/// - Broadcasts local [`ClusterEvent`]s to all peers.
-/// - Receives remote events and applies them to [`ClusterState`].
+/// - Broadcasts [`GossipPayload`]s (events, manifests, log entries) to all peers.
+/// - Receives remote payloads: applies membership events to [`ClusterState`],
+///   forwards data payloads (manifests, log entries) via a channel to the caller.
 pub struct GossipService {
     gossip: Gossip,
     topic_id: TopicId,
@@ -68,7 +70,7 @@ impl GossipService {
         let topic_id = TopicId::from_bytes(*blake3::hash(cluster_secret).as_bytes());
 
         let gossip = Gossip::builder()
-            .max_message_size(8192)
+            .max_message_size(1024 * 1024)
             .spawn(endpoint.clone());
 
         let router = Router::builder(endpoint)
@@ -107,12 +109,16 @@ impl GossipService {
 
     /// Join the gossip topic with the given bootstrap peers.
     ///
-    /// Spawns a background task to receive and apply incoming events to
-    /// [`ClusterState`]. Returns a [`GossipHandle`] for broadcasting events.
+    /// Spawns a background task to receive incoming payloads:
+    /// - [`GossipPayload::Event`] → applied to [`ClusterState`] directly.
+    /// - [`GossipPayload::ManifestPut`] / [`GossipPayload::LogEntry`] → forwarded
+    ///   to the returned receiver channel for the caller to process.
+    ///
+    /// Returns a [`GossipHandle`] for broadcasting and a receiver for data payloads.
     pub async fn join(
         &self,
         bootstrap_peers: Vec<iroh::EndpointId>,
-    ) -> Result<GossipHandle, ClusterError> {
+    ) -> Result<(GossipHandle, mpsc::UnboundedReceiver<GossipPayload>), ClusterError> {
         let topic = self
             .gossip
             .subscribe_and_join(self.topic_id, bootstrap_peers)
@@ -121,11 +127,15 @@ impl GossipService {
 
         let (sender, receiver) = topic.split();
 
+        // Channel for data payloads (manifests, log entries) that need
+        // external processing (MetaStore, LogTree — not available here).
+        let (payload_tx, payload_rx) = mpsc::unbounded_channel();
+
         // Spawn the receiver loop in the background.
         let state = self.state.clone();
-        tokio::spawn(run_receiver_loop(receiver, state));
+        tokio::spawn(run_receiver_loop(receiver, state, payload_tx));
 
-        Ok(GossipHandle { sender })
+        Ok((GossipHandle { sender }, payload_rx))
     }
 
     /// Return the topic ID used by this gossip instance.
@@ -164,33 +174,57 @@ pub struct GossipHandle {
 }
 
 impl GossipHandle {
-    /// Broadcast a cluster event to all peers on the gossip topic.
-    pub async fn broadcast(&self, event: &ClusterEvent) -> Result<(), ClusterError> {
-        let data =
-            postcard::to_allocvec(event).map_err(|e| ClusterError::Serialization(e.to_string()))?;
+    /// Broadcast a cluster event to all peers.
+    pub async fn broadcast_event(&self, event: &ClusterEvent) -> Result<(), ClusterError> {
+        self.broadcast_payload(&GossipPayload::Event(event.clone()))
+            .await
+    }
+
+    /// Broadcast an arbitrary gossip payload to all peers.
+    pub async fn broadcast_payload(&self, payload: &GossipPayload) -> Result<(), ClusterError> {
+        let data = postcard::to_allocvec(payload)
+            .map_err(|e| ClusterError::Serialization(e.to_string()))?;
         self.sender
             .broadcast(Bytes::from(data))
             .await
             .map_err(|e: iroh_gossip::api::ApiError| ClusterError::Gossip(e.to_string()))?;
-        debug!(?event, "broadcast cluster event");
+        debug!("broadcast gossip payload");
         Ok(())
     }
 }
 
-/// Background receiver loop that applies incoming gossip events to cluster state.
-async fn run_receiver_loop(mut receiver: GossipReceiver, state: Arc<ClusterState>) {
+/// Background receiver loop that processes incoming gossip payloads.
+///
+/// Membership events are applied to `ClusterState` directly. Data payloads
+/// (manifests, log entries) are forwarded to `payload_tx` for external
+/// processing by the caller.
+async fn run_receiver_loop(
+    mut receiver: GossipReceiver,
+    state: Arc<ClusterState>,
+    payload_tx: mpsc::UnboundedSender<GossipPayload>,
+) {
     info!("gossip receiver loop started");
+
     while let Some(event) = receiver.next().await {
         match event {
-            Ok(Event::Received(msg)) => match postcard::from_bytes::<ClusterEvent>(&msg.content) {
-                Ok(cluster_event) => {
-                    debug!(?cluster_event, "received gossip event");
-                    state.emit_event(cluster_event);
+            Ok(Event::Received(msg)) => {
+                match postcard::from_bytes::<GossipPayload>(&msg.content) {
+                    Ok(GossipPayload::Event(cluster_event)) => {
+                        debug!(?cluster_event, "received gossip event");
+                        state.emit_event(cluster_event);
+                    }
+                    Ok(payload) => {
+                        // Forward manifest/log entry payloads to the caller.
+                        if payload_tx.send(payload).is_err() {
+                            warn!("gossip payload receiver dropped, stopping loop");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!("failed to decode gossip message: {e}");
+                    }
                 }
-                Err(e) => {
-                    warn!("failed to decode gossip message: {e}");
-                }
-            },
+            }
             Ok(Event::NeighborUp(id)) => {
                 debug!(%id, "gossip neighbor up");
             }

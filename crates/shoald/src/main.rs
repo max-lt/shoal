@@ -39,7 +39,9 @@ use shoal_repair::executor::ShardTransfer;
 use shoal_repair::{CircuitBreaker, RepairDetector, RepairExecutor, RepairScheduler, Throttle};
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
-use shoal_types::{Member, MemberState, NodeId, NodeTopology, RepairCircuitBreaker, ShardId};
+use shoal_types::{
+    Manifest, Member, MemberState, NodeId, NodeTopology, RepairCircuitBreaker, ShardId,
+};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -440,7 +442,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     // handler is registered alongside our custom ShoalProtocol in a single
     // Router below.
     let gossip = iroh_gossip::Gossip::builder()
-        .max_message_size(8192)
+        .max_message_size(1024 * 1024)
         .spawn(endpoint.clone());
     let gossip_service = GossipService::new(
         gossip.clone(),
@@ -504,11 +506,11 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         })
         .collect();
 
-    let gossip_handle = if !peer_endpoint_ids.is_empty() {
+    let gossip_result = if !peer_endpoint_ids.is_empty() {
         match gossip_service.join(peer_endpoint_ids).await {
-            Ok(handle) => {
+            Ok((handle, rx)) => {
                 info!("joined gossip topic");
-                Some(handle)
+                Some((handle, rx))
             }
             Err(e) => {
                 warn!(%e, "failed to join gossip topic — continuing without gossip");
@@ -518,12 +520,17 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     } else {
         // First node — subscribe to topic without bootstrap peers.
         match gossip_service.join(vec![]).await {
-            Ok(handle) => Some(handle),
+            Ok((handle, rx)) => Some((handle, rx)),
             Err(e) => {
                 warn!(%e, "failed to create gossip topic");
                 None
             }
         }
+    };
+
+    let (gossip_handle, gossip_payload_rx) = match gossip_result {
+        Some((handle, rx)) => (Some(handle), Some(rx)),
+        None => (None, None),
     };
 
     // --- Gossip broadcast bridge ---
@@ -536,7 +543,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             loop {
                 match events.recv().await {
                     Ok(event) => {
-                        if let Err(e) = handle.broadcast(&event).await {
+                        if let Err(e) = handle.broadcast_event(&event).await {
                             debug!(%e, "failed to broadcast cluster event via gossip");
                         }
                     }
@@ -552,26 +559,140 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         });
     }
 
+    // --- Gossip data payload receiver ---
+    // Processes ManifestPut and LogEntry payloads received via gossip from
+    // other nodes. This replaces the unicast ManifestPut/LogEntryBroadcast
+    // handling that was previously in handler.rs uni-stream processing.
+    if let Some(mut payload_rx) = gossip_payload_rx {
+        let meta_gossip = meta.clone();
+        let log_tree_gossip = log_tree.clone();
+        let pending_gossip = pending_entries.clone();
+        tokio::spawn(async move {
+            use shoal_types::GossipPayload;
+            while let Some(payload) = payload_rx.recv().await {
+                match payload {
+                    GossipPayload::ManifestPut {
+                        bucket,
+                        key,
+                        manifest_bytes,
+                    } => match postcard::from_bytes::<Manifest>(&manifest_bytes) {
+                        Ok(manifest) => {
+                            debug!(
+                                %bucket, %key,
+                                object_id = %manifest.object_id,
+                                "received manifest via gossip"
+                            );
+
+                            if let Err(e) = meta_gossip.put_manifest(&manifest) {
+                                warn!(%e, "failed to store gossip manifest");
+                            }
+
+                            if let Err(e) =
+                                meta_gossip.put_object_key(&bucket, &key, &manifest.object_id)
+                            {
+                                warn!(%e, "failed to store gossip object key");
+                            }
+                        }
+                        Err(e) => {
+                            warn!(%e, "failed to deserialize gossip manifest");
+                        }
+                    },
+                    GossipPayload::LogEntry {
+                        entry_bytes,
+                        manifest_bytes,
+                    } => {
+                        match postcard::from_bytes::<shoal_logtree::LogEntry>(&entry_bytes) {
+                            Ok(entry) => {
+                                let manifest = manifest_bytes
+                                    .as_ref()
+                                    .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
+
+                                // Always cache the manifest in MetaStore so reads
+                                // work even before the DAG converges (missing parents).
+                                if let Some(m) = &manifest {
+                                    if let Err(e) = meta_gossip.put_manifest(m) {
+                                        warn!(%e, "failed to cache gossip log manifest");
+                                    }
+
+                                    // Extract bucket/key from the log entry action
+                                    // and cache the object key mapping too.
+                                    if let shoal_logtree::Action::Put { bucket, key, .. } =
+                                        &entry.action
+                                        && let Err(e) =
+                                            meta_gossip.put_object_key(bucket, key, &m.object_id)
+                                    {
+                                        warn!(%e, "failed to cache gossip object key");
+                                    }
+                                }
+
+                                match log_tree_gossip.receive_entry(&entry, manifest.as_ref()) {
+                                    Ok(true) => {
+                                        debug!("stored log entry from gossip");
+                                        handler::drain_pending_log_entries(
+                                            &log_tree_gossip,
+                                            &pending_gossip,
+                                        );
+                                    }
+                                    Ok(false) => {} // already known
+                                    Err(shoal_logtree::LogTreeError::MissingParents(_)) => {
+                                        let mut buf =
+                                            pending_gossip.lock().expect("pending lock poisoned");
+
+                                        if buf.len() >= 1000 {
+                                            warn!("pending entry buffer full, dropping oldest");
+                                            buf.remove(0);
+                                        }
+
+                                        buf.push(handler::PendingEntry::new(entry, manifest_bytes));
+                                        debug!(
+                                            pending = buf.len(),
+                                            "buffered log entry with missing parents (gossip)"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(%e, "failed to process gossip log entry");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(%e, "failed to deserialize gossip log entry");
+                            }
+                        }
+                    }
+                    GossipPayload::Event(_) => {
+                        // Events are handled by the gossip receiver loop directly.
+                    }
+                }
+            }
+
+            info!("gossip payload receiver exited");
+        });
+    }
+
     // --- Engine ---
-    let engine = Arc::new(
-        ShoalNode::new(
-            ShoalNodeConfig {
-                node_id,
-                chunk_size: config.chunk_size(),
-                erasure_k: config.erasure_k() as usize,
-                erasure_m: config.erasure_m() as usize,
-                vnodes_per_node: 128,
-                shard_replication: config.shard_replication() as usize,
-                cache_max_bytes: config.cache_max_bytes(),
-            },
-            store.clone(),
-            meta.clone(),
-            cluster.clone(),
-        )
-        .with_transport(transport.clone())
-        .with_address_book(address_book.clone())
-        .with_log_tree(log_tree.clone()),
-    );
+    let mut engine_builder = ShoalNode::new(
+        ShoalNodeConfig {
+            node_id,
+            chunk_size: config.chunk_size(),
+            erasure_k: config.erasure_k() as usize,
+            erasure_m: config.erasure_m() as usize,
+            vnodes_per_node: 128,
+            shard_replication: config.shard_replication() as usize,
+            cache_max_bytes: config.cache_max_bytes(),
+        },
+        store.clone(),
+        meta.clone(),
+        cluster.clone(),
+    )
+    .with_transport(transport.clone())
+    .with_address_book(address_book.clone())
+    .with_log_tree(log_tree.clone());
+
+    if let Some(handle) = gossip_handle {
+        engine_builder = engine_builder.with_gossip(handle);
+    }
+
+    let engine = Arc::new(engine_builder);
 
     // --- Repair subsystem ---
     // Wire up the repair detector, scheduler, and executor as background

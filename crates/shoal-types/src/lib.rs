@@ -240,6 +240,33 @@ pub enum ClusterEvent {
     RepairNeeded(ShardId),
 }
 
+/// Payload types that travel through the gossip broadcast layer.
+///
+/// All cluster-wide dissemination goes through gossip (epidemic broadcast).
+/// Point-to-point request/response (shard pull, manifest sync) stays on
+/// direct QUIC streams.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GossipPayload {
+    /// A cluster membership event.
+    Event(ClusterEvent),
+    /// A manifest broadcast (object stored/updated).
+    ManifestPut {
+        /// Target bucket.
+        bucket: String,
+        /// Object key within the bucket.
+        key: String,
+        /// Postcard-serialized [`Manifest`].
+        manifest_bytes: Vec<u8>,
+    },
+    /// A log tree entry broadcast (DAG-based mutation tracking).
+    LogEntry {
+        /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
+        entry_bytes: Vec<u8>,
+        /// Optional postcard-serialized [`Manifest`] referenced by the entry.
+        manifest_bytes: Option<Vec<u8>>,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------

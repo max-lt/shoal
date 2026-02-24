@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use iroh::EndpointAddr;
 use shoal_cas::{Chunker, build_manifest};
-use shoal_cluster::ClusterState;
+use shoal_cluster::{ClusterState, GossipHandle};
 use shoal_erasure::ErasureEncoder;
 use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
@@ -114,6 +114,10 @@ pub struct ShoalNode {
     /// manifest cache) and replaces ManifestPut broadcasts with LogEntry
     /// broadcasts.
     log_tree: Option<Arc<LogTree>>,
+    /// Gossip handle for epidemic broadcast (manifests, log entries).
+    ///
+    /// When present, `put_object` broadcasts via gossip instead of unicast.
+    gossip: Option<GossipHandle>,
     /// Shards that failed to push to ring owners and need background retry.
     ///
     /// Uses `std::sync::Mutex` (not tokio) — the critical section is pure
@@ -145,6 +149,7 @@ impl ShoalNode {
             shard_cache: ShardCache::new(config.cache_max_bytes),
             deleted_keys: RwLock::new(HashSet::new()),
             log_tree: None,
+            gossip: None,
             pending_pushes: Mutex::new(Vec::new()),
         }
     }
@@ -164,6 +169,15 @@ impl ShoalNode {
     /// Set the address book for resolving NodeId to EndpointAddr.
     pub fn with_address_book(mut self, book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>>) -> Self {
         self.address_book = book;
+        self
+    }
+
+    /// Set the gossip handle for epidemic broadcast.
+    ///
+    /// When set, manifest and log entry broadcasts go through gossip
+    /// instead of unicast QUIC streams.
+    pub fn with_gossip(mut self, handle: GossipHandle) -> Self {
+        self.gossip = Some(handle);
         self
     }
 
@@ -453,88 +467,58 @@ impl ShoalNode {
         let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
         let object_id = manifest.object_id;
 
-        // Step 4: persist manifest and key mapping.
+        // Step 4: persist manifest and key mapping, then broadcast.
         if let Some(log_tree) = &self.log_tree {
             // LogTree mode: append log entry + broadcast LogEntryBroadcast.
             let log_entry = log_tree.append_put(bucket, key, object_id, &manifest)?;
 
-            if let Some(transport) = &self.transport {
-                let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
-                let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
-                let msg = ShoalMessage::LogEntryBroadcast {
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                // Gossip broadcast — epidemic dissemination to all peers.
+                let payload = GossipPayload::LogEntry {
                     entry_bytes,
                     manifest_bytes: Some(manifest_bytes),
                 };
-                let peers = self.cluster.members().await;
-                let mut broadcast_tasks = tokio::task::JoinSet::new();
 
-                for peer in &peers {
-                    if peer.node_id == self.node_id {
-                        continue;
-                    }
-
-                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
-                        let transport = transport.clone();
-                        let peer_id = peer.node_id;
-                        let msg = msg.clone();
-                        broadcast_tasks.spawn(async move {
-                            if let Err(e) = transport.send_to(addr, &msg).await {
-                                warn!(
-                                    peer = %peer_id,
-                                    %e,
-                                    "failed to broadcast log entry"
-                                );
-                            }
-                        });
-                    }
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast log entry via gossip");
                 }
-
-                while let Some(res) = broadcast_tasks.join_next().await {
-                    if let Err(e) = res {
-                        warn!(%e, "log entry broadcast task panicked");
-                    }
-                }
+            } else {
+                // Unicast fallback (tests without gossip).
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast {
+                    entry_bytes,
+                    manifest_bytes: Some(manifest_bytes),
+                })
+                .await;
             }
         } else {
-            // Fallback: old behavior (MetaStore + ManifestPut broadcast).
+            // MetaStore mode: persist locally + broadcast ManifestPut.
             self.meta.put_manifest(&manifest)?;
             self.meta.put_object_key(bucket, key, &object_id)?;
 
-            if let Some(transport) = &self.transport {
-                let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
-                let peers = self.cluster.members().await;
-                let mut broadcast_tasks = tokio::task::JoinSet::new();
+            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
 
-                for peer in &peers {
-                    if peer.node_id == self.node_id {
-                        continue;
-                    }
+            if let Some(gossip) = &self.gossip {
+                // Gossip broadcast — epidemic dissemination to all peers.
+                let payload = GossipPayload::ManifestPut {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    manifest_bytes,
+                };
 
-                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
-                        let transport = transport.clone();
-                        let peer_id = peer.node_id;
-                        let msg = ShoalMessage::ManifestPut {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
-                            manifest_bytes: manifest_bytes.clone(),
-                        };
-                        broadcast_tasks.spawn(async move {
-                            if let Err(e) = transport.send_to(addr, &msg).await {
-                                warn!(
-                                    peer = %peer_id,
-                                    %e,
-                                    "failed to broadcast manifest"
-                                );
-                            }
-                        });
-                    }
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast manifest via gossip");
                 }
-
-                while let Some(res) = broadcast_tasks.join_next().await {
-                    if let Err(e) = res {
-                        warn!(%e, "manifest broadcast task panicked");
-                    }
-                }
+            } else {
+                // Unicast fallback (tests without gossip).
+                self.unicast_to_peers(&ShoalMessage::ManifestPut {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    manifest_bytes,
+                })
+                .await;
             }
         }
 
@@ -721,41 +705,23 @@ impl ShoalNode {
 
             let log_entry = log_tree.append_delete(bucket, key)?;
 
-            if let Some(transport) = &self.transport {
-                let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
-                let msg = ShoalMessage::LogEntryBroadcast {
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry {
                     entry_bytes,
                     manifest_bytes: None,
                 };
-                let peers = self.cluster.members().await;
-                let mut broadcast_tasks = tokio::task::JoinSet::new();
 
-                for peer in &peers {
-                    if peer.node_id == self.node_id {
-                        continue;
-                    }
-
-                    if let Some(addr) = self.resolve_addr(&peer.node_id).await {
-                        let transport = transport.clone();
-                        let peer_id = peer.node_id;
-                        let msg = msg.clone();
-                        broadcast_tasks.spawn(async move {
-                            if let Err(e) = transport.send_to(addr, &msg).await {
-                                warn!(
-                                    peer = %peer_id,
-                                    %e,
-                                    "failed to broadcast delete log entry"
-                                );
-                            }
-                        });
-                    }
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast delete log entry via gossip");
                 }
-
-                while let Some(res) = broadcast_tasks.join_next().await {
-                    if let Err(e) = res {
-                        warn!(%e, "delete log entry broadcast task panicked");
-                    }
-                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast {
+                    entry_bytes,
+                    manifest_bytes: None,
+                })
+                .await;
             }
 
             info!(bucket, key, "delete_object: delete entry appended");
@@ -1027,18 +993,18 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Manifest>, EngineError> {
-        // LogTree mode: resolve from the DAG's materialized state.
-        if let Some(log_tree) = &self.log_tree {
-            let object_id = match log_tree.resolve(bucket, key)? {
-                Some(oid) => oid,
-                None => return Ok(None),
-            };
-
-            return match log_tree.get_manifest(&object_id)? {
-                Some(m) => Ok(Some(m)),
-                None => Ok(None),
-            };
+        // LogTree mode: resolve from the DAG's materialized state,
+        // falling back to MetaStore cache if the DAG is incomplete
+        // (e.g. entries received via gossip before parents arrived).
+        if let Some(log_tree) = &self.log_tree
+            && let Some(object_id) = log_tree.resolve(bucket, key)?
+            && let Some(m) = log_tree.get_manifest(&object_id)?
+        {
+            return Ok(Some(m));
         }
+
+        // Fallback: check MetaStore cache (populated by gossip receiver
+        // even when LogTree entries can't be applied yet).
 
         // Fallback: MetaStore + peer pull.
 
@@ -1126,6 +1092,41 @@ impl ShoalNode {
             Err(_) => {
                 warn!(%node_id, "cannot resolve address");
                 None
+            }
+        }
+    }
+
+    /// Send a message to all peers via unicast QUIC streams.
+    ///
+    /// Used as a fallback when gossip is not available (tests, single-node).
+    async fn unicast_to_peers(&self, msg: &ShoalMessage) {
+        let Some(transport) = &self.transport else {
+            return;
+        };
+
+        let peers = self.cluster.members().await;
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+
+            if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                let transport = transport.clone();
+                let peer_id = peer.node_id;
+                let msg = msg.clone();
+                tasks.spawn(async move {
+                    if let Err(e) = transport.send_to(addr, &msg).await {
+                        warn!(peer = %peer_id, %e, "failed to send unicast message");
+                    }
+                });
+            }
+        }
+
+        while let Some(res) = tasks.join_next().await {
+            if let Err(e) = res {
+                warn!(%e, "unicast broadcast task panicked");
             }
         }
     }

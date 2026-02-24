@@ -21,13 +21,20 @@ use shoal_types::{Manifest, NodeId, ObjectId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
-/// Maximum number of entries in the pending buffer before we start dropping.
-const PENDING_BUFFER_CAP: usize = 1000;
-
 /// An entry waiting for its parents to arrive.
 pub(crate) struct PendingEntry {
     entry: LogEntry,
     manifest_bytes: Option<Vec<u8>>,
+}
+
+impl PendingEntry {
+    /// Create a new pending entry.
+    pub(crate) fn new(entry: LogEntry, manifest_bytes: Option<Vec<u8>>) -> Self {
+        Self {
+            entry,
+            manifest_bytes,
+        }
+    }
 }
 
 /// Type alias for the shared pending entry buffer.
@@ -159,18 +166,13 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .entry(remote_node_id)
             .or_insert(remote_addr);
 
-        // Spawn a handler for uni-directional streams (SWIM data, manifest, log entries).
+        // Spawn a handler for uni-directional streams (SWIM data only).
+        // ManifestPut and LogEntryBroadcast are disseminated via gossip now.
         let conn_uni = conn.clone();
         let membership = self.membership.clone();
-        let meta_uni = self.meta.clone();
-        let log_tree_uni = self.log_tree.clone();
-        let pending_uni = self.pending_entries.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
-                let meta = meta_uni.clone();
-                let log_tree = log_tree_uni.clone();
-                let pending = pending_uni.clone();
                 async move {
                     match msg {
                         ShoalMessage::SwimData(data) => {
@@ -178,96 +180,6 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 warn!(%e, "failed to feed SWIM data");
                             }
                         }
-                        ShoalMessage::LogEntryBroadcast {
-                            entry_bytes,
-                            manifest_bytes,
-                        } => {
-                            if let Some(log_tree) = &log_tree {
-                                match postcard::from_bytes::<LogEntry>(&entry_bytes) {
-                                    Ok(entry) => {
-                                        let manifest = manifest_bytes
-                                            .as_ref()
-                                            .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
-
-                                        match log_tree.receive_entry(&entry, manifest.as_ref()) {
-                                            Ok(true) => {
-                                                debug!("stored log entry");
-                                                // Try to drain buffered entries now that
-                                                // a new entry (potential parent) is available.
-                                                drain_pending(log_tree, &pending);
-                                            }
-                                            Ok(false) => {} // already known
-                                            Err(LogTreeError::MissingParents(_)) => {
-                                                // Buffer for retry — parents may arrive later.
-                                                let mut buf =
-                                                    pending.lock().expect("pending lock poisoned");
-
-                                                if buf.len() >= PENDING_BUFFER_CAP {
-                                                    warn!(
-                                                        cap = PENDING_BUFFER_CAP,
-                                                        "pending entry buffer full, dropping oldest"
-                                                    );
-                                                    buf.remove(0);
-                                                }
-
-                                                buf.push(PendingEntry {
-                                                    entry,
-                                                    manifest_bytes,
-                                                });
-                                                debug!(
-                                                    pending = buf.len(),
-                                                    "buffered log entry with missing parents"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    %e,
-                                                    "failed to process log entry"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        warn!(
-                                            %e,
-                                            "failed to deserialize log entry broadcast"
-                                        );
-                                    }
-                                }
-                            } else {
-                                debug!("received log entry broadcast but no LogTree configured");
-                            }
-                        }
-                        ShoalMessage::ManifestPut {
-                            bucket,
-                            key,
-                            manifest_bytes,
-                        } => match postcard::from_bytes::<Manifest>(&manifest_bytes) {
-                            Ok(manifest) => {
-                                debug!(
-                                    %bucket, %key,
-                                    object_id = %manifest.object_id,
-                                    "received manifest broadcast"
-                                );
-                                if let Err(e) = meta.put_manifest(&manifest) {
-                                    warn!(%e, "failed to store broadcast manifest");
-                                }
-                                if let Err(e) =
-                                    meta.put_object_key(&bucket, &key, &manifest.object_id)
-                                {
-                                    warn!(
-                                        %e,
-                                        "failed to store broadcast object key"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    %e,
-                                    "failed to deserialize broadcast manifest"
-                                );
-                            }
-                        },
                         other => {
                             debug!("unhandled uni-stream message: {other:?}");
                         }
