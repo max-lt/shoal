@@ -721,8 +721,11 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                         entries.reverse();
 
                         if !entries.is_empty() {
+                            let has_more = entries.len() >= MAX_ENTRIES;
                             debug!(
                                 count = entries.len(),
+                                manifests = manifests.len(),
+                                has_more,
                                 to = %requester,
                                 "providing log entries via unicast"
                             );
@@ -864,21 +867,32 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             // Initial delay: let the initial sync_log_from_peers() run first.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut prev_missing = 0usize;
 
             loop {
-                interval.tick().await;
-
                 let missing = handler::collect_missing_parents(&log_tree_wants, &pending_wants);
+                let pending_count = pending_wants.lock().expect("lock").len();
 
                 if missing.is_empty() {
+                    if prev_missing > 0 {
+                        info!(
+                            pending = pending_count,
+                            "log sync: all missing parents resolved"
+                        );
+                        prev_missing = 0;
+                    }
+
+                    // Idle: check again in 2 seconds.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     continue;
                 }
 
                 debug!(
-                    count = missing.len(),
+                    missing = missing.len(),
+                    pending = pending_count,
                     "broadcasting WantEntries for missing parents"
                 );
+                prev_missing = missing.len();
 
                 let payload = shoal_types::GossipPayload::WantEntries {
                     requester: local_node_id,
@@ -892,6 +906,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                 // After broadcasting, also try to drain in case entries arrived
                 // between the collect and now.
                 handler::drain_pending_log_entries(&log_tree_wants, &pending_wants);
+
+                // Active sync: short delay to let responses arrive, then loop immediately.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         });
     }
