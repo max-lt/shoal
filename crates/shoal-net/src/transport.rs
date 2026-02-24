@@ -12,7 +12,7 @@ use bytes::Bytes;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use shoal_types::ShardId;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::SHOAL_ALPN;
@@ -30,7 +30,12 @@ const MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 pub struct ShoalTransport {
     endpoint: Endpoint,
     /// Cached connections to remote peers, keyed by their iroh endpoint ID.
-    connections: Arc<RwLock<HashMap<iroh::EndpointId, Connection>>>,
+    ///
+    /// Uses `Mutex` (not `RwLock`) to prevent a TOCTOU race where concurrent
+    /// callers all see "no cached connection", each establish a separate QUIC
+    /// connection to the same peer, and overwrite each other in the cache.
+    /// Dropped connections send `CONNECTION_CLOSE`, aborting in-flight data.
+    connections: Arc<Mutex<HashMap<iroh::EndpointId, Connection>>>,
     /// ALPN used for outgoing connections. Derived from the cluster secret
     /// so that nodes with different secrets cannot connect.
     alpn: Vec<u8>,
@@ -67,7 +72,7 @@ impl ShoalTransport {
 
         Ok(Self {
             endpoint,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             alpn,
         })
     }
@@ -76,7 +81,7 @@ impl ShoalTransport {
     pub fn from_endpoint(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             alpn: SHOAL_ALPN.to_vec(),
         }
     }
@@ -90,7 +95,7 @@ impl ShoalTransport {
     pub fn from_endpoint_with_alpn(endpoint: Endpoint, alpn: Vec<u8>) -> Self {
         Self {
             endpoint,
-            connections: Arc::new(RwLock::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             alpn,
         }
     }
@@ -115,21 +120,22 @@ impl ShoalTransport {
     // -------------------------------------------------------------------
 
     /// Get or establish a QUIC connection to a remote peer.
+    ///
+    /// Holds the connection cache lock for the entire duration to prevent
+    /// the TOCTOU race where concurrent callers each create a connection
+    /// to the same peer, overwriting each other.
     async fn get_connection(&self, addr: EndpointAddr) -> Result<Connection, NetError> {
         let remote_id = addr.id;
+        let mut cache = self.connections.lock().await;
 
-        // Check cache first.
+        // Check cache.
+        if let Some(conn) = cache.get(&remote_id)
+            && conn.close_reason().is_none()
         {
-            let cache = self.connections.read().await;
-            if let Some(conn) = cache.get(&remote_id) {
-                // Verify the connection is still alive.
-                if conn.close_reason().is_none() {
-                    return Ok(conn.clone());
-                }
-            }
+            return Ok(conn.clone());
         }
 
-        // Establish a new connection.
+        // Establish a new connection while holding the lock.
         debug!(remote = %remote_id.fmt_short(), "connecting to peer");
         let conn = self
             .endpoint
@@ -137,18 +143,13 @@ impl ShoalTransport {
             .await
             .map_err(|e| NetError::Connect(e.to_string()))?;
 
-        // Cache it.
-        {
-            let mut cache = self.connections.write().await;
-            cache.insert(remote_id, conn.clone());
-        }
-
+        cache.insert(remote_id, conn.clone());
         Ok(conn)
     }
 
     /// Remove a cached connection (e.g. after detecting it's dead).
     pub async fn remove_connection(&self, id: &iroh::EndpointId) {
-        let mut cache = self.connections.write().await;
+        let mut cache = self.connections.lock().await;
         cache.remove(id);
     }
 
@@ -217,9 +218,13 @@ impl ShoalTransport {
     // High-level shard transfer with integrity
     // -------------------------------------------------------------------
 
-    /// Push a shard to a remote node.
+    /// Push a shard to a remote node and wait for storage acknowledgement.
     ///
-    /// The receiver should verify `blake3(data) == shard_id` before accepting.
+    /// Opens a bi-directional stream: sends a [`ShoalMessage::ShardPush`],
+    /// waits for a [`ShoalMessage::ShardPushAck`]. The caller must not
+    /// delete its local copy until this method returns `Ok(())`.
+    ///
+    /// The receiver verifies `blake3(data) == shard_id` before storing.
     pub async fn push_shard(
         &self,
         addr: EndpointAddr,
@@ -227,13 +232,46 @@ impl ShoalTransport {
         data: Bytes,
     ) -> Result<(), NetError> {
         let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        // Send the shard data.
         let msg = ShoalMessage::ShardPush {
             shard_id,
             data: data.to_vec(),
         };
-        Self::send_message(&conn, &msg).await?;
-        debug!(%shard_id, size = data.len(), "pushed shard to peer");
-        Ok(())
+        Self::send_on_stream(&mut send, &msg).await?;
+
+        // Wait for ACK from the receiver.
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::ShardPushAck {
+                shard_id: ack_id,
+                ok,
+            } => {
+                if ack_id != shard_id {
+                    warn!(
+                        expected = %shard_id,
+                        received = %ack_id,
+                        "ShardPushAck shard_id mismatch"
+                    );
+                }
+                if !ok {
+                    return Err(NetError::Connect(format!(
+                        "remote rejected shard {shard_id}"
+                    )));
+                }
+                debug!(%shard_id, size = data.len(), "pushed shard to peer (ACK'd)");
+                Ok(())
+            }
+            other => Err(NetError::Serialization(format!(
+                "expected ShardPushAck, got: {other:?}"
+            ))),
+        }
     }
 
     /// Pull a shard from a remote node.
