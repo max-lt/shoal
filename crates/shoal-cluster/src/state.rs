@@ -23,8 +23,16 @@ pub struct ClusterState {
     ring: RwLock<Ring>,
     /// This node's identifier.
     local_node_id: NodeId,
-    /// Broadcast channel for cluster events.
+    /// Broadcast channel for ALL cluster events (local + remote).
+    ///
+    /// Subscribers: repair detector, engine, etc.
     event_tx: broadcast::Sender<ClusterEvent>,
+    /// Broadcast channel for LOCAL-origin events only (foca membership changes).
+    ///
+    /// Subscribers: gossip bridge (to disseminate to other nodes).
+    /// This prevents the re-broadcast loop where gossip-received events
+    /// get re-broadcast by the bridge indefinitely.
+    local_event_tx: broadcast::Sender<ClusterEvent>,
     /// Base vnodes per node for the ring.
     vnodes_per_node: u16,
 }
@@ -33,18 +41,31 @@ impl ClusterState {
     /// Create a new cluster state for the given local node.
     pub fn new(local_node_id: NodeId, vnodes_per_node: u16) -> Arc<Self> {
         let (event_tx, _) = broadcast::channel(256);
+        let (local_event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             members: RwLock::new(HashMap::new()),
             ring: RwLock::new(Ring::new(vnodes_per_node)),
             local_node_id,
             event_tx,
+            local_event_tx,
             vnodes_per_node,
         })
     }
 
-    /// Subscribe to cluster events.
+    /// Subscribe to ALL cluster events (local + remote).
+    ///
+    /// Use this for components that need to react to any membership change
+    /// (repair detector, etc.).
     pub fn subscribe(&self) -> broadcast::Receiver<ClusterEvent> {
         self.event_tx.subscribe()
+    }
+
+    /// Subscribe to LOCAL-origin cluster events only.
+    ///
+    /// Use this for the gossip bridge that re-broadcasts events to other
+    /// nodes — it must not re-broadcast events already received from gossip.
+    pub fn subscribe_local(&self) -> broadcast::Receiver<ClusterEvent> {
+        self.local_event_tx.subscribe()
     }
 
     /// Return this node's ID.
@@ -76,8 +97,9 @@ impl ClusterState {
         }
 
         info!(%node_id, "member joined cluster");
-        // Ignore send errors (no subscribers is fine).
-        let _ = self.event_tx.send(ClusterEvent::NodeJoined(member));
+        let event = ClusterEvent::NodeJoined(member);
+        let _ = self.event_tx.send(event.clone());
+        let _ = self.local_event_tx.send(event);
     }
 
     /// Remove a member from the cluster (graceful departure).
@@ -95,7 +117,9 @@ impl ClusterState {
         }
 
         info!(%node_id, "member left cluster");
-        let _ = self.event_tx.send(ClusterEvent::NodeLeft(*node_id));
+        let event = ClusterEvent::NodeLeft(*node_id);
+        let _ = self.event_tx.send(event.clone());
+        let _ = self.local_event_tx.send(event);
     }
 
     /// Mark a member as dead (failure detected).
@@ -115,7 +139,9 @@ impl ClusterState {
         }
 
         info!(%node_id, "member declared dead");
-        let _ = self.event_tx.send(ClusterEvent::NodeDead(*node_id));
+        let event = ClusterEvent::NodeDead(*node_id);
+        let _ = self.event_tx.send(event.clone());
+        let _ = self.local_event_tx.send(event);
     }
 
     /// Return a snapshot of all current members.

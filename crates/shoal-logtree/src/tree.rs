@@ -418,6 +418,11 @@ impl LogTree {
         self.node_id
     }
 
+    /// Return a reference to the underlying store.
+    pub fn store(&self) -> &LogTreeStore {
+        &self.store
+    }
+
     // ----- Internal -----
 
     /// Compute the materialized state hash (blake3 of serialized state).

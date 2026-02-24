@@ -6,7 +6,7 @@
 //! [`ProtocolHandler`]: iroh::protocol::ProtocolHandler
 //! [`Router`]: iroh::protocol::Router
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +19,7 @@ use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport};
 use shoal_store::ShardStore;
 use shoal_types::{Manifest, NodeId, ObjectId};
 use tokio::sync::RwLock;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// An entry waiting for its parents to arrive.
 pub(crate) struct PendingEntry {
@@ -121,7 +121,7 @@ fn drain_pending(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usiz
 
         match log_tree.receive_entry(&buf[i].entry, manifest.as_ref()) {
             Ok(true) => {
-                debug!("applied pending log entry");
+                trace!("resolved pending log entry");
                 buf.swap_remove(i);
                 applied += 1;
                 // Don't increment i — swap_remove moved the last element here.
@@ -152,6 +152,111 @@ fn drain_pending(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usiz
     applied
 }
 
+/// Collect the set of parent hashes that are missing from the LogTree.
+///
+/// Scans the pending entry buffer and returns hashes that the LogTree
+/// does not have. These are the entries we need to request from peers.
+pub fn collect_missing_parents(
+    log_tree: &LogTree,
+    pending: &Mutex<Vec<PendingEntry>>,
+) -> Vec<[u8; 32]> {
+    let buf = pending.lock().expect("pending lock poisoned");
+
+    let mut missing = HashSet::new();
+    let mut known = HashSet::new();
+
+    // Also treat entries in the buffer itself as "known" — we have them,
+    // we just can't apply them yet because *their* parents are missing.
+    for pe in buf.iter() {
+        known.insert(pe.entry.hash);
+    }
+
+    for pe in buf.iter() {
+        for parent in &pe.entry.parents {
+            if known.contains(parent) {
+                continue;
+            }
+
+            if log_tree.store().has_entry(parent).unwrap_or(false) {
+                known.insert(*parent);
+            } else {
+                missing.insert(*parent);
+            }
+        }
+    }
+
+    missing.into_iter().collect()
+}
+
+/// Process a `ProvideLogEntries` message received via unicast.
+///
+/// Applies entries to the LogTree and caches manifests in MetaStore.
+/// Then drains the pending buffer in case newly arrived entries unblock
+/// previously buffered ones.
+fn handle_provide_log_entries(
+    entry_bytes_list: Vec<Vec<u8>>,
+    manifest_pairs: Vec<(ObjectId, Vec<u8>)>,
+    log_tree: Option<&Arc<LogTree>>,
+    meta: &MetaStore,
+    pending: &Mutex<Vec<PendingEntry>>,
+) {
+    let Some(log_tree) = log_tree else {
+        return;
+    };
+
+    // Build a manifest lookup table.
+    let manifests: HashMap<ObjectId, Manifest> = manifest_pairs
+        .iter()
+        .filter_map(|(oid, mb)| postcard::from_bytes::<Manifest>(mb).ok().map(|m| (*oid, m)))
+        .collect();
+
+    let mut applied = 0usize;
+
+    for eb in &entry_bytes_list {
+        let entry = match postcard::from_bytes::<LogEntry>(eb) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(%e, "failed to deserialize provided log entry");
+                continue;
+            }
+        };
+
+        // Find the associated manifest (if any) for this entry.
+        let manifest = match &entry.action {
+            shoal_logtree::Action::Put { manifest_id, .. } => manifests.get(manifest_id),
+            _ => None,
+        };
+
+        // Cache manifest in MetaStore regardless of DAG state.
+        if let Some(m) = manifest {
+            let _ = meta.put_manifest(m);
+
+            if let shoal_logtree::Action::Put { bucket, key, .. } = &entry.action {
+                let _ = meta.put_object_key(bucket, key, &m.object_id);
+            }
+        }
+
+        match log_tree.receive_entry(&entry, manifest) {
+            Ok(true) => applied += 1,
+            Ok(false) => {} // already known
+            Err(LogTreeError::MissingParents(_)) => {
+                // Still missing parents — buffer it.
+                let mb = manifest.and_then(|m| postcard::to_allocvec(m).ok());
+                let mut buf = pending.lock().expect("pending lock poisoned");
+                buf.push(PendingEntry::new(entry, mb));
+            }
+            Err(e) => {
+                warn!(%e, "failed to apply provided log entry");
+            }
+        }
+    }
+
+    if applied > 0 {
+        debug!(applied, "applied provided log entries");
+        drain_pending(log_tree, pending);
+    }
+}
+
 impl iroh::protocol::ProtocolHandler for ShoalProtocol {
     async fn accept(&self, conn: Connection) -> Result<(), AcceptError> {
         // Learn the remote peer's address for future routing.
@@ -166,19 +271,33 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .entry(remote_node_id)
             .or_insert(remote_addr);
 
-        // Spawn a handler for uni-directional streams (SWIM data only).
-        // ManifestPut and LogEntryBroadcast are disseminated via gossip now.
+        // Spawn a handler for uni-directional streams (SWIM data + log entry provides).
         let conn_uni = conn.clone();
         let membership = self.membership.clone();
+        let log_tree_uni = self.log_tree.clone();
+        let meta_uni = self.meta.clone();
+        let pending_uni = self.pending_entries.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let membership = membership.clone();
+                let log_tree = log_tree_uni.clone();
+                let meta = meta_uni.clone();
+                let pending = pending_uni.clone();
                 async move {
                     match msg {
                         ShoalMessage::SwimData(data) => {
                             if let Err(e) = membership.feed_data(data) {
                                 warn!(%e, "failed to feed SWIM data");
                             }
+                        }
+                        ShoalMessage::ProvideLogEntries { entries, manifests } => {
+                            handle_provide_log_entries(
+                                entries,
+                                manifests,
+                                log_tree.as_ref(),
+                                &meta,
+                                &pending,
+                            );
                         }
                         other => {
                             debug!("unhandled uni-stream message: {other:?}");

@@ -126,6 +126,16 @@ pub enum ShoalMessage {
         /// Associated manifests: (ObjectId, postcard-serialized Manifest).
         manifests: Vec<(ObjectId, Vec<u8>)>,
     },
+
+    /// Push specific log entries to a node (unicast response to gossip WantEntries).
+    ///
+    /// Sent as a uni-stream message — no response expected.
+    ProvideLogEntries {
+        /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry) payloads.
+        entries: Vec<Vec<u8>>,
+        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
+        manifests: Vec<(ObjectId, Vec<u8>)>,
+    },
 }
 
 /// A single manifest entry in a [`ShoalMessage::ManifestSyncResponse`].

@@ -265,6 +265,30 @@ pub enum GossipPayload {
         /// Optional postcard-serialized [`Manifest`] referenced by the entry.
         manifest_bytes: Option<Vec<u8>>,
     },
+    /// Request specific log entries by hash (want/have protocol).
+    ///
+    /// Broadcast via gossip when a node has pending entries whose parents
+    /// are missing. Any peer that holds the requested entries responds
+    /// directly to the requester via unicast.
+    WantEntries {
+        /// Node requesting the entries (for unicast response routing).
+        requester: NodeId,
+        /// blake3 hashes of the wanted log entries.
+        hashes: Vec<[u8; 32]>,
+    },
+}
+
+/// Wire envelope for gossip messages.
+///
+/// Wraps a [`GossipPayload`] with a random nonce so that PlumTree
+/// (iroh-gossip) never deduplicates two distinct broadcasts that happen
+/// to have identical payload bytes (e.g. repeated `NodeDead` events).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GossipMessage {
+    /// Random nonce to guarantee byte-level uniqueness.
+    pub nonce: u64,
+    /// The actual payload.
+    pub payload: GossipPayload,
 }
 
 // ---------------------------------------------------------------------------

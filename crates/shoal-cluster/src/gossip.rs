@@ -20,7 +20,8 @@ use iroh_gossip::Gossip;
 use iroh_gossip::api::{Event, GossipReceiver, GossipSender};
 use iroh_gossip::net::GOSSIP_ALPN;
 use iroh_gossip::proto::TopicId;
-use shoal_types::{ClusterEvent, GossipPayload};
+use rand::RngCore;
+use shoal_types::{ClusterEvent, GossipMessage, GossipPayload};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -181,9 +182,17 @@ impl GossipHandle {
     }
 
     /// Broadcast an arbitrary gossip payload to all peers.
+    ///
+    /// Each message is wrapped in a [`GossipMessage`] with a random nonce
+    /// so that PlumTree never deduplicates two distinct broadcasts that
+    /// happen to have identical payload bytes.
     pub async fn broadcast_payload(&self, payload: &GossipPayload) -> Result<(), ClusterError> {
-        let data = postcard::to_allocvec(payload)
-            .map_err(|e| ClusterError::Serialization(e.to_string()))?;
+        let msg = GossipMessage {
+            nonce: rand::rng().next_u64(),
+            payload: payload.clone(),
+        };
+        let data =
+            postcard::to_allocvec(&msg).map_err(|e| ClusterError::Serialization(e.to_string()))?;
         self.sender
             .broadcast(Bytes::from(data))
             .await
@@ -208,18 +217,20 @@ async fn run_receiver_loop(
     while let Some(event) = receiver.next().await {
         match event {
             Ok(Event::Received(msg)) => {
-                match postcard::from_bytes::<GossipPayload>(&msg.content) {
-                    Ok(GossipPayload::Event(cluster_event)) => {
-                        debug!(?cluster_event, "received gossip event");
-                        state.emit_event(cluster_event);
-                    }
-                    Ok(payload) => {
-                        // Forward manifest/log entry payloads to the caller.
-                        if payload_tx.send(payload).is_err() {
-                            warn!("gossip payload receiver dropped, stopping loop");
-                            break;
+                match postcard::from_bytes::<GossipMessage>(&msg.content) {
+                    Ok(envelope) => match envelope.payload {
+                        GossipPayload::Event(cluster_event) => {
+                            debug!(?cluster_event, "received gossip event");
+                            state.emit_event(cluster_event);
                         }
-                    }
+                        payload => {
+                            // Forward manifest/log entry payloads to the caller.
+                            if payload_tx.send(payload).is_err() {
+                                warn!("gossip payload receiver dropped, stopping loop");
+                                break;
+                            }
+                        }
+                    },
                     Err(e) => {
                         warn!("failed to decode gossip message: {e}");
                     }

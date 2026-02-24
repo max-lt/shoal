@@ -18,6 +18,7 @@ async-trait = { workspace = true }
 postcard = { workspace = true }
 bytes = { workspace = true }
 iroh = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

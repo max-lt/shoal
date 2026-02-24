@@ -813,17 +813,25 @@ impl ShoalNode {
     ///
     /// Returns the total number of new manifests synced.
     pub async fn sync_manifests_from_peers(&self) -> Result<usize, EngineError> {
+        use rand::seq::SliceRandom;
+
         let Some(transport) = &self.transport else {
             return Ok(0);
         };
 
-        let peers = self.cluster.members().await;
+        let mut peers: Vec<_> = self
+            .cluster
+            .members()
+            .await
+            .into_iter()
+            .filter(|p| p.node_id != self.node_id)
+            .collect();
+        peers.shuffle(&mut rand::rng());
+
         let mut total_synced = 0usize;
 
-        for peer in &peers {
-            if peer.node_id == self.node_id {
-                continue;
-            }
+        // Try up to 3 random peers; stop after first successful sync.
+        for peer in peers.iter().take(3) {
             let Some(addr) = self.resolve_addr(&peer.node_id).await else {
                 continue;
             };
@@ -833,8 +841,6 @@ impl ShoalNode {
                     for entry in entries {
                         match postcard::from_bytes::<Manifest>(&entry.manifest_bytes) {
                             Ok(manifest) => {
-                                // Store if we don't have this key, or if the
-                                // peer has a different (newer) ObjectId for it.
                                 let local_oid =
                                     self.meta.get_object_key(&entry.bucket, &entry.key)?;
                                 let dominated = match local_oid {
@@ -868,6 +874,9 @@ impl ShoalNode {
                             }
                         }
                     }
+
+                    // Got a successful response — no need to ask more peers.
+                    break;
                 }
                 Err(e) => {
                     warn!(from = %peer.node_id, %e, "failed to sync manifests from peer");
@@ -893,27 +902,33 @@ impl ShoalNode {
     ///
     /// Returns the total number of new entries applied.
     pub async fn sync_log_from_peers(&self) -> Result<usize, EngineError> {
+        use rand::seq::SliceRandom;
+
         let log_tree = self.log_tree.as_ref().ok_or(EngineError::NoLogTree)?;
         let transport = self.transport.as_ref().ok_or(EngineError::NoTransport)?;
 
         let my_tips = log_tree.tips()?;
         let tip_refs: Vec<[u8; 32]> = my_tips.clone();
 
-        let peers = self.cluster.members().await;
+        let mut peers: Vec<_> = self
+            .cluster
+            .members()
+            .await
+            .into_iter()
+            .filter(|p| p.node_id != self.node_id)
+            .collect();
+        peers.shuffle(&mut rand::rng());
+
         let mut total_applied = 0usize;
 
-        for peer in &peers {
-            if peer.node_id == self.node_id {
-                continue;
-            }
-
+        // Try up to 3 random peers; stop after first successful sync.
+        for peer in peers.iter().take(3) {
             let Some(addr) = self.resolve_addr(&peer.node_id).await else {
                 continue;
             };
 
             match transport.pull_log_entries(addr, &tip_refs).await {
                 Ok((entry_bytes_list, manifest_pairs)) => {
-                    // Deserialize entries.
                     let mut entries = Vec::new();
                     for eb in &entry_bytes_list {
                         match postcard::from_bytes::<shoal_logtree::LogEntry>(eb) {
@@ -928,7 +943,6 @@ impl ShoalNode {
                         }
                     }
 
-                    // Deserialize manifests.
                     let mut manifests = Vec::new();
                     for (oid, mb) in &manifest_pairs {
                         match postcard::from_bytes::<Manifest>(mb) {
@@ -962,6 +976,9 @@ impl ShoalNode {
                             );
                         }
                     }
+
+                    // Got a successful response — no need to ask more peers.
+                    break;
                 }
                 Err(e) => {
                     warn!(from = %peer.node_id, %e, "failed to pull log entries from peer");

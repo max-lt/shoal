@@ -43,7 +43,7 @@ use shoal_types::{
     Manifest, Member, MemberState, NodeId, NodeTopology, RepairCircuitBreaker, ShardId,
 };
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use config::CliConfig;
 use handler::ShoalProtocol;
@@ -538,7 +538,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     // other nodes learn about membership changes and shard events.
     if let Some(gossip_handle) = gossip_handle.as_ref() {
         let handle = gossip_handle.clone();
-        let mut events = cluster.subscribe();
+        let mut events = cluster.subscribe_local();
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
@@ -560,15 +560,18 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     }
 
     // --- Gossip data payload receiver ---
-    // Processes ManifestPut and LogEntry payloads received via gossip from
-    // other nodes. This replaces the unicast ManifestPut/LogEntryBroadcast
-    // handling that was previously in handler.rs uni-stream processing.
+    // Processes ManifestPut, LogEntry, and WantEntries payloads received via
+    // gossip from other nodes.
     if let Some(mut payload_rx) = gossip_payload_rx {
         let meta_gossip = meta.clone();
         let log_tree_gossip = log_tree.clone();
         let pending_gossip = pending_entries.clone();
+        let transport_gossip = transport.clone();
+        let address_book_gossip = address_book.clone();
+        let local_node_id = node_id;
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
+
             while let Some(payload) = payload_rx.recv().await {
                 match payload {
                     GossipPayload::ManifestPut {
@@ -614,8 +617,6 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                         warn!(%e, "failed to cache gossip log manifest");
                                     }
 
-                                    // Extract bucket/key from the log entry action
-                                    // and cache the object key mapping too.
                                     if let shoal_logtree::Action::Put { bucket, key, .. } =
                                         &entry.action
                                         && let Err(e) =
@@ -639,12 +640,12 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                             pending_gossip.lock().expect("pending lock poisoned");
 
                                         if buf.len() >= 1000 {
-                                            warn!("pending entry buffer full, dropping oldest");
-                                            buf.remove(0);
+                                            warn!("pending entry buffer full, dropping entry");
+                                            buf.swap_remove(0);
                                         }
 
                                         buf.push(handler::PendingEntry::new(entry, manifest_bytes));
-                                        debug!(
+                                        trace!(
                                             pending = buf.len(),
                                             "buffered log entry with missing parents (gossip)"
                                         );
@@ -656,6 +657,84 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                             }
                             Err(e) => {
                                 warn!(%e, "failed to deserialize gossip log entry");
+                            }
+                        }
+                    }
+                    GossipPayload::WantEntries { requester, hashes } => {
+                        // Ignore our own want requests.
+                        if requester == local_node_id {
+                            continue;
+                        }
+
+                        // Look up requested entries AND their ancestors in our LogTree.
+                        // BFS walk through parents so the requester gets the full chain
+                        // in one response, not one level at a time.
+                        let mut entries = Vec::new();
+                        let mut manifests = Vec::new();
+                        let mut visited = std::collections::HashSet::new();
+                        let mut queue = std::collections::VecDeque::new();
+                        const MAX_ENTRIES: usize = 200;
+
+                        for hash in &hashes {
+                            queue.push_back(*hash);
+                        }
+
+                        while let Some(hash) = queue.pop_front() {
+                            if entries.len() >= MAX_ENTRIES {
+                                break;
+                            }
+
+                            if !visited.insert(hash) {
+                                continue;
+                            }
+
+                            if let Ok(Some(entry)) = log_tree_gossip.store().get_entry(&hash) {
+                                if let shoal_logtree::Action::Put { manifest_id, .. } =
+                                    &entry.action
+                                    && let Ok(Some(m)) = log_tree_gossip.get_manifest(manifest_id)
+                                    && let Ok(mb) = postcard::to_allocvec(&m)
+                                {
+                                    manifests.push((*manifest_id, mb));
+                                }
+
+                                // Walk parents so we include ancestors.
+                                for parent in &entry.parents {
+                                    queue.push_back(*parent);
+                                }
+
+                                if let Ok(eb) = postcard::to_allocvec(&entry) {
+                                    entries.push(eb);
+                                }
+                            }
+                        }
+
+                        // Reverse so parents come before children (topological order).
+                        entries.reverse();
+
+                        if !entries.is_empty() {
+                            debug!(
+                                count = entries.len(),
+                                to = %requester,
+                                "providing log entries via unicast"
+                            );
+
+                            // Resolve requester address and send via unicast.
+                            let addr = {
+                                let book = address_book_gossip.read().await;
+                                book.get(&requester).cloned()
+                            };
+                            let addr = match addr {
+                                Some(a) => a,
+                                None => match iroh::EndpointId::from_bytes(requester.as_bytes()) {
+                                    Ok(eid) => EndpointAddr::new(eid),
+                                    Err(_) => continue,
+                                },
+                            };
+
+                            let msg = ShoalMessage::ProvideLogEntries { entries, manifests };
+
+                            if let Err(e) = transport_gossip.send_to(addr, &msg).await {
+                                debug!(%e, "failed to send log entries to requester");
                             }
                         }
                     }
@@ -687,6 +766,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     .with_transport(transport.clone())
     .with_address_book(address_book.clone())
     .with_log_tree(log_tree.clone());
+
+    // Clone gossip handle before consuming it — the want/have loop needs one too.
+    let gossip_handle_for_wants = gossip_handle.clone();
 
     if let Some(handle) = gossip_handle {
         engine_builder = engine_builder.with_gossip(handle);
@@ -757,6 +839,50 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             loop {
                 interval.tick().await;
                 let _ = engine.retry_pending_pushes().await;
+            }
+        });
+    }
+
+    // --- Want/have loop (targeted DAG sync via gossip) ---
+    // Periodically checks if the pending buffer has entries with missing
+    // parents. If so, broadcasts a WantEntries request via gossip so that
+    // any peer holding those entries can send them back via unicast.
+    if let Some(gossip_wants) = gossip_handle_for_wants {
+        let log_tree_wants = log_tree.clone();
+        let pending_wants = pending_entries.clone();
+        let local_node_id = node_id;
+        tokio::spawn(async move {
+            // Initial delay: let the initial sync_log_from_peers() run first.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+
+            loop {
+                interval.tick().await;
+
+                let missing = handler::collect_missing_parents(&log_tree_wants, &pending_wants);
+
+                if missing.is_empty() {
+                    continue;
+                }
+
+                debug!(
+                    count = missing.len(),
+                    "broadcasting WantEntries for missing parents"
+                );
+
+                let payload = shoal_types::GossipPayload::WantEntries {
+                    requester: local_node_id,
+                    hashes: missing,
+                };
+
+                if let Err(e) = gossip_wants.broadcast_payload(&payload).await {
+                    debug!(%e, "failed to broadcast WantEntries");
+                }
+
+                // After broadcasting, also try to drain in case entries arrived
+                // between the collect and now.
+                handler::drain_pending_log_entries(&log_tree_wants, &pending_wants);
             }
         });
     }
