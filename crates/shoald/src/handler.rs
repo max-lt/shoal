@@ -6,7 +6,7 @@
 //! [`ProtocolHandler`]: iroh::protocol::ProtocolHandler
 //! [`Router`]: iroh::protocol::Router
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -150,42 +150,6 @@ fn drain_pending(log_tree: &LogTree, pending: &Mutex<Vec<PendingEntry>>) -> usiz
     }
 
     applied
-}
-
-/// Collect the set of parent hashes that are missing from the LogTree.
-///
-/// Scans the pending entry buffer and returns hashes that the LogTree
-/// does not have. These are the entries we need to request from peers.
-pub fn collect_missing_parents(
-    log_tree: &LogTree,
-    pending: &Mutex<Vec<PendingEntry>>,
-) -> Vec<[u8; 32]> {
-    let buf = pending.lock().expect("pending lock poisoned");
-
-    let mut missing = HashSet::new();
-    let mut known = HashSet::new();
-
-    // Also treat entries in the buffer itself as "known" — we have them,
-    // we just can't apply them yet because *their* parents are missing.
-    for pe in buf.iter() {
-        known.insert(pe.entry.hash);
-    }
-
-    for pe in buf.iter() {
-        for parent in &pe.entry.parents {
-            if known.contains(parent) {
-                continue;
-            }
-
-            if log_tree.store().has_entry(parent).unwrap_or(false) {
-                known.insert(*parent);
-            } else {
-                missing.insert(*parent);
-            }
-        }
-    }
-
-    missing.into_iter().collect()
 }
 
 /// Process a `ProvideLogEntries` message received via unicast.

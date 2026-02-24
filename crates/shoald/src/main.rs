@@ -595,9 +595,6 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         let meta_gossip = meta.clone();
         let log_tree_gossip = log_tree.clone();
         let pending_gossip = pending_entries.clone();
-        let transport_gossip = transport.clone();
-        let address_book_gossip = address_book.clone();
-        let local_node_id = node_id;
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
 
@@ -689,87 +686,6 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                             }
                         }
                     }
-                    GossipPayload::WantEntries { requester, hashes } => {
-                        // Ignore our own want requests.
-                        if requester == local_node_id {
-                            continue;
-                        }
-
-                        // Look up requested entries AND their ancestors in our LogTree.
-                        // BFS walk through parents so the requester gets the full chain
-                        // in one response, not one level at a time.
-                        let mut entries = Vec::new();
-                        let mut manifests = Vec::new();
-                        let mut visited = std::collections::HashSet::new();
-                        let mut queue = std::collections::VecDeque::new();
-                        const MAX_ENTRIES: usize = 200;
-
-                        for hash in &hashes {
-                            queue.push_back(*hash);
-                        }
-
-                        while let Some(hash) = queue.pop_front() {
-                            if entries.len() >= MAX_ENTRIES {
-                                break;
-                            }
-
-                            if !visited.insert(hash) {
-                                continue;
-                            }
-
-                            if let Ok(Some(entry)) = log_tree_gossip.store().get_entry(&hash) {
-                                if let shoal_logtree::Action::Put { manifest_id, .. } =
-                                    &entry.action
-                                    && let Ok(Some(m)) = log_tree_gossip.get_manifest(manifest_id)
-                                    && let Ok(mb) = postcard::to_allocvec(&m)
-                                {
-                                    manifests.push((*manifest_id, mb));
-                                }
-
-                                // Walk parents so we include ancestors.
-                                for parent in &entry.parents {
-                                    queue.push_back(*parent);
-                                }
-
-                                if let Ok(eb) = postcard::to_allocvec(&entry) {
-                                    entries.push(eb);
-                                }
-                            }
-                        }
-
-                        // Reverse so parents come before children (topological order).
-                        entries.reverse();
-
-                        if !entries.is_empty() {
-                            let has_more = entries.len() >= MAX_ENTRIES;
-                            debug!(
-                                count = entries.len(),
-                                manifests = manifests.len(),
-                                has_more,
-                                to = %requester,
-                                "providing log entries via unicast"
-                            );
-
-                            // Resolve requester address and send via unicast.
-                            let addr = {
-                                let book = address_book_gossip.read().await;
-                                book.get(&requester).cloned()
-                            };
-                            let addr = match addr {
-                                Some(a) => a,
-                                None => match iroh::EndpointId::from_bytes(requester.as_bytes()) {
-                                    Ok(eid) => EndpointAddr::new(eid),
-                                    Err(_) => continue,
-                                },
-                            };
-
-                            let msg = ShoalMessage::ProvideLogEntries { entries, manifests };
-
-                            if let Err(e) = transport_gossip.send_to(addr, &msg).await {
-                                debug!(%e, "failed to send log entries to requester");
-                            }
-                        }
-                    }
                     GossipPayload::Event(_) => {
                         // Membership events propagate via foca SWIM, not gossip.
                     }
@@ -798,9 +714,6 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     .with_transport(transport.clone())
     .with_address_book(address_book.clone())
     .with_log_tree(log_tree.clone());
-
-    // Clone gossip handle before consuming it — the want/have loop needs one too.
-    let gossip_handle_for_wants = gossip_handle.clone();
 
     if let Some(handle) = gossip_handle {
         engine_builder = engine_builder.with_gossip(handle);
@@ -875,86 +788,43 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         });
     }
 
-    // --- Want/have loop (targeted DAG sync via gossip) ---
-    // Periodically checks if the pending buffer has entries with missing
-    // parents. If so, broadcasts a WantEntries request via gossip so that
-    // any peer holding those entries can send them back via unicast.
-    if let Some(gossip_wants) = gossip_handle_for_wants {
-        let log_tree_wants = log_tree.clone();
-        let pending_wants = pending_entries.clone();
-        let local_node_id = node_id;
-        tokio::spawn(async move {
-            // Initial delay: let the initial sync_log_from_peers() run first.
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-
-            let mut prev_missing = 0usize;
-
-            loop {
-                let missing = handler::collect_missing_parents(&log_tree_wants, &pending_wants);
-                let pending_count = pending_wants.lock().expect("lock").len();
-
-                if missing.is_empty() {
-                    if prev_missing > 0 {
-                        info!(
-                            pending = pending_count,
-                            "log sync: all missing parents resolved"
-                        );
-                        prev_missing = 0;
-                    }
-
-                    // Idle: check again in 2 seconds.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-
-                debug!(
-                    missing = missing.len(),
-                    pending = pending_count,
-                    "broadcasting WantEntries for missing parents"
-                );
-                prev_missing = missing.len();
-
-                let payload = shoal_types::GossipPayload::WantEntries {
-                    requester: local_node_id,
-                    hashes: missing,
-                };
-
-                if let Err(e) = gossip_wants.broadcast_payload(&payload).await {
-                    debug!(%e, "failed to broadcast WantEntries");
-                }
-
-                // After broadcasting, also try to drain in case entries arrived
-                // between the collect and now.
-                handler::drain_pending_log_entries(&log_tree_wants, &pending_wants);
-
-                // Active sync: short delay to let responses arrive, then loop immediately.
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
-        });
-    }
-
-    // --- Log sync (catch up on historical mutations from peers) ---
-    // This is necessary because log entry broadcasts are point-in-time: if
-    // this node is joining an existing cluster, it missed all previous
-    // broadcasts. We pull missing log entries from peers using our current
-    // DAG tips, allowing efficient delta sync.
-    if !config.cluster.peers.is_empty() {
+    // --- Periodic log sync (catch up on mutations from peers) ---
+    // On startup (and periodically when pending entries exist), pull missing
+    // log entries from peers using tips-based delta sync via QUIC.
+    {
         let engine_sync = engine.clone();
         let log_tree_sync = log_tree.clone();
         let pending_sync = pending_entries.clone();
         tokio::spawn(async move {
-            // Small delay to let SWIM handshake establish connections.
+            // Initial delay: let SWIM handshake establish connections.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            match engine_sync.sync_log_from_peers().await {
-                Ok(0) => debug!("log sync: nothing new from peers"),
-                Ok(n) => info!(count = n, "log sync: caught up on historical mutations"),
-                Err(e) => warn!(%e, "log sync failed (will retry on next restart)"),
-            }
-            // Drain any entries that were buffered while waiting for sync.
-            let drained = handler::drain_pending_log_entries(&log_tree_sync, &pending_sync);
 
-            if drained > 0 {
-                info!(count = drained, "applied buffered log entries after sync");
+            loop {
+                let pending_count = pending_sync.lock().expect("lock").len();
+
+                match engine_sync.sync_log_from_peers().await {
+                    Ok(0) => {}
+                    Ok(n) => info!(count = n, "log sync: applied entries from peers"),
+                    Err(e) => debug!(%e, "log sync attempt failed"),
+                }
+
+                let drained = handler::drain_pending_log_entries(&log_tree_sync, &pending_sync);
+
+                if drained > 0 {
+                    info!(count = drained, "applied buffered log entries after sync");
+                }
+
+                if pending_count == 0 {
+                    // Nothing pending — check again in 5 seconds.
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                } else {
+                    // Pending entries exist — retry more aggressively.
+                    debug!(
+                        pending = pending_count,
+                        "pending log entries, retrying sync in 2s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
             }
         });
     }

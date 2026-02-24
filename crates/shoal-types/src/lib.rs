@@ -265,17 +265,6 @@ pub enum GossipPayload {
         /// Optional postcard-serialized [`Manifest`] referenced by the entry.
         manifest_bytes: Option<Vec<u8>>,
     },
-    /// Request specific log entries by hash (want/have protocol).
-    ///
-    /// Broadcast via gossip when a node has pending entries whose parents
-    /// are missing. Any peer that holds the requested entries responds
-    /// directly to the requester via unicast.
-    WantEntries {
-        /// Node requesting the entries (for unicast response routing).
-        requester: NodeId,
-        /// blake3 hashes of the wanted log entries.
-        hashes: Vec<[u8; 32]>,
-    },
 }
 
 /// Wire envelope for gossip messages.
