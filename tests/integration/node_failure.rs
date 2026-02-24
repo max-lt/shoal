@@ -22,7 +22,7 @@ async fn test_kill_one_node_all_objects_readable() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -66,7 +66,7 @@ async fn test_kill_two_nodes_still_readable() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -105,7 +105,7 @@ async fn test_kill_writer_node() {
         .put_object("b", "important.dat", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "important.dat");
+    c.broadcast_manifest(0, "b", "important.dat").await;
 
     // Kill the writer.
     c.kill_node(0).await;
@@ -135,7 +135,7 @@ async fn test_node_kill_and_revive() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i % 5, "b", &key);
+        c.broadcast_manifest(i % 5, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -170,7 +170,7 @@ async fn test_mass_failure_and_recovery() {
         .put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "k");
+    c.broadcast_manifest(0, "b", "k").await;
 
     // Kill everyone except node 0.
     for i in 1..5 {
@@ -265,7 +265,7 @@ async fn test_delete_object_after_node_failure() {
         .put_object("b", "deleteme", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "b", "deleteme");
+    c.broadcast_manifest(0, "b", "deleteme").await;
 
     // Verify it's readable.
     let (got, _) = c.node(1).get_object("b", "deleteme").await.unwrap();

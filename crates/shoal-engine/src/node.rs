@@ -957,8 +957,10 @@ impl ShoalNode {
 
     /// Sync log entries from cluster peers using the LogTree.
     ///
-    /// When a node joins (or restarts), it pulls missing log entries from
-    /// peers using its current DAG tips, allowing efficient delta sync.
+    /// Pulls missing log entries from ALL reachable peers using tips-based
+    /// delta sync via QUIC. Tips are refreshed between each peer so that
+    /// subsequent deltas are smaller and parents fetched from earlier peers
+    /// are visible to later ones.
     ///
     /// Returns the total number of new entries applied.
     pub async fn sync_log_from_peers(&self) -> Result<usize, EngineError> {
@@ -966,9 +968,6 @@ impl ShoalNode {
 
         let log_tree = self.log_tree.as_ref().ok_or(EngineError::NoLogTree)?;
         let transport = self.transport.as_ref().ok_or(EngineError::NoTransport)?;
-
-        let my_tips = log_tree.tips()?;
-        let tip_refs: Vec<[u8; 32]> = my_tips.clone();
 
         let mut peers: Vec<_> = self
             .cluster
@@ -981,15 +980,21 @@ impl ShoalNode {
 
         let mut total_applied = 0usize;
 
-        // Try up to 3 random peers; stop after first successful sync.
-        for peer in peers.iter().take(3) {
+        // Sync with ALL peers. Refresh tips between each so that entries
+        // received from peer N are known when computing the delta from peer N+1.
+        for peer in &peers {
             let Some(addr) = self.resolve_addr(&peer.node_id).await else {
                 continue;
             };
 
+            // Refresh tips before each request — entries applied from a
+            // previous peer advance the tips, reducing the delta size.
+            let tip_refs = log_tree.tips()?;
+
             match transport.pull_log_entries(addr, &tip_refs).await {
                 Ok((entry_bytes_list, manifest_pairs)) => {
                     let mut entries = Vec::new();
+
                     for eb in &entry_bytes_list {
                         match postcard::from_bytes::<shoal_logtree::LogEntry>(eb) {
                             Ok(entry) => entries.push(entry),
@@ -1004,6 +1009,7 @@ impl ShoalNode {
                     }
 
                     let mut manifests = Vec::new();
+
                     for (oid, mb) in &manifest_pairs {
                         match postcard::from_bytes::<Manifest>(mb) {
                             Ok(manifest) => manifests.push((*oid, manifest)),
@@ -1036,12 +1042,9 @@ impl ShoalNode {
                             );
                         }
                     }
-
-                    // Got a successful response — no need to ask more peers.
-                    break;
                 }
                 Err(e) => {
-                    warn!(from = %peer.node_id, %e, "failed to pull log entries from peer");
+                    debug!(from = %peer.node_id, %e, "failed to pull log entries from peer");
                 }
             }
         }

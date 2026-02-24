@@ -301,18 +301,23 @@ impl LogTree {
 
     /// Compute entries a peer is missing given their tips.
     ///
-    /// BFS backward from our tips until we reach entries in `peer_tips`.
-    /// Returns entries in topological order (parents before children).
+    /// BFS backward from our tips to discover the set of entries, then
+    /// Kahn's algorithm to return them in correct topological order
+    /// (parents before children). A simple reverse-BFS is wrong for DAGs
+    /// with diamond patterns (e.g. A→B→C, A→B→D→E where B and D are at
+    /// the same BFS depth but D depends on B).
     pub fn compute_delta(&self, peer_tips: &[[u8; 32]]) -> Result<Vec<LogEntry>> {
+        use std::collections::HashMap;
+
         let peer_tip_set: HashSet<[u8; 32]> = peer_tips.iter().copied().collect();
         let our_tips = self.store.get_tips()?;
 
+        // Phase 1: BFS backward to discover entries the peer is missing.
         let mut queue: VecDeque<[u8; 32]> = our_tips.into_iter().collect();
-        let mut visited = HashSet::new();
-        let mut result = Vec::new();
+        let mut entries: HashMap<[u8; 32], LogEntry> = HashMap::new();
 
         while let Some(hash) = queue.pop_front() {
-            if !visited.insert(hash) {
+            if entries.contains_key(&hash) {
                 continue;
             }
 
@@ -323,17 +328,67 @@ impl LogTree {
 
             if let Some(entry) = self.store.get_entry(&hash)? {
                 for parent in &entry.parents {
-                    if !peer_tip_set.contains(parent) {
+                    if !peer_tip_set.contains(parent) && !entries.contains_key(parent) {
                         queue.push_back(*parent);
                     }
                 }
 
-                result.push(entry);
+                entries.insert(hash, entry);
             }
         }
 
-        // Reverse to get topological order (parents first).
-        result.reverse();
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: Kahn's topological sort (parents before children).
+        // In-degree = number of parents that are ALSO in the delta set.
+        let delta_set: HashSet<[u8; 32]> = entries.keys().copied().collect();
+        let mut in_degree: HashMap<[u8; 32], usize> = HashMap::new();
+        // child → parents-in-delta (for decrementing in-degree).
+        let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+
+        for (hash, entry) in &entries {
+            let deg = entry
+                .parents
+                .iter()
+                .filter(|p| delta_set.contains(*p))
+                .count();
+            in_degree.insert(*hash, deg);
+
+            for parent in &entry.parents {
+                if delta_set.contains(parent) {
+                    children.entry(*parent).or_default().push(*hash);
+                }
+            }
+        }
+
+        let mut ready: VecDeque<[u8; 32]> = in_degree
+            .iter()
+            .filter(|(_, deg)| **deg == 0)
+            .map(|(h, _)| *h)
+            .collect();
+
+        let mut result = Vec::with_capacity(entries.len());
+
+        while let Some(hash) = ready.pop_front() {
+            if let Some(entry) = entries.remove(&hash) {
+                result.push(entry);
+            }
+
+            if let Some(kids) = children.get(&hash) {
+                for kid in kids {
+                    if let Some(deg) = in_degree.get_mut(kid) {
+                        *deg -= 1;
+
+                        if *deg == 0 {
+                            ready.push_back(*kid);
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -348,6 +403,9 @@ impl LogTree {
         // Pre-load manifests.
         let manifest_map: std::collections::HashMap<ObjectId, &Manifest> =
             manifests.iter().map(|(id, m)| (*id, m)).collect();
+
+        // Set of hashes in this sync batch — used for parent validation.
+        let delta_hashes: HashSet<[u8; 32]> = entries.iter().map(|e| e.hash).collect();
 
         let mut applied = 0;
 
@@ -371,6 +429,29 @@ impl LogTree {
                     hash = hex::encode_to_string(entry.hash),
                     "skipping entry with invalid signature during sync"
                 );
+                continue;
+            }
+
+            // Verify in-delta parents exist. Parents within this sync batch
+            // should have been applied first (topological order from Kahn's
+            // algorithm). Parents OUTSIDE the delta are boundary entries the
+            // peer already has, or were intentionally pruned on the sender
+            // side — we don't validate those.
+            let mut parents_ok = true;
+
+            for parent in &entry.parents {
+                if delta_hashes.contains(parent) && !self.store.has_entry(parent)? {
+                    warn!(
+                        hash = hex::encode_to_string(entry.hash),
+                        missing_parent = hex::encode_to_string(parent),
+                        "skipping sync entry with unapplied in-delta parent"
+                    );
+                    parents_ok = false;
+                    break;
+                }
+            }
+
+            if !parents_ok {
                 continue;
             }
 
@@ -403,6 +484,13 @@ impl LogTree {
 
         if applied > 0 {
             debug!(applied, "applied sync entries");
+
+            // Merge multiple tips to keep the DAG converged.
+            let tips = self.store.get_tips()?;
+
+            if tips.len() > 1 {
+                let _ = self.maybe_merge();
+            }
         }
 
         Ok(applied)

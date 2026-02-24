@@ -24,7 +24,7 @@ async fn test_add_nodes_objects_still_readable() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "b", &key);
+        c.broadcast_manifest(writer, "b", &key).await;
 
         objects.push((key, data));
     }
@@ -76,7 +76,7 @@ async fn test_new_writes_use_expanded_ring() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(0, "b", &key);
+        c.broadcast_manifest(0, "b", &key).await;
     }
 
     // Check shard distribution: new nodes should have some shards.
@@ -158,14 +158,14 @@ async fn test_new_node_lists_objects_after_sync() {
             .put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i as usize % 3, "b", &key);
+        c.broadcast_manifest(i as usize % 3, "b", &key).await;
     }
 
     // Add a new node.
     let idx = c.add_node().await;
 
     // Before sync: new node has 0 objects.
-    let before = c.node(idx).list_objects("b", "").unwrap();
+    let before = c.node(idx).list_objects("b", "").await.unwrap();
     assert_eq!(
         before.len(),
         0,
@@ -176,7 +176,7 @@ async fn test_new_node_lists_objects_after_sync() {
     let synced = c.node(idx).sync_manifests_from_peers().await.unwrap();
     assert_eq!(synced, 20, "should sync 20 manifests");
 
-    let after = c.node(idx).list_objects("b", "").unwrap();
+    let after = c.node(idx).list_objects("b", "").await.unwrap();
     assert_eq!(
         after.len(),
         20,

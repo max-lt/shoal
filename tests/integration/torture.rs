@@ -53,7 +53,7 @@ async fn test_data_size_spectrum() {
             .put_object("spectrum", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "spectrum", &key);
+        c.broadcast_manifest(writer, "spectrum", &key).await;
     }
 
     // Read back from different nodes, verify byte-for-byte.
@@ -98,7 +98,7 @@ async fn test_overwrite_consistency() {
             .put_object("overwrite", "the-key", &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "overwrite", "the-key");
+        c.broadcast_manifest(writer, "overwrite", "the-key").await;
 
         last_data = data.clone();
 
@@ -129,7 +129,7 @@ async fn test_overwrite_consistency() {
     }
 
     // Only 1 key should be listed.
-    let keys = c.node(0).list_objects("overwrite", "").unwrap();
+    let keys = c.node(0).list_objects("overwrite", "").await.unwrap();
     assert_eq!(keys.len(), 1, "should have exactly 1 key after overwrites");
 }
 
@@ -150,7 +150,7 @@ async fn test_shard_deletion_rs_reconstruction() {
         .put_object("rs", "test.bin", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "rs", "test.bin");
+    c.broadcast_manifest(0, "rs", "test.bin").await;
 
     // Sanity: readable initially.
     let (got, manifest) = c.node(1).get_object("rs", "test.bin").await.unwrap();
@@ -208,7 +208,7 @@ async fn test_shard_loss_across_replicas_still_readable() {
         .put_object("rs2", "rep.bin", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "rs2", "rep.bin");
+    c.broadcast_manifest(0, "rs2", "rep.bin").await;
 
     // Kill 2 out of 5 nodes — with replication=3, each shard still has at
     // least 1 surviving copy.
@@ -266,7 +266,7 @@ async fn test_concurrent_mixed_operations() {
                     .await
                     .is_ok()
                 {
-                    cluster.broadcast_manifest(node, "mix", &key);
+                    cluster.broadcast_manifest(node, "mix", &key).await;
                     keys.write().await.push((key, data));
                     pc.fetch_add(1, Ordering::Relaxed);
                 }
@@ -331,9 +331,9 @@ async fn test_concurrent_mixed_operations() {
         let lc = list_count.clone();
         handles.push(tokio::spawn(async move {
             while !stop.load(Ordering::Relaxed) {
-                let _ = cluster.node(0).list_objects("mix", "");
-                let _ = cluster.node(0).list_objects("mix", "mix-w0");
-                let _ = cluster.node(0).list_objects("mix", "mix-w1");
+                let _ = cluster.node(0).list_objects("mix", "").await;
+                let _ = cluster.node(0).list_objects("mix", "mix-w0").await;
+                let _ = cluster.node(0).list_objects("mix", "mix-w1").await;
                 lc.fetch_add(1, Ordering::Relaxed);
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
@@ -408,7 +408,7 @@ async fn test_rolling_chaos_with_expansion() {
                     .await
                 {
                     Ok(_) => {
-                        cl.broadcast_manifest(node, "roll", &key);
+                        cl.broadcast_manifest(node, "roll", &key).await;
                         keys.write().await.push((key, data));
                         wc.fetch_add(1, Ordering::Relaxed);
                     }
@@ -539,7 +539,7 @@ async fn test_large_cluster_20_nodes() {
             .put_object("big", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(writer, "big", &key);
+        c.broadcast_manifest(writer, "big", &key).await;
 
         objects.push((key, data));
     }
@@ -590,7 +590,7 @@ async fn test_erasure_config_variations() {
             .put_object("ec", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(0, "ec", &key);
+        c.broadcast_manifest(0, "ec", &key).await;
 
         // Verify from multiple nodes.
         for reader in [0, 1, n - 1] {
@@ -625,10 +625,10 @@ async fn test_metadata_round_trip() {
         .put_object("meta", "tagged.bin", &data, metadata.clone())
         .await
         .unwrap();
-    c.broadcast_manifest(0, "meta", "tagged.bin");
+    c.broadcast_manifest(0, "meta", "tagged.bin").await;
 
     // HEAD from a different node.
-    let manifest = c.node(2).head_object("meta", "tagged.bin").unwrap();
+    let manifest = c.node(2).head_object("meta", "tagged.bin").await.unwrap();
     assert_eq!(manifest.metadata, metadata);
     assert_eq!(manifest.total_size, 3000);
 
@@ -657,7 +657,7 @@ async fn test_delete_then_list_consistency() {
             .put_object("dl", &key, &data, BTreeMap::new())
             .await
             .unwrap();
-        c.broadcast_manifest(i as usize % 5, "dl", &key);
+        c.broadcast_manifest(i as usize % 5, "dl", &key).await;
         all_keys.push(key);
     }
 
@@ -676,7 +676,7 @@ async fn test_delete_then_list_consistency() {
     }
 
     // List should return exactly the kept keys.
-    let mut listed = c.node(0).list_objects("dl", "").unwrap();
+    let mut listed = c.node(0).list_objects("dl", "").await.unwrap();
     listed.sort();
     kept.sort();
     assert_eq!(listed, kept, "list after delete should match kept keys");
@@ -713,13 +713,13 @@ async fn test_multi_bucket_isolation() {
                 .put_object(bucket, &key, &data, BTreeMap::new())
                 .await
                 .unwrap();
-            c.broadcast_manifest(i % 5, bucket, &key);
+            c.broadcast_manifest(i % 5, bucket, &key).await;
         }
     }
 
     // Verify each bucket's objects are independent.
     for (bi, bucket) in buckets.iter().enumerate() {
-        let keys = c.node(0).list_objects(bucket, "").unwrap();
+        let keys = c.node(0).list_objects(bucket, "").await.unwrap();
         assert_eq!(
             keys.len(),
             10,
