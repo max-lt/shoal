@@ -83,7 +83,9 @@ async fn write_object(
         chunk_metas.push(ChunkMeta {
             chunk_id: chunk.id,
             offset: chunk.offset,
-            size: original_size as u32,
+            raw_length: original_size as u32,
+            stored_length: original_size as u32,
+            compression: shoal_types::Compression::None,
             shards: shard_metas,
         });
     }
@@ -119,7 +121,7 @@ async fn read_object(
     let mut result = Vec::with_capacity(manifest.total_size as usize);
 
     for chunk_meta in &manifest.chunks {
-        let original_size = chunk_meta.size as usize;
+        let original_size = chunk_meta.stored_length as usize;
 
         // Fetch available shards from all stores.
         let mut available_shards: Vec<(u8, Vec<u8>)> = Vec::new();

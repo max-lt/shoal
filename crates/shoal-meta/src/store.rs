@@ -546,7 +546,9 @@ mod tests {
             chunks: vec![ChunkMeta {
                 chunk_id: shoal_types::ChunkId::from_data(b"chunk 0"),
                 offset: 0,
-                size: 1024,
+                raw_length: 1024,
+                stored_length: 1024,
+                compression: shoal_types::Compression::None,
                 shards: vec![ShardMeta {
                     shard_id: ShardId::from_data(b"shard 0"),
                     index: 0,
@@ -1205,7 +1207,9 @@ mod tests {
                 .map(|i| ChunkMeta {
                     chunk_id: shoal_types::ChunkId::from_data(&[i as u8]),
                     offset: i as u64 * 1024,
-                    size: 1024,
+                    raw_length: 1024,
+                    stored_length: 1024,
+                    compression: shoal_types::Compression::None,
                     shards: (0..6)
                         .map(|j| ShardMeta {
                             shard_id: ShardId::from_data(&[i as u8, j]),

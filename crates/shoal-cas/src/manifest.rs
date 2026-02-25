@@ -106,14 +106,16 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shoal_types::{ChunkId, ShardId, ShardMeta};
+    use shoal_types::{ChunkId, Compression, ShardId, ShardMeta};
 
     fn sample_chunks() -> Vec<ChunkMeta> {
         vec![
             ChunkMeta {
                 chunk_id: ChunkId::from_data(b"chunk-0"),
                 offset: 0,
-                size: 1024,
+                raw_length: 1024,
+                stored_length: 1024,
+                compression: Compression::None,
                 shards: vec![
                     ShardMeta {
                         shard_id: ShardId::from_data(b"shard-0-0"),
@@ -130,7 +132,9 @@ mod tests {
             ChunkMeta {
                 chunk_id: ChunkId::from_data(b"chunk-1"),
                 offset: 1024,
-                size: 500,
+                raw_length: 500,
+                stored_length: 500,
+                compression: Compression::None,
                 shards: vec![ShardMeta {
                     shard_id: ShardId::from_data(b"shard-1-0"),
                     index: 0,

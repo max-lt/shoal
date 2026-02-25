@@ -259,28 +259,29 @@ async fn test_head_nonexistent() {
 async fn test_head_object_chunk_count() {
     let node = single_node(256, 2, 1).await;
 
-    let sizes_and_chunks = [
-        (0, 0),
-        (1, 1),
-        (255, 1),
-        (256, 1),
-        (257, 2),
-        (512, 2),
-        (513, 3),
-        (1024, 4),
+    // With CDC (min=16KB, avg=64KB, max=256KB), small data produces 1 chunk,
+    // empty data produces 0 chunks.
+    // (size, min_chunks, max_chunks)
+    let cases: &[(usize, usize, usize)] = &[
+        (0, 0, 0),           // empty → 0 chunks
+        (1, 1, 1),           // tiny → 1 chunk
+        (255, 1, 1),         // small → 1 chunk
+        (1024, 1, 1),        // below CDC min → 1 chunk
+        (16_384, 1, 1),      // at CDC min → 1 chunk
+        (300_000, 2, usize::MAX), // above CDC max → multiple chunks
     ];
 
-    for (size, expected_chunks) in sizes_and_chunks {
+    for &(size, min_chunks, max_chunks) in cases {
         let data = test_data(size);
         let key = format!("size-{size}");
         node.put_object("b", &key, &data, BTreeMap::new())
             .await
             .unwrap();
         let manifest = node.head_object("b", &key).await.unwrap();
-        assert_eq!(
-            manifest.chunks.len(),
-            expected_chunks,
-            "wrong chunk count for size={size}"
+        let n = manifest.chunks.len();
+        assert!(
+            n >= min_chunks && n <= max_chunks,
+            "unexpected chunk count {n} for size={size} (expected {min_chunks}..={max_chunks})",
         );
     }
 }

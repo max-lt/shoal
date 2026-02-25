@@ -1096,29 +1096,30 @@ async fn test_3_node_one_byte_under_chunk() {
     }
 }
 
-/// Object of chunk_size + 1 bytes (forces 2 chunks).
+/// Small object (below CDC min) produces a single chunk.
 #[tokio::test]
 #[ntest::timeout(30000)]
-async fn test_3_node_one_byte_over_chunk() {
+async fn test_3_node_small_object_single_chunk() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(1025);
 
     c.node(2)
-        .put_object("b", "over", &data, BTreeMap::new())
+        .put_object("b", "small", &data, BTreeMap::new())
         .await
         .unwrap();
-    c.broadcast_manifest(2, "b", "over").await;
+    c.broadcast_manifest(2, "b", "small").await;
 
-    let manifest = c.node(2).head_object("b", "over").await.unwrap();
-    assert_eq!(manifest.chunks.len(), 2, "should be exactly 2 chunks");
+    let manifest = c.node(2).head_object("b", "small").await.unwrap();
+    // 1025 bytes < CDC min (16KB) → single chunk.
+    assert_eq!(manifest.chunks.len(), 1, "small data should be 1 CDC chunk");
 
     for i in 0..3 {
-        let (got, _) = c.node(i).get_object("b", "over").await.unwrap();
-        assert_eq!(got, data, "over chunk_size on node {i}");
+        let (got, _) = c.node(i).get_object("b", "small").await.unwrap();
+        assert_eq!(got, data, "small object on node {i}");
     }
 }
 
-/// 1MB object with small chunk size: many chunks.
+/// 1MB object produces multiple CDC chunks.
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_5_node_1mb_many_chunks() {
@@ -1132,7 +1133,12 @@ async fn test_5_node_1mb_many_chunks() {
     c.broadcast_manifest(0, "b", "big").await;
 
     let manifest = c.node(0).head_object("b", "big").await.unwrap();
-    assert_eq!(manifest.chunks.len(), 256, "1MB / 4096 = 256 chunks");
+    // CDC avg=64KB → ~16 chunks for 1MB (varies).
+    assert!(
+        manifest.chunks.len() > 1,
+        "1MB should produce multiple CDC chunks, got {}",
+        manifest.chunks.len()
+    );
 
     // Read from two different non-writer nodes.
     for &i in &[2, 4] {
@@ -1267,13 +1273,13 @@ async fn test_delete_from_different_node() {
 // Different chunk sizes
 // =========================================================================
 
-/// Verify different chunk sizes produce correct results.
+/// Verify various data sizes produce correct results with CDC chunking.
 #[tokio::test]
 #[ntest::timeout(30000)]
-async fn test_various_chunk_sizes() {
-    for chunk_size in [128, 256, 512, 1024, 4096] {
-        let c = TestCluster::new(3, chunk_size, 2, 1).await;
-        let data = test_data(10_000);
+async fn test_various_data_sizes() {
+    for data_size in [100, 1_000, 10_000, 100_000, 500_000] {
+        let c = TestCluster::new(3, 1024, 2, 1).await;
+        let data = test_data(data_size);
 
         c.node(0)
             .put_object("b", "k", &data, BTreeMap::new())
@@ -1282,15 +1288,14 @@ async fn test_various_chunk_sizes() {
         c.broadcast_manifest(0, "b", "k").await;
 
         let (got, _) = c.node(2).get_object("b", "k").await.unwrap();
-        assert_eq!(got, data, "chunk_size={chunk_size}");
+        assert_eq!(got, data, "data_size={data_size}");
 
         let manifest = c.node(0).head_object("b", "k").await.unwrap();
-        let expected_chunks = (10_000 + chunk_size as usize - 1) / chunk_size as usize;
-        assert_eq!(
-            manifest.chunks.len(),
-            expected_chunks,
-            "chunk count for chunk_size={chunk_size}"
+        assert!(
+            !manifest.chunks.is_empty(),
+            "must have at least 1 chunk for size={data_size}"
         );
+        assert_eq!(manifest.total_size, data_size as u64);
     }
 }
 

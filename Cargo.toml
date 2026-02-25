@@ -88,5 +88,11 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 libc = "0.2"
 dirs = "6"
 
+# Content-defined chunking
+fastcdc = { version = "3", features = ["tokio"] }
+
+# Compression
+zstd = "0.13"
+
 # Testing
 tempfile = "3"

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointAddr;
-use shoal_cas::{Chunker, build_manifest};
+use shoal_cas::{CdcChunker, build_manifest};
 use shoal_cluster::{ClusterState, GossipHandle};
 use shoal_erasure::ErasureEncoder;
 use shoal_logtree::LogTree;
@@ -87,10 +87,8 @@ pub struct ShoalNode {
     meta: Arc<MetaStore>,
     /// Cluster membership and placement ring.
     cluster: Arc<ClusterState>,
-    /// Content-addressing chunker.
-    chunker: Chunker,
-    /// Chunk size (kept separately since Chunker doesn't expose it).
-    chunk_size: u32,
+    /// Content-defined chunker (FastCDC).
+    cdc_chunker: CdcChunker,
     /// Erasure encoder.
     encoder: ErasureEncoder,
     /// Erasure coding parameters.
@@ -145,8 +143,7 @@ impl ShoalNode {
             store,
             meta,
             cluster,
-            chunker: Chunker::new(config.chunk_size),
-            chunk_size: config.chunk_size,
+            cdc_chunker: CdcChunker::new(),
             encoder: ErasureEncoder::new(config.erasure_k, config.erasure_m),
             erasure_k: config.erasure_k,
             erasure_m: config.erasure_m,
@@ -335,11 +332,11 @@ impl ShoalNode {
 
         info!(bucket, key, total_size, "put_object: starting write");
 
-        // Step 1: chunk the data.
-        let chunks = self.chunker.chunk(data);
-        debug!(num_chunks = chunks.len(), "chunked object");
+        // Step 1: content-defined chunking (CDC on raw bytes).
+        let chunks = self.cdc_chunker.chunk(data);
+        debug!(num_chunks = chunks.len(), "chunked object (CDC)");
 
-        // Step 2: erasure-encode each chunk and distribute shards.
+        // Step 2: compress, erasure-encode, and distribute shards.
         let ring = self.cluster.ring().await;
 
         let mut chunk_metas = Vec::with_capacity(chunks.len());
@@ -347,13 +344,33 @@ impl ShoalNode {
         let mut local_existing: u32 = 0;
         let mut remote_pushed: u32 = 0;
 
+        /// Zstd compression level (3 = good speed/ratio tradeoff).
+        const ZSTD_LEVEL: i32 = 3;
+
         // Remote pushes are fired in parallel to avoid blocking on slow or
         // dead nodes. Local stores and metadata writes stay sequential
         // (fast, no network).
         let mut push_tasks = tokio::task::JoinSet::new();
 
         for chunk in &chunks {
-            let (shards, _original_size) = self.encoder.encode(&chunk.data)?;
+            // Compress raw chunk data with zstd before erasure coding.
+            let raw_length = chunk.data.len() as u32;
+            let compressed = zstd::stream::encode_all(chunk.data.as_ref(), ZSTD_LEVEL)
+                .map_err(|e| EngineError::Cas(shoal_cas::CasError::Io(e)))?;
+
+            // Use compressed data if it's actually smaller, otherwise store raw.
+            let compressed_len = compressed.len() as u32;
+            let (encode_input, stored_length, compression) = if compressed_len < raw_length {
+                (
+                    bytes::Bytes::from(compressed),
+                    compressed_len,
+                    Compression::Zstd,
+                )
+            } else {
+                (chunk.data.clone(), raw_length, Compression::None)
+            };
+
+            let (shards, _original_size) = self.encoder.encode(&encode_input)?;
 
             let mut shard_metas = Vec::with_capacity(shards.len());
 
@@ -432,7 +449,9 @@ impl ShoalNode {
             chunk_metas.push(ChunkMeta {
                 chunk_id: chunk.id,
                 offset: chunk.offset,
-                size: chunk.data.len() as u32,
+                raw_length,
+                stored_length,
+                compression,
                 shards: shard_metas,
             });
         }
@@ -483,7 +502,12 @@ impl ShoalNode {
         );
 
         // Step 3: build manifest.
-        let manifest = build_manifest(&chunk_metas, total_size, self.chunk_size, metadata)?;
+        let manifest = build_manifest(
+            &chunk_metas,
+            total_size,
+            self.cdc_chunker.avg_size(),
+            metadata,
+        )?;
         let object_id = manifest.object_id;
 
         // Step 4: persist manifest and key mapping, then broadcast.
@@ -688,12 +712,30 @@ impl ShoalNode {
                 });
             }
 
-            let chunk_data = shoal_erasure::decode(
+            // Erasure decode produces the stored (possibly compressed) data.
+            let stored_data = shoal_erasure::decode(
                 self.erasure_k,
                 self.erasure_m,
                 &collected,
-                chunk_meta.size as usize,
+                chunk_meta.stored_length as usize,
             )?;
+
+            // Decompress if needed.
+            let chunk_data = match chunk_meta.compression {
+                Compression::Zstd => {
+                    let decompressed = zstd::stream::decode_all(stored_data.as_slice())
+                        .map_err(|e| EngineError::Cas(shoal_cas::CasError::Io(e)))?;
+                    if decompressed.len() != chunk_meta.raw_length as usize {
+                        return Err(EngineError::ReadFailed {
+                            chunk_index: ci,
+                            needed: chunk_meta.raw_length as usize,
+                            found: decompressed.len(),
+                        });
+                    }
+                    decompressed
+                }
+                Compression::None => stored_data,
+            };
 
             result.extend_from_slice(&chunk_data);
         }

@@ -117,16 +117,29 @@ pub struct Manifest {
     pub metadata: BTreeMap<String, String>,
 }
 
+/// Compression algorithm used for a stored chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Compression {
+    /// No compression — chunk stored as-is.
+    None,
+    /// Zstandard compression.
+    Zstd,
+}
+
 /// Metadata for a single chunk within a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkMeta {
-    /// Content-addressed identifier for this chunk.
+    /// Content-addressed identifier for this chunk (`blake3(raw_data)`).
     pub chunk_id: ChunkId,
     /// Byte offset of this chunk within the original object.
     pub offset: u64,
-    /// Size of this chunk in bytes.
-    pub size: u32,
-    /// Reed-Solomon shards produced from this chunk.
+    /// Size of this chunk in bytes before compression.
+    pub raw_length: u32,
+    /// Size of this chunk after compression (equals `raw_length` when uncompressed).
+    pub stored_length: u32,
+    /// Compression algorithm applied to this chunk before erasure coding.
+    pub compression: Compression,
+    /// Reed-Solomon shards produced from the (possibly compressed) chunk data.
     pub shards: Vec<ShardMeta>,
 }
 
@@ -613,7 +626,9 @@ mod tests {
             chunks: vec![ChunkMeta {
                 chunk_id: ChunkId::from_data(b"chunk 0"),
                 offset: 0,
-                size: 1024,
+                raw_length: 1024,
+                stored_length: 1024,
+                compression: Compression::None,
                 shards: vec![
                     ShardMeta {
                         shard_id: ShardId::from_data(b"shard 0-0"),
@@ -644,7 +659,9 @@ mod tests {
         let chunk = ChunkMeta {
             chunk_id: ChunkId::from_data(b"chunk"),
             offset: 4096,
-            size: 1024,
+            raw_length: 1024,
+            stored_length: 1024,
+            compression: Compression::None,
             shards: vec![],
         };
         let encoded = postcard::to_allocvec(&chunk).unwrap();
@@ -662,6 +679,15 @@ mod tests {
         let encoded = postcard::to_allocvec(&shard).unwrap();
         let decoded: ShardMeta = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(shard, decoded);
+    }
+
+    #[test]
+    fn test_compression_roundtrip_postcard() {
+        for comp in [Compression::None, Compression::Zstd] {
+            let encoded = postcard::to_allocvec(&comp).unwrap();
+            let decoded: Compression = postcard::from_bytes(&encoded).unwrap();
+            assert_eq!(comp, decoded);
+        }
     }
 
     #[test]

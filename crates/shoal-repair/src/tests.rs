@@ -158,7 +158,9 @@ impl TestCluster {
             chunks.push(ChunkMeta {
                 chunk_id,
                 offset,
-                size: chunk_data.len() as u32,
+                raw_length: chunk_data.len() as u32,
+                stored_length: chunk_data.len() as u32,
+                compression: shoal_types::Compression::None,
                 shards: shard_metas,
             });
             offset += chunk_data.len() as u64;
@@ -353,7 +355,7 @@ async fn test_executor_repair_by_rs_reconstruction() {
             shard_id,
             target_shard,
             &sibling_metas,
-            chunk.size,
+            chunk.stored_length,
             &throttle,
         )
         .await;

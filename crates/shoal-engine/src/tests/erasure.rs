@@ -22,8 +22,8 @@ async fn test_erasure_k4_m2() {
 
     let (got, manifest) = node.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
-    // 3000 / 512 = 5.86 -> 6 chunks, each with 6 shards (4+2)
-    assert_eq!(manifest.chunks.len(), 6);
+    // With CDC, 3000 bytes (< 16KB min) → 1 chunk, each with 6 shards (k=4+m=2).
+    assert_eq!(manifest.chunks.len(), 1);
     assert_eq!(manifest.chunks[0].shards.len(), 6);
 }
 
@@ -202,14 +202,16 @@ async fn test_identical_data_same_shard_ids() {
 }
 
 // -----------------------------------------------------------------------
-// Different chunk sizes produce different manifests
+// Different erasure configs produce different manifests
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 #[ntest::timeout(10000)]
-async fn test_different_chunk_sizes_different_manifests() {
+async fn test_different_erasure_configs_different_manifests() {
+    // With CDC, chunk_size param doesn't affect chunking (fixed CDC params).
+    // Different erasure configs (k, m) produce different shard layouts → different manifests.
     let node_a = single_node(512, 2, 1).await;
-    let node_b = single_node(1024, 2, 1).await;
+    let node_b = single_node(512, 4, 2).await;
     let data = test_data(2000);
 
     let oid_a = node_a
@@ -221,6 +223,6 @@ async fn test_different_chunk_sizes_different_manifests() {
         .await
         .unwrap();
 
-    // Different chunk sizes -> different chunking -> different manifests.
+    // Different erasure configs -> different shard IDs -> different manifests.
     assert_ne!(oid_a, oid_b);
 }

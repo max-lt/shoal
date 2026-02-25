@@ -215,8 +215,8 @@ impl RepairExecutor {
             });
         }
 
-        // RS decode to recover the original chunk.
-        let original_size = chunk_meta.size as usize;
+        // RS decode to recover the stored (possibly compressed) chunk data.
+        let original_size = chunk_meta.stored_length as usize;
         let chunk_data = shoal_erasure::decode(k, m, &collected, original_size)?;
 
         // Re-encode to get all shards including the missing one.

@@ -88,14 +88,15 @@ async fn test_empty_key_name() {
 }
 
 // -----------------------------------------------------------------------
-// Boundary chunk sizes
+// Boundary chunk sizes (CDC: min=16KB, avg=64KB, max=256KB)
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 #[ntest::timeout(10000)]
-async fn test_data_exactly_one_chunk() {
+async fn test_data_below_cdc_min() {
+    // Data smaller than CDC min_size → single chunk.
     let node = single_node(256, 2, 1).await;
-    let data = test_data(256);
+    let data = test_data(1000);
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await
@@ -103,36 +104,38 @@ async fn test_data_exactly_one_chunk() {
     let (got, manifest) = node.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
     assert_eq!(manifest.chunks.len(), 1);
+    assert_eq!(manifest.chunks[0].raw_length, 1000);
 }
 
 #[tokio::test]
 #[ntest::timeout(10000)]
-async fn test_data_one_byte_over_chunk() {
+async fn test_data_at_cdc_min_boundary() {
+    // Data exactly at CDC min_size → single chunk.
     let node = single_node(256, 2, 1).await;
-    let data = test_data(257);
+    let data = test_data(16_384); // CDC_MIN_SIZE
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await
         .unwrap();
     let (got, manifest) = node.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
-    assert_eq!(manifest.chunks.len(), 2);
-    // Second chunk should be 1 byte.
-    assert_eq!(manifest.chunks[1].size, 1);
-}
-
-#[tokio::test]
-#[ntest::timeout(10000)]
-async fn test_data_one_byte_under_chunk() {
-    let node = single_node(256, 2, 1).await;
-    let data = test_data(255);
-
-    node.put_object("b", "k", &data, BTreeMap::new())
-        .await
-        .unwrap();
-    let (got, manifest) = node.get_object("b", "k").await.unwrap();
-    assert_eq!(got, data);
+    // At exactly min_size, CDC produces 1 chunk.
     assert_eq!(manifest.chunks.len(), 1);
+}
+
+#[tokio::test]
+#[ntest::timeout(10000)]
+async fn test_data_above_cdc_max() {
+    // Data larger than CDC max_size → multiple chunks.
+    let node = single_node(256, 2, 1).await;
+    let data = test_data(300_000); // > 256KB max
+
+    node.put_object("b", "k", &data, BTreeMap::new())
+        .await
+        .unwrap();
+    let (got, manifest) = node.get_object("b", "k").await.unwrap();
+    assert_eq!(got, data);
+    assert!(manifest.chunks.len() >= 2, "should produce multiple chunks");
 }
 
 // -----------------------------------------------------------------------
@@ -143,7 +146,7 @@ async fn test_data_one_byte_under_chunk() {
 #[ntest::timeout(10000)]
 async fn test_large_object() {
     let node = single_node(1024, 2, 1).await;
-    let data = test_data(10_000);
+    let data = test_data(100_000);
 
     node.put_object("b", "large", &data, BTreeMap::new())
         .await
@@ -151,9 +154,9 @@ async fn test_large_object() {
 
     let (got, manifest) = node.get_object("b", "large").await.unwrap();
     assert_eq!(got, data);
-    assert_eq!(manifest.total_size, 10_000);
-    // 10000 / 1024 = 9.77 -> 10 chunks
-    assert_eq!(manifest.chunks.len(), 10);
+    assert_eq!(manifest.total_size, 100_000);
+    // CDC produces variable-size chunks; just verify data round-trips.
+    assert!(!manifest.chunks.is_empty());
 }
 
 #[tokio::test]
@@ -170,8 +173,8 @@ async fn test_100kb_object() {
     assert_eq!(got, data);
     assert_eq!(manifest.object_id, oid);
     assert_eq!(manifest.total_size, 100_000);
-    // 100000 / 4096 = 24.41 -> 25 chunks
-    assert_eq!(manifest.chunks.len(), 25);
+    // CDC chunks — verify they exist and data round-trips.
+    assert!(!manifest.chunks.is_empty());
 }
 
 #[tokio::test]
@@ -183,9 +186,14 @@ async fn test_1mb_object() {
     node.put_object("b", "1mb", &data, BTreeMap::new())
         .await
         .unwrap();
-    let (got, _) = node.get_object("b", "1mb").await.unwrap();
+    let (got, manifest) = node.get_object("b", "1mb").await.unwrap();
     assert_eq!(got.len(), 1_000_000);
     assert_eq!(got, data);
+    // 1MB with CDC avg=64KB → expect ~15 chunks (varies).
+    assert!(
+        manifest.chunks.len() > 1,
+        "1MB should produce multiple chunks"
+    );
 }
 
 // -----------------------------------------------------------------------

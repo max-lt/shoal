@@ -3,6 +3,7 @@
 mod helpers;
 
 mod basic;
+mod cdc;
 pub(crate) mod chaos;
 mod concurrency;
 mod edge_cases;
