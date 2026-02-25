@@ -39,6 +39,7 @@ use shoal_repair::executor::ShardTransfer;
 use shoal_repair::{CircuitBreaker, RepairDetector, RepairExecutor, RepairScheduler, Throttle};
 use shoal_s3::{S3Server, S3ServerConfig};
 use shoal_store::{FileStore, MemoryStore, ShardStore};
+use shoal_types::events::{EventBus, LogEntryApplied, LogEntryPending, ManifestReceived};
 use shoal_types::{
     Manifest, Member, MemberState, NodeId, NodeTopology, RepairCircuitBreaker, ShardId,
 };
@@ -355,6 +356,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         })
         .await;
 
+    // --- Event bus: typed pub/sub for intra-node events ---
+    let event_bus = EventBus::new();
+
     // --- Address book: NodeId → EndpointAddr for routing ---
     let address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>> =
         Arc::new(RwLock::new(HashMap::new()));
@@ -533,7 +537,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         address_book.clone(),
     )
     .with_log_tree(log_tree.clone())
-    .with_transport(transport.clone() as Arc<dyn shoal_net::Transport>);
+    .with_transport(transport.clone() as Arc<dyn shoal_net::Transport>)
+    .with_event_bus(event_bus.clone());
     let pending_entries = protocol.pending_buffer();
     let router = Router::builder(endpoint.clone())
         .accept(cluster_alpn, protocol)
@@ -596,6 +601,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         let meta_gossip = meta.clone();
         let log_tree_gossip = log_tree.clone();
         let pending_gossip = pending_entries.clone();
+        let bus_gossip = event_bus.clone();
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
 
@@ -622,6 +628,12 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                             {
                                 warn!(%e, "failed to store gossip object key");
                             }
+
+                            bus_gossip.emit(ManifestReceived {
+                                bucket,
+                                key,
+                                object_id: manifest.object_id,
+                            });
                         }
                         Err(e) => {
                             warn!(%e, "failed to deserialize gossip manifest");
@@ -656,13 +668,47 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                 match log_tree_gossip.receive_entry(&entry, manifest.as_ref()) {
                                     Ok(true) => {
                                         debug!("stored log entry from gossip");
+
+                                        // Emit LogEntryApplied + ManifestReceived.
+                                        match &entry.action {
+                                            shoal_logtree::Action::Put {
+                                                bucket,
+                                                key,
+                                                manifest_id,
+                                            } => {
+                                                bus_gossip.emit(LogEntryApplied {
+                                                    hash: entry.hash,
+                                                    bucket: bucket.clone(),
+                                                    key: key.clone(),
+                                                });
+                                                bus_gossip.emit(ManifestReceived {
+                                                    bucket: bucket.clone(),
+                                                    key: key.clone(),
+                                                    object_id: *manifest_id,
+                                                });
+                                            }
+                                            shoal_logtree::Action::Delete { bucket, key } => {
+                                                bus_gossip.emit(LogEntryApplied {
+                                                    hash: entry.hash,
+                                                    bucket: bucket.clone(),
+                                                    key: key.clone(),
+                                                });
+                                            }
+                                            _ => {} // Merge, Snapshot — no key-level event
+                                        }
+
                                         shoal_engine::drain_pending(
                                             &log_tree_gossip,
                                             &pending_gossip,
                                         );
                                     }
                                     Ok(false) => {} // already known
-                                    Err(shoal_logtree::LogTreeError::MissingParents(_)) => {
+                                    Err(shoal_logtree::LogTreeError::MissingParents(parents)) => {
+                                        bus_gossip.emit(LogEntryPending {
+                                            hash: entry.hash,
+                                            missing_parents: parents,
+                                        });
+
                                         let mut buf =
                                             pending_gossip.lock().expect("pending lock poisoned");
 
@@ -718,7 +764,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     .with_transport(transport.clone())
     .with_address_book(address_book.clone())
     .with_log_tree(log_tree.clone())
-    .with_pending_buffer(pending_entries.clone());
+    .with_pending_buffer(pending_entries.clone())
+    .with_event_bus(event_bus.clone());
 
     if let Some(handle) = gossip_handle {
         engine_builder = engine_builder.with_gossip(handle);
@@ -748,7 +795,8 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         replication_factor,
         config.erasure_k() as usize,
         config.erasure_m() as usize,
-    );
+    )
+    .with_event_bus(event_bus.clone());
     let repair_scheduler = RepairScheduler::new(
         meta.clone(),
         cluster.clone(),
@@ -758,19 +806,22 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         config.repair_concurrent_transfers(),
         1000, // poll interval: check repair queue every second
     );
-    let repair_detector = Arc::new(RepairDetector::new(
-        cluster.clone(),
-        meta.clone(),
-        store.clone(),
-        replication_factor,
-    ));
+    let repair_detector = Arc::new(
+        RepairDetector::new(
+            cluster.clone(),
+            meta.clone(),
+            store.clone(),
+            replication_factor,
+        )
+        .with_event_bus(event_bus.clone()),
+    );
 
     // Spawn repair background tasks.
-    let detector_events = cluster.subscribe();
     {
         let detector = repair_detector.clone();
+        let bus = event_bus.clone();
         tokio::spawn(async move {
-            detector.run(detector_events).await;
+            detector.run_bus(&bus).await;
         });
     }
     tokio::spawn(async move {

@@ -4027,6 +4027,8 @@ dependencies = [
  "blake3",
  "postcard",
  "serde",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

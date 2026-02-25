@@ -18,6 +18,7 @@ use shoal_logtree::{LogEntry, LogTree, LogTreeError};
 use shoal_meta::MetaStore;
 use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport, Transport};
 use shoal_store::ShardStore;
+use shoal_types::events::{EventBus, ShardSource, ShardStored};
 use shoal_types::{Manifest, NodeId, ObjectId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
@@ -38,6 +39,8 @@ pub struct ShoalProtocol {
     pending_entries: PendingBuffer,
     /// Transport for outgoing targeted pulls (eager pull on MissingParents).
     transport: Option<Arc<dyn Transport>>,
+    /// Typed event bus for emitting events on incoming operations.
+    event_bus: Option<EventBus>,
 }
 
 impl fmt::Debug for ShoalProtocol {
@@ -62,6 +65,7 @@ impl ShoalProtocol {
             log_tree: None,
             pending_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
             transport: None,
+            event_bus: None,
         }
     }
 
@@ -74,6 +78,12 @@ impl ShoalProtocol {
     /// Set the transport for outgoing targeted pulls.
     pub fn with_transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
+        self
+    }
+
+    /// Set the typed event bus for emitting events.
+    pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        self.event_bus = Some(bus);
         self
     }
 
@@ -280,11 +290,13 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         let store = self.store.clone();
         let meta = self.meta.clone();
         let log_tree_bi = self.log_tree.clone();
+        let event_bus_bi = self.event_bus.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_bi_streams(conn, move |msg| {
                 let store = store.clone();
                 let meta = meta.clone();
                 let log_tree = log_tree_bi.clone();
+                let event_bus = event_bus_bi.clone();
                 async move {
                     match msg {
                         ShoalMessage::ShardPush { shard_id, data } => {
@@ -292,6 +304,11 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             let ok = store.put(shard_id, bytes::Bytes::from(data)).await.is_ok();
                             if !ok {
                                 warn!(%shard_id, "failed to store pushed shard");
+                            } else if let Some(bus) = &event_bus {
+                                bus.emit(ShardStored {
+                                    shard_id,
+                                    source: ShardSource::PeerPush,
+                                });
                             }
                             Some(ShoalMessage::ShardPushAck { shard_id, ok })
                         }

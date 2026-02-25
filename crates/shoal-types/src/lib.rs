@@ -6,6 +6,8 @@
 //! cluster types ([`Member`], [`MemberState`], [`ClusterEvent`]),
 //! and configuration ([`NodeConfig`], [`ErasureConfig`], [`StorageBackend`]).
 
+pub mod events;
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};

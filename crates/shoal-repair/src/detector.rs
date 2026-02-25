@@ -13,6 +13,9 @@ use std::sync::{Arc, Mutex};
 use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
 use shoal_store::ShardStore;
+use shoal_types::events::{
+    EventBus, MembershipDead, MembershipLeft, MembershipReady, RepairNeeded,
+};
 use shoal_types::{ClusterEvent, NodeId, ShardId};
 use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
@@ -26,6 +29,8 @@ pub struct RepairDetector {
     /// Nodes already processed as dead/left — prevents duplicate repair enqueues
     /// if foca emits the same notification more than once.
     processed_dead: Mutex<HashSet<NodeId>>,
+    /// Typed event bus for emitting repair-related events.
+    event_bus: Option<EventBus>,
 }
 
 impl RepairDetector {
@@ -42,7 +47,14 @@ impl RepairDetector {
             store,
             replication_factor,
             processed_dead: Mutex::new(HashSet::new()),
+            event_bus: None,
         }
+    }
+
+    /// Set the typed event bus for emitting events.
+    pub fn with_event_bus(mut self, bus: EventBus) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     /// Run the detector loop, processing cluster events until the receiver is dropped.
@@ -103,6 +115,58 @@ impl RepairDetector {
                 self.processed_dead.lock().unwrap().remove(&member.node_id);
             }
             _ => {}
+        }
+    }
+
+    /// Run the detector loop using the typed [`EventBus`] instead of a raw
+    /// `broadcast::Receiver<ClusterEvent>`.
+    ///
+    /// Subscribes to [`MembershipDead`], [`MembershipLeft`], [`MembershipReady`],
+    /// and [`RepairNeeded`] events on the bus.
+    pub async fn run_bus(&self, bus: &EventBus) {
+        info!("repair detector started (event bus)");
+
+        let mut rx_dead = bus.subscribe::<MembershipDead>();
+        let mut rx_left = bus.subscribe::<MembershipLeft>();
+        let mut rx_ready = bus.subscribe::<MembershipReady>();
+        let mut rx_repair = bus.subscribe::<RepairNeeded>();
+
+        loop {
+            tokio::select! {
+                Some(event) = rx_dead.recv() => {
+                    if !self.processed_dead.lock().unwrap().insert(event.node_id) {
+                        debug!(node_id = %event.node_id, "ignoring duplicate MembershipDead event");
+                        continue;
+                    }
+                    info!(node_id = %event.node_id, "node declared dead — scanning for affected shards");
+                    if let Err(e) = self.handle_node_dead(event.node_id).await {
+                        error!(node_id = %event.node_id, error = %e, "failed to enqueue repairs for dead node");
+                    }
+                }
+                Some(event) = rx_left.recv() => {
+                    if !self.processed_dead.lock().unwrap().insert(event.node_id) {
+                        debug!(node_id = %event.node_id, "ignoring duplicate MembershipLeft event");
+                        continue;
+                    }
+                    info!(node_id = %event.node_id, "node left — scanning for affected shards");
+                    if let Err(e) = self.handle_node_dead(event.node_id).await {
+                        error!(node_id = %event.node_id, error = %e, "failed to enqueue repairs for departed node");
+                    }
+                }
+                Some(event) = rx_ready.recv() => {
+                    self.processed_dead.lock().unwrap().remove(&event.node_id);
+                }
+                Some(event) = rx_repair.recv() => {
+                    debug!(shard_id = %event.shard_id, "repair needed event received");
+                    if let Err(e) = self.enqueue_shard(event.shard_id).await {
+                        error!(shard_id = %event.shard_id, error = %e, "failed to enqueue shard for repair");
+                    }
+                }
+                else => {
+                    info!("repair detector shutting down — all event channels closed");
+                    break;
+                }
+            }
         }
     }
 
@@ -170,6 +234,11 @@ impl RepairDetector {
                 Ok(false) => {
                     warn!(%shard_id, "local shard failed integrity check — enqueuing for repair");
                     self.meta.enqueue_repair(shard_id, 0)?; // Priority 0 = most urgent
+                    if let Some(bus) = &self.event_bus {
+                        bus.emit(shoal_types::events::ShardCorrupted {
+                            shard_id: *shard_id,
+                        });
+                    }
                     result.corrupt += 1;
                 }
                 Err(e) => {

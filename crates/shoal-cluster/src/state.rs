@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use shoal_placement::Ring;
+use shoal_types::events::{EventBus, EventOrigin, MembershipDead, MembershipLeft, MembershipReady};
 use shoal_types::{ClusterEvent, Member, MemberState, NodeId};
 use tokio::sync::{RwLock, broadcast};
 use tracing::info;
@@ -27,6 +28,11 @@ pub struct ClusterState {
     ///
     /// Subscribers: repair detector, engine, etc.
     event_tx: broadcast::Sender<ClusterEvent>,
+    /// Type-safe event bus for intra-node pub/sub.
+    ///
+    /// Emits typed events (e.g. [`MembershipReady`], [`MembershipDead`])
+    /// alongside the legacy `broadcast::Sender<ClusterEvent>`.
+    event_bus: EventBus,
     /// Base vnodes per node for the ring.
     vnodes_per_node: u16,
 }
@@ -40,6 +46,7 @@ impl ClusterState {
             ring: RwLock::new(Ring::new(vnodes_per_node)),
             local_node_id,
             event_tx,
+            event_bus: EventBus::new(),
             vnodes_per_node,
         })
     }
@@ -82,6 +89,10 @@ impl ClusterState {
 
         info!(%node_id, "member joined cluster");
         let _ = self.event_tx.send(ClusterEvent::NodeJoined(member));
+        self.event_bus.emit(MembershipReady {
+            node_id,
+            origin: EventOrigin::Local,
+        });
     }
 
     /// Remove a member from the cluster (graceful departure).
@@ -100,6 +111,10 @@ impl ClusterState {
 
         info!(%node_id, "member left cluster");
         let _ = self.event_tx.send(ClusterEvent::NodeLeft(*node_id));
+        self.event_bus.emit(MembershipLeft {
+            node_id: *node_id,
+            origin: EventOrigin::Local,
+        });
     }
 
     /// Mark a member as dead (failure detected).
@@ -120,6 +135,10 @@ impl ClusterState {
 
         info!(%node_id, "member declared dead");
         let _ = self.event_tx.send(ClusterEvent::NodeDead(*node_id));
+        self.event_bus.emit(MembershipDead {
+            node_id: *node_id,
+            origin: EventOrigin::Local,
+        });
     }
 
     /// Return a snapshot of all current members.
@@ -157,8 +176,20 @@ impl ClusterState {
         self.members.read().await.keys().copied().collect()
     }
 
+    /// Return a reference to the typed event bus.
+    pub fn event_bus(&self) -> &EventBus {
+        &self.event_bus
+    }
+
     /// Broadcast a cluster event to all subscribers.
     pub fn emit_event(&self, event: ClusterEvent) {
+        // Also emit typed events on the EventBus for NodeReady.
+        if let ClusterEvent::NodeReady(node_id) = &event {
+            self.event_bus.emit(MembershipReady {
+                node_id: *node_id,
+                origin: EventOrigin::Local,
+            });
+        }
         let _ = self.event_tx.send(event);
     }
 }
