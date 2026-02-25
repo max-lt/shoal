@@ -1,9 +1,11 @@
 //! Repair detector: watches cluster events and enqueues shards for repair.
 //!
-//! [`RepairDetector`] subscribes to [`ClusterEvent`]s and:
-//! - On `NodeDead`: computes which shards were owned by the dead node and
-//!   enqueues them in the repair queue, prioritized by how many surviving
+//! [`RepairDetector`] subscribes to typed events on the [`EventBus`]:
+//! - On [`MembershipDead`]: computes which shards were owned by the dead node
+//!   and enqueues them in the repair queue, prioritized by how many surviving
 //!   copies remain.
+//! - On [`MembershipLeft`]: same as dead — shards need redistribution.
+//! - On [`RepairNeeded`]: enqueues a single shard for repair.
 //! - Periodically: scans local shards, verifies they match ring placement,
 //!   and reports anomalies.
 
@@ -16,8 +18,7 @@ use shoal_store::ShardStore;
 use shoal_types::events::{
     EventBus, MembershipDead, MembershipLeft, MembershipReady, RepairNeeded,
 };
-use shoal_types::{ClusterEvent, NodeId, ShardId};
-use tokio::sync::broadcast;
+use shoal_types::{NodeId, ShardId};
 use tracing::{debug, error, info, warn};
 
 /// Watches cluster events and enqueues shards that need repair.
@@ -57,74 +58,11 @@ impl RepairDetector {
         self
     }
 
-    /// Run the detector loop, processing cluster events until the receiver is dropped.
+    /// Run the detector loop, subscribing to typed events on the [`EventBus`].
     ///
     /// This should be spawned as a background task.
-    pub async fn run(&self, mut events: broadcast::Receiver<ClusterEvent>) {
+    pub async fn run(&self, bus: &EventBus) {
         info!("repair detector started");
-
-        loop {
-            match events.recv().await {
-                Ok(event) => self.handle_event(event).await,
-                Err(broadcast::error::RecvError::Lagged(n)) => {
-                    warn!(skipped = n, "repair detector lagged behind event stream");
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    info!("repair detector shutting down — event channel closed");
-                    break;
-                }
-            }
-        }
-    }
-
-    /// Handle a single cluster event.
-    async fn handle_event(&self, event: ClusterEvent) {
-        match event {
-            ClusterEvent::NodeDead(node_id) => {
-                if !self.processed_dead.lock().unwrap().insert(node_id) {
-                    debug!(%node_id, "ignoring duplicate NodeDead event");
-                    return;
-                }
-
-                info!(%node_id, "node declared dead — scanning for affected shards");
-
-                if let Err(e) = self.handle_node_dead(node_id).await {
-                    error!(%node_id, error = %e, "failed to enqueue repairs for dead node");
-                }
-            }
-            ClusterEvent::NodeLeft(node_id) => {
-                if !self.processed_dead.lock().unwrap().insert(node_id) {
-                    debug!(%node_id, "ignoring duplicate NodeLeft event");
-                    return;
-                }
-
-                info!(%node_id, "node left — scanning for affected shards");
-
-                if let Err(e) = self.handle_node_dead(node_id).await {
-                    error!(%node_id, error = %e, "failed to enqueue repairs for departed node");
-                }
-            }
-            ClusterEvent::RepairNeeded(shard_id) => {
-                debug!(%shard_id, "repair needed event received");
-                if let Err(e) = self.enqueue_shard(shard_id).await {
-                    error!(%shard_id, error = %e, "failed to enqueue shard for repair");
-                }
-            }
-            ClusterEvent::NodeJoined(member) => {
-                // Clear from processed set so a future death is handled.
-                self.processed_dead.lock().unwrap().remove(&member.node_id);
-            }
-            _ => {}
-        }
-    }
-
-    /// Run the detector loop using the typed [`EventBus`] instead of a raw
-    /// `broadcast::Receiver<ClusterEvent>`.
-    ///
-    /// Subscribes to [`MembershipDead`], [`MembershipLeft`], [`MembershipReady`],
-    /// and [`RepairNeeded`] events on the bus.
-    pub async fn run_bus(&self, bus: &EventBus) {
-        info!("repair detector started (event bus)");
 
         let mut rx_dead = bus.subscribe::<MembershipDead>();
         let mut rx_left = bus.subscribe::<MembershipLeft>();

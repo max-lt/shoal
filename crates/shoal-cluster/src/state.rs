@@ -9,14 +9,14 @@ use std::sync::Arc;
 
 use shoal_placement::Ring;
 use shoal_types::events::{EventBus, EventOrigin, MembershipDead, MembershipLeft, MembershipReady};
-use shoal_types::{ClusterEvent, Member, MemberState, NodeId};
-use tokio::sync::{RwLock, broadcast};
+use shoal_types::{Member, MemberState, NodeId};
+use tokio::sync::RwLock;
 use tracing::info;
 
 /// Shared cluster state maintained by the membership service.
 ///
-/// Holds the current set of members, the placement ring, and a broadcast
-/// channel through which other components can subscribe to cluster events.
+/// Holds the current set of members, the placement ring, and a typed
+/// [`EventBus`] through which other components receive cluster events.
 pub struct ClusterState {
     /// Current cluster members, keyed by node ID.
     members: RwLock<HashMap<NodeId, Member>>,
@@ -24,14 +24,9 @@ pub struct ClusterState {
     ring: RwLock<Ring>,
     /// This node's identifier.
     local_node_id: NodeId,
-    /// Broadcast channel for cluster events.
-    ///
-    /// Subscribers: repair detector, engine, etc.
-    event_tx: broadcast::Sender<ClusterEvent>,
     /// Type-safe event bus for intra-node pub/sub.
     ///
-    /// Emits typed events (e.g. [`MembershipReady`], [`MembershipDead`])
-    /// alongside the legacy `broadcast::Sender<ClusterEvent>`.
+    /// Emits typed events (e.g. [`MembershipReady`], [`MembershipDead`]).
     event_bus: EventBus,
     /// Base vnodes per node for the ring.
     vnodes_per_node: u16,
@@ -40,23 +35,13 @@ pub struct ClusterState {
 impl ClusterState {
     /// Create a new cluster state for the given local node.
     pub fn new(local_node_id: NodeId, vnodes_per_node: u16) -> Arc<Self> {
-        let (event_tx, _) = broadcast::channel(256);
         Arc::new(Self {
             members: RwLock::new(HashMap::new()),
             ring: RwLock::new(Ring::new(vnodes_per_node)),
             local_node_id,
-            event_tx,
             event_bus: EventBus::new(),
             vnodes_per_node,
         })
-    }
-
-    /// Subscribe to ALL cluster events (local + remote).
-    ///
-    /// Use this for components that need to react to any membership change
-    /// (repair detector, etc.).
-    pub fn subscribe(&self) -> broadcast::Receiver<ClusterEvent> {
-        self.event_tx.subscribe()
     }
 
     /// Return this node's ID.
@@ -71,8 +56,8 @@ impl ClusterState {
 
     /// Add or update a member in the cluster.
     ///
-    /// Adds the node to the placement ring and broadcasts a
-    /// [`ClusterEvent::NodeJoined`] event.
+    /// Adds the node to the placement ring and emits a
+    /// [`MembershipReady`] event.
     pub async fn add_member(&self, member: Member) {
         let node_id = member.node_id;
         let capacity = member.capacity;
@@ -80,7 +65,7 @@ impl ClusterState {
 
         {
             let mut members = self.members.write().await;
-            members.insert(node_id, member.clone());
+            members.insert(node_id, member);
         }
         {
             let mut ring = self.ring.write().await;
@@ -88,7 +73,6 @@ impl ClusterState {
         }
 
         info!(%node_id, "member joined cluster");
-        let _ = self.event_tx.send(ClusterEvent::NodeJoined(member));
         self.event_bus.emit(MembershipReady {
             node_id,
             origin: EventOrigin::Local,
@@ -97,8 +81,8 @@ impl ClusterState {
 
     /// Remove a member from the cluster (graceful departure).
     ///
-    /// Removes the node from the placement ring and broadcasts a
-    /// [`ClusterEvent::NodeLeft`] event.
+    /// Removes the node from the placement ring and emits a
+    /// [`MembershipLeft`] event.
     pub async fn remove_member(&self, node_id: &NodeId) {
         {
             let mut members = self.members.write().await;
@@ -110,7 +94,6 @@ impl ClusterState {
         }
 
         info!(%node_id, "member left cluster");
-        let _ = self.event_tx.send(ClusterEvent::NodeLeft(*node_id));
         self.event_bus.emit(MembershipLeft {
             node_id: *node_id,
             origin: EventOrigin::Local,
@@ -120,7 +103,7 @@ impl ClusterState {
     /// Mark a member as dead (failure detected).
     ///
     /// Updates the member's state, removes from the placement ring,
-    /// and broadcasts a [`ClusterEvent::NodeDead`] event.
+    /// and emits a [`MembershipDead`] event.
     pub async fn mark_dead(&self, node_id: &NodeId) {
         {
             let mut members = self.members.write().await;
@@ -134,7 +117,6 @@ impl ClusterState {
         }
 
         info!(%node_id, "member declared dead");
-        let _ = self.event_tx.send(ClusterEvent::NodeDead(*node_id));
         self.event_bus.emit(MembershipDead {
             node_id: *node_id,
             origin: EventOrigin::Local,
@@ -179,18 +161,6 @@ impl ClusterState {
     /// Return a reference to the typed event bus.
     pub fn event_bus(&self) -> &EventBus {
         &self.event_bus
-    }
-
-    /// Broadcast a cluster event to all subscribers.
-    pub fn emit_event(&self, event: ClusterEvent) {
-        // Also emit typed events on the EventBus for NodeReady.
-        if let ClusterEvent::NodeReady(node_id) = &event {
-            self.event_bus.emit(MembershipReady {
-                node_id: *node_id,
-                origin: EventOrigin::Local,
-            });
-        }
-        let _ = self.event_tx.send(event);
     }
 }
 

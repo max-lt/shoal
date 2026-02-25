@@ -6,7 +6,8 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use shoal_types::{ClusterEvent, MemberState, NodeId, NodeTopology};
+    use shoal_types::events::{MembershipDead, MembershipReady};
+    use shoal_types::{MemberState, NodeId, NodeTopology};
     use tokio::sync::RwLock;
     use tokio::time;
 
@@ -291,34 +292,29 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_state_event_subscription() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
-        let mut rx = state.subscribe();
+        let mut rx = state.event_bus().subscribe::<MembershipReady>();
 
         let member: shoal_types::Member = test_identity(1).into();
         state.add_member(member.clone()).await;
 
         let event = rx.recv().await.expect("should receive event");
-        match event {
-            ClusterEvent::NodeJoined(m) => assert_eq!(m.node_id, member.node_id),
-            other => panic!("expected NodeJoined, got {other:?}"),
-        }
+        assert_eq!(event.node_id, member.node_id);
     }
 
     #[tokio::test]
     async fn test_cluster_state_event_on_dead() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
-        let mut rx = state.subscribe();
+        let mut rx_ready = state.event_bus().subscribe::<MembershipReady>();
+        let mut rx_dead = state.event_bus().subscribe::<MembershipDead>();
 
         let member: shoal_types::Member = test_identity(1).into();
         state.add_member(member.clone()).await;
-        let _ = rx.recv().await; // consume NodeJoined
+        let _ = rx_ready.recv().await; // consume MembershipReady
 
         state.mark_dead(&member.node_id).await;
 
-        let event = rx.recv().await.expect("should receive event");
-        match event {
-            ClusterEvent::NodeDead(id) => assert_eq!(id, member.node_id),
-            other => panic!("expected NodeDead, got {other:?}"),
-        }
+        let event = rx_dead.recv().await.expect("should receive event");
+        assert_eq!(event.node_id, member.node_id);
     }
 
     // -----------------------------------------------------------------------
@@ -530,7 +526,11 @@ mod tests {
     #[tokio::test]
     async fn test_events_received_by_subscribers() {
         let (network, identities) = TestNetwork::create(2).await;
-        let mut rx = network.state(&identities[0].node_id).await.subscribe();
+        let mut rx = network
+            .state(&identities[0].node_id)
+            .await
+            .event_bus()
+            .subscribe::<MembershipReady>();
 
         network
             .handle(&identities[1].node_id)
@@ -542,12 +542,10 @@ mod tests {
         let mut received_join = false;
         loop {
             tokio::select! {
-                Ok(event) = rx.recv() => {
-                    if let ClusterEvent::NodeJoined(member) = event {
-                        if member.node_id == identities[1].node_id {
-                            received_join = true;
-                            break;
-                        }
+                Some(event) = rx.recv() => {
+                    if event.node_id == identities[1].node_id {
+                        received_join = true;
+                        break;
                     }
                 }
                 _ = time::sleep(Duration::from_millis(50)) => {
@@ -558,7 +556,7 @@ mod tests {
             }
         }
 
-        assert!(received_join, "should have received NodeJoined event");
+        assert!(received_join, "should have received MembershipReady event");
 
         network.shutdown().await;
     }

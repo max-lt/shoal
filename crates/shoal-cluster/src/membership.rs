@@ -374,7 +374,12 @@ async fn handle_notification(
         OwnedNotification::Active => {
             info!("foca: this node is now active in the cluster");
             let local_id = state.local_node_id();
-            state.emit_event(shoal_types::ClusterEvent::NodeReady(local_id));
+            state
+                .event_bus()
+                .emit(shoal_types::events::MembershipReady {
+                    node_id: local_id,
+                    origin: shoal_types::events::EventOrigin::Local,
+                });
         }
 
         OwnedNotification::Idle => {

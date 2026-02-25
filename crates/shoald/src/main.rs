@@ -821,7 +821,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         let detector = repair_detector.clone();
         let bus = event_bus.clone();
         tokio::spawn(async move {
-            detector.run_bus(&bus).await;
+            detector.run(&bus).await;
         });
     }
     tokio::spawn(async move {
