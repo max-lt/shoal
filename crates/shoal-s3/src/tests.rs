@@ -32,7 +32,7 @@ async fn test_router() -> axum::Router {
         })
         .await;
 
-    let engine = Arc::new(shoal_engine::ShoalNode::new(
+    let engine: Arc<dyn shoal_engine::ShoalEngine> = Arc::new(shoal_engine::ShoalNode::new(
         shoal_engine::ShoalNodeConfig {
             node_id,
             chunk_size: 1024,
@@ -71,7 +71,7 @@ async fn test_router_with_auth(secret: &str) -> axum::Router {
         })
         .await;
 
-    let engine = Arc::new(shoal_engine::ShoalNode::new(
+    let engine: Arc<dyn shoal_engine::ShoalEngine> = Arc::new(shoal_engine::ShoalNode::new(
         shoal_engine::ShoalNodeConfig {
             node_id,
             chunk_size: 1024,

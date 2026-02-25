@@ -28,7 +28,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::put;
-use shoal_engine::ShoalNode;
+use shoal_engine::ShoalEngine;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -49,8 +49,8 @@ pub(crate) struct MultipartUpload {
 /// Shared application state for all S3 handlers.
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// The storage engine.
-    pub engine: Arc<ShoalNode>,
+    /// The storage engine (trait object — works with any [`ShoalEngine`] impl).
+    pub engine: Arc<dyn ShoalEngine>,
     /// In-flight multipart uploads.
     pub uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
     /// Optional shared-secret for Bearer token authentication.
@@ -84,8 +84,8 @@ async fn auth_middleware(
 
 /// Configuration for creating an [`S3Server`].
 pub struct S3ServerConfig {
-    /// The storage engine to serve.
-    pub engine: Arc<ShoalNode>,
+    /// The storage engine to serve (any [`ShoalEngine`] implementation).
+    pub engine: Arc<dyn ShoalEngine>,
     /// Optional shared-secret for Bearer token auth. `None` disables auth.
     pub auth_secret: Option<String>,
 }
