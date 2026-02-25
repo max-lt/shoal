@@ -447,6 +447,20 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 .collect();
                             Some(ShoalMessage::ApiKeyResponse { keys })
                         }
+                        ShoalMessage::KeyLookupRequest { bucket, key } => {
+                            let manifest = meta
+                                .get_object_key(&bucket, &key)
+                                .ok()
+                                .flatten()
+                                .and_then(|oid| meta.get_manifest(&oid).ok().flatten())
+                                .or_else(|| {
+                                    let lt = log_tree.as_ref()?;
+                                    let oid = lt.resolve(&bucket, &key).ok()??;
+                                    lt.get_manifest(&oid).ok()?
+                                });
+                            let bytes = manifest.and_then(|m| postcard::to_allocvec(&m).ok());
+                            Some(ShoalMessage::KeyLookupResponse { manifest: bytes })
+                        }
                         _ => None,
                     }
                 }

@@ -84,6 +84,14 @@ pub trait Transport: Send + Sync {
         addr: iroh::EndpointAddr,
         access_key_ids: &[String],
     ) -> Result<Vec<(String, String)>, NetError>;
+
+    /// Look up a manifest by bucket/key on a remote node.
+    async fn lookup_key(
+        &self,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

@@ -1275,9 +1275,6 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Manifest>, EngineError> {
-        // Subscribe early so we don't miss events emitted during local lookups.
-        let mut rx = self.event_bus.subscribe::<ManifestReceived>();
-
         // LogTree mode: resolve from the DAG's materialized state.
         let object_id_from_dag = if let Some(log_tree) = &self.log_tree {
             log_tree.resolve(bucket, key)?
@@ -1371,32 +1368,36 @@ impl ShoalNode {
             }
         }
 
-        // Event-driven wait: the entry might arrive via gossip within a short window.
-        let bucket_owned = bucket.to_string();
-        let key_owned = key.to_string();
+        // Active consistency check: query peers by key.
+        let peers = self.cluster.members().await;
+        let mut tasks = tokio::task::JoinSet::new();
 
-        let wait_result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
-            loop {
-                match rx.recv().await {
-                    Some(evt) if evt.bucket == bucket_owned && evt.key == key_owned => {
-                        return Some(evt.object_id);
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+
+            if let Some(addr) = self.resolve_addr(&peer.node_id).await {
+                let transport = transport.clone();
+                let b = bucket.to_string();
+                let k = key.to_string();
+                tasks.spawn(async move { transport.lookup_key(addr, &b, &k).await });
+            }
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            if let Ok(Ok(Some(bytes))) = result {
+                if let Ok(manifest) = postcard::from_bytes::<Manifest>(&bytes) {
+                    // Cache locally.
+                    let _ = self.meta.put_manifest(&manifest);
+                    let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+
+                    if let Some(log_tree) = &self.log_tree {
+                        let _ = log_tree.store().put_manifest(&manifest);
                     }
-                    Some(_) => continue,
-                    None => return None,
-                }
-            }
-        })
-        .await;
 
-        if let Ok(Some(oid)) = wait_result {
-            if let Some(log_tree) = &self.log_tree {
-                if let Some(m) = log_tree.get_manifest(&oid)? {
-                    return Ok(Some(m));
+                    return Ok(Some(manifest));
                 }
-            }
-
-            if let Some(manifest) = self.meta.get_manifest(&oid)? {
-                return Ok(Some(manifest));
             }
         }
 

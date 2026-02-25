@@ -600,6 +600,48 @@ impl ShoalTransport {
         }
     }
 
+    /// Look up a manifest by bucket/key on a remote node.
+    ///
+    /// Opens a bidirectional stream: sends a `KeyLookupRequest`, receives a
+    /// `KeyLookupResponse`. Returns the postcard-serialized manifest bytes
+    /// if the remote node has the key, or `None` otherwise.
+    pub async fn lookup_key(
+        &self,
+        addr: EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::KeyLookupRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::KeyLookupResponse { manifest } => {
+                debug!(has_manifest = manifest.is_some(), "key lookup response");
+                Ok(manifest)
+            }
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
     /// Gracefully close the transport.
     pub async fn close(&self) {
         self.endpoint.close().await;
@@ -664,5 +706,14 @@ impl crate::Transport for ShoalTransport {
         access_key_ids: &[String],
     ) -> Result<Vec<(String, String)>, crate::NetError> {
         self.pull_api_keys(addr, access_key_ids).await
+    }
+
+    async fn lookup_key(
+        &self,
+        addr: EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, crate::NetError> {
+        self.lookup_key(addr, bucket, key).await
     }
 }

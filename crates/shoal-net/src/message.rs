@@ -141,4 +141,13 @@ pub enum ShoalMessage {
         /// Found keys: (access_key_id, secret_access_key).
         keys: Vec<(String, String)>,
     },
+
+    /// Look up an object by bucket/key (read-after-write consistency).
+    KeyLookupRequest { bucket: String, key: String },
+
+    /// Response to a [`ShoalMessage::KeyLookupRequest`].
+    KeyLookupResponse {
+        /// Postcard-serialized Manifest, if the key exists on this node.
+        manifest: Option<Vec<u8>>,
+    },
 }

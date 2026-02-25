@@ -138,6 +138,31 @@ impl Transport for MockTransport {
     ) -> Result<Vec<(String, String)>, NetError> {
         Ok(vec![])
     }
+
+    async fn lookup_key(
+        &self,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+
+        let Some(meta) = self.metas.get(&node_id) else {
+            return Ok(None);
+        };
+
+        let manifest = meta
+            .get_object_key(bucket, key)
+            .ok()
+            .flatten()
+            .and_then(|oid| meta.get_manifest(&oid).ok().flatten());
+
+        Ok(manifest.and_then(|m| postcard::to_allocvec(&m).ok()))
+    }
 }
 
 // =========================================================================

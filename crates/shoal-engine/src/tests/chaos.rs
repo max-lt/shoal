@@ -245,4 +245,14 @@ impl Transport for ChaosTransport {
         self.apply_chaos(&addr).await?;
         self.inner.pull_api_keys(addr, access_key_ids).await
     }
+
+    async fn lookup_key(
+        &self,
+        addr: iroh::EndpointAddr,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        self.apply_chaos(&addr).await?;
+        self.inner.lookup_key(addr, bucket, key).await
+    }
 }

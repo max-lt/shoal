@@ -285,6 +285,16 @@ impl Transport for QuinnTransport {
         // Not needed for these tests.
         Ok(vec![])
     }
+
+    async fn lookup_key(
+        &self,
+        _addr: iroh::EndpointAddr,
+        _bucket: &str,
+        _key: &str,
+    ) -> Result<Option<Vec<u8>>, NetError> {
+        // Not needed for these tests.
+        Ok(None)
+    }
 }
 
 // =========================================================================
