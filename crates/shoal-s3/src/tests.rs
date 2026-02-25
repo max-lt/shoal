@@ -4,10 +4,11 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use hmac::{Hmac, Mac};
 use http_body_util::BodyExt;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use shoal_cluster::ClusterState;
-use shoal_engine::ShoalNode;
 use shoal_meta::MetaStore;
 use shoal_store::MemoryStore;
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
@@ -15,7 +16,135 @@ use tower::ServiceExt;
 
 use crate::{S3Server, S3ServerConfig};
 
+type HmacSha256 = Hmac<Sha256>;
+
 const TEST_MAX_BYTES: u64 = 1_000_000_000;
+
+// -----------------------------------------------------------------------
+// SigV4 signing helper for tests
+// -----------------------------------------------------------------------
+
+/// Sign an HTTP request with AWS Signature V4.
+///
+/// Adds `host`, `x-amz-date`, `x-amz-content-sha256`, and `authorization`
+/// headers. Uses region `us-east-1` and service `s3`.
+fn sign_request(
+    mut req: Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> Request<Body> {
+    let timestamp = "20260225T120000Z";
+    let date = "20260225";
+    let region = "us-east-1";
+
+    // Add required SigV4 headers.
+    req.headers_mut()
+        .insert("host", "localhost".parse().unwrap());
+    req.headers_mut()
+        .insert("x-amz-date", timestamp.parse().unwrap());
+    req.headers_mut()
+        .insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+
+    // Collect signed headers (sorted).
+    let mut signed: Vec<String> = req
+        .headers()
+        .keys()
+        .map(|k| k.as_str().to_lowercase())
+        .collect();
+
+    signed.sort();
+    signed.dedup();
+
+    // Build canonical headers string.
+    let mut canonical_headers = String::new();
+
+    for name in &signed {
+        let value = req
+            .headers()
+            .get(name.as_str())
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .trim();
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(value);
+        canonical_headers.push('\n');
+    }
+
+    let signed_headers_str = signed.join(";");
+
+    // Build canonical query string (sorted by key).
+    let query = req.uri().query().unwrap_or("");
+    let canonical_query = {
+        if query.is_empty() {
+            String::new()
+        } else {
+            let mut pairs: Vec<(&str, &str)> = query
+                .split('&')
+                .filter(|s| !s.is_empty())
+                .map(|pair| {
+                    let mut split = pair.splitn(2, '=');
+                    let key = split.next().unwrap_or("");
+                    let val = split.next().unwrap_or("");
+                    (key, val)
+                })
+                .collect();
+
+            pairs.sort();
+            pairs
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        }
+    };
+
+    let path = req.uri().path();
+
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\nUNSIGNED-PAYLOAD",
+        req.method(),
+        path,
+        canonical_query,
+        canonical_headers,
+        signed_headers_str,
+    );
+
+    let scope = format!("{date}/{region}/s3/aws4_request");
+    let hashed_canonical = hex::encode(Sha256::digest(canonical_request.as_bytes()));
+    let string_to_sign = format!("AWS4-HMAC-SHA256\n{timestamp}\n{scope}\n{hashed_canonical}");
+
+    // Derive signing key.
+    let date_key = hmac_sha256(
+        format!("AWS4{secret_access_key}").as_bytes(),
+        date.as_bytes(),
+    );
+    let region_key = hmac_sha256(&date_key, region.as_bytes());
+    let service_key = hmac_sha256(&region_key, b"s3");
+    let signing_key = hmac_sha256(&service_key, b"aws4_request");
+
+    let signature = hex::encode(hmac_sha256(&signing_key, string_to_sign.as_bytes()));
+
+    let auth_value = format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={signed_headers_str}, Signature={signature}"
+    );
+
+    req.headers_mut()
+        .insert("authorization", auth_value.parse().unwrap());
+
+    req
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+// -----------------------------------------------------------------------
+// Test infrastructure
+// -----------------------------------------------------------------------
 
 /// Create a test S3 router (no API keys provisioned yet).
 async fn test_router() -> axum::Router {
@@ -61,9 +190,8 @@ struct ApiKeyResponse {
 
 /// Create a test router and provision one API key.
 ///
-/// Returns `(router, s3_bearer)` where `s3_bearer` is the value to pass as
-/// `Authorization: Bearer <value>` on S3 data-plane routes.
-async fn test_router_with_key() -> (axum::Router, String) {
+/// Returns `(router, access_key_id, secret_access_key)`.
+async fn test_router_with_key() -> (axum::Router, String, String) {
     let app = test_router().await;
 
     let response = app
@@ -82,10 +210,7 @@ async fn test_router_with_key() -> (axum::Router, String) {
     let body = body_string(response).await;
     let key: ApiKeyResponse = serde_json::from_str(&body).expect("valid JSON response");
 
-    (
-        app,
-        format!("{}:{}", key.access_key_id, key.secret_access_key),
-    )
+    (app, key.access_key_id, key.secret_access_key)
 }
 
 /// Read the full response body as bytes.
@@ -110,23 +235,22 @@ async fn body_string(response: axum::response::Response) -> String {
 
 #[tokio::test]
 async fn test_put_get_object() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
     let data = b"hello world, this is shoal!";
 
     // PUT object.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/hello.txt")
-                .header("content-type", "text/plain")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from(data.as_slice()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/hello.txt")
+            .header("content-type", "text/plain")
+            .body(Body::from(data.as_slice()))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let etag = response
@@ -140,17 +264,17 @@ async fn test_put_get_object() {
     assert!(etag.ends_with('"'));
 
     // GET object.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/hello.txt")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/hello.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -177,37 +301,36 @@ async fn test_put_get_object() {
 
 #[tokio::test]
 async fn test_head_object() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
     let data = vec![42u8; 3000];
 
     // PUT.
-    let _ = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/headtest")
-                .header("content-type", "application/octet-stream")
-                .header("x-amz-meta-custom", "value42")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from(data))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/headtest")
+            .header("content-type", "application/octet-stream")
+            .header("x-amz-meta-custom", "value42")
+            .body(Body::from(data))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
 
     // HEAD.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("HEAD")
-                .uri("/mybucket/headtest")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("HEAD")
+            .uri("/mybucket/headtest")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -250,37 +373,35 @@ async fn test_head_object() {
 
 #[tokio::test]
 async fn test_list_objects_with_prefix() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
     // PUT several objects.
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/c.txt"] {
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/mybucket/{key}"))
-                    .header("authorization", format!("Bearer {bearer}"))
-                    .body(Body::from("data"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let req = sign_request(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/mybucket/{key}"))
+                .body(Body::from("data"))
+                .unwrap(),
+            &key_id,
+            &secret,
+        );
+
+        let _ = app.clone().oneshot(req).await.unwrap();
     }
 
     // List with prefix=photos/.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket?list-type=2&prefix=photos/")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket?list-type=2&prefix=photos/")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -300,72 +421,70 @@ async fn test_list_objects_with_prefix() {
     assert!(!body.contains("docs/c.txt"));
 
     // List all (no prefix).
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket?list-type=2")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket?list-type=2")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     let body = body_string(response).await;
     assert!(body.contains("<KeyCount>3</KeyCount>"));
 }
 
 // -----------------------------------------------------------------------
-// DeleteObject then GetObject → 404
+// DeleteObject then GetObject -> 404
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_delete_then_get_404() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
     // PUT.
-    let _ = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/delme")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from("byebye"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/delme")
+            .body(Body::from("byebye"))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
 
     // DELETE.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/mybucket/delme")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("DELETE")
+            .uri("/mybucket/delme")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
-    // GET → 404.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/delme")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // GET -> 404.
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/delme")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_string(response).await;
@@ -378,25 +497,24 @@ async fn test_delete_then_get_404() {
 
 #[tokio::test]
 async fn test_multipart_upload_3_parts() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
     let part1: Vec<u8> = vec![0xAA; 1024];
     let part2: Vec<u8> = vec![0xBB; 1024];
     let part3: Vec<u8> = vec![0xCC; 512];
 
     // Initiate multipart upload.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/mybucket/multipart.bin?uploads")
-                .header("content-type", "application/octet-stream")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("POST")
+            .uri("/mybucket/multipart.bin?uploads")
+            .header("content-type", "application/octet-stream")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
@@ -413,20 +531,19 @@ async fn test_multipart_upload_3_parts() {
 
     // Upload 3 parts.
     for (num, data) in [(1u16, &part1), (2, &part2), (3, &part3)] {
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!(
-                        "/mybucket/multipart.bin?uploadId={upload_id}&partNumber={num}"
-                    ))
-                    .header("authorization", format!("Bearer {bearer}"))
-                    .body(Body::from(data.clone()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let req = sign_request(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/mybucket/multipart.bin?uploadId={upload_id}&partNumber={num}"
+                ))
+                .body(Body::from(data.clone()))
+                .unwrap(),
+            &key_id,
+            &secret,
+        );
+
+        let response = app.clone().oneshot(req).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get("etag").is_some());
@@ -440,35 +557,34 @@ async fn test_multipart_upload_3_parts() {
         <Part><PartNumber>3</PartNumber><ETag>\"c\"</ETag></Part>\
         </CompleteMultipartUpload>";
 
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/mybucket/multipart.bin?uploadId={upload_id}"))
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from(complete_body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("POST")
+            .uri(format!("/mybucket/multipart.bin?uploadId={upload_id}"))
+            .body(Body::from(complete_body))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
     assert!(body.contains("<ETag>"));
 
     // GET the completed object.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/multipart.bin")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/multipart.bin")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let got = body_bytes(response).await;
@@ -486,19 +602,19 @@ async fn test_multipart_upload_3_parts() {
 
 #[tokio::test]
 async fn test_create_bucket() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/newbucket")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/newbucket")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -560,7 +676,7 @@ async fn test_create_api_key_returns_valid_pair() {
 async fn test_admin_keys_endpoint_is_open() {
     let app = test_router().await;
 
-    // No auth header → still works (admin endpoints are open).
+    // No auth header -> still works (admin endpoints are open).
     let response = app
         .oneshot(
             Request::builder()
@@ -640,21 +756,19 @@ async fn test_delete_api_key_revokes_access() {
     assert_eq!(response.status(), StatusCode::CREATED);
     let body = body_string(response).await;
     let key: ApiKeyResponse = serde_json::from_str(&body).unwrap();
-    let s3_bearer = format!("{}:{}", key.access_key_id, key.secret_access_key);
 
     // Verify the key works for S3 operations.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/testobj")
-                .header("authorization", format!("Bearer {s3_bearer}"))
-                .body(Body::from("data"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/testobj")
+            .body(Body::from("data"))
+            .unwrap(),
+        &key.access_key_id,
+        &key.secret_access_key,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
 
@@ -674,18 +788,17 @@ async fn test_delete_api_key_revokes_access() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
     // Verify the key no longer works.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/testobj2")
-                .header("authorization", format!("Bearer {s3_bearer}"))
-                .body(Body::from("data"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/testobj2")
+            .body(Body::from("data"))
+            .unwrap(),
+        &key.access_key_id,
+        &key.secret_access_key,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
@@ -725,14 +838,14 @@ async fn test_delete_nonexistent_api_key_returns_400() {
 }
 
 // -----------------------------------------------------------------------
-// S3 auth: access key ID + secret access key
+// S3 auth: AWS Signature V4
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_s3_auth_required_no_header() {
-    let (app, _bearer) = test_router_with_key().await;
+    let (app, _key_id, _secret) = test_router_with_key().await;
 
-    // No auth header → 403.
+    // No auth header -> 403.
     let response = app
         .oneshot(
             Request::builder()
@@ -751,43 +864,40 @@ async fn test_s3_auth_required_no_header() {
 
 #[tokio::test]
 async fn test_s3_auth_wrong_key_rejected() {
-    let (app, _bearer) = test_router_with_key().await;
+    let (app, _key_id, _secret) = test_router_with_key().await;
 
-    // Wrong key pair → 403.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/key")
-                .header(
-                    "authorization",
-                    "Bearer SHOALXXXXXXXXXXXXXXX:wrongsecretwrongsecretwrongsecretwrong",
-                )
-                .body(Body::from("data"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // Wrong key pair -> 403.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/key")
+            .body(Body::from("data"))
+            .unwrap(),
+        "SHOALXXXXXXXXXXXXXXX",
+        "wrongsecretwrongsecretwrongsecretwrongsec",
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
-async fn test_s3_auth_correct_bearer_accepted() {
-    let (app, bearer) = test_router_with_key().await;
+async fn test_s3_auth_correct_sigv4_accepted() {
+    let (app, key_id, secret) = test_router_with_key().await;
 
-    // Correct bearer → 200.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/key")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from("data"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    // Correct SigV4 -> 200.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/key")
+            .body(Body::from("data"))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -812,24 +922,24 @@ async fn test_s3_without_key_always_rejected() {
 }
 
 // -----------------------------------------------------------------------
-// GET nonexistent → 404
+// GET nonexistent -> 404
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_get_nonexistent_returns_404() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/doesnotexist")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/doesnotexist")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_string(response).await;
@@ -842,19 +952,19 @@ async fn test_get_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_etag_is_blake3_hex() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/etagtest")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from("test data"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/etagtest")
+            .body(Body::from("test data"))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     let etag = response.headers().get("etag").unwrap().to_str().unwrap();
 
@@ -872,36 +982,35 @@ async fn test_etag_is_blake3_hex() {
 
 #[tokio::test]
 async fn test_user_metadata_passthrough() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
     // PUT with metadata.
-    let _ = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("PUT")
-                .uri("/mybucket/metadata-test")
-                .header("x-amz-meta-author", "alice")
-                .header("x-amz-meta-version", "2")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::from("content"))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/mybucket/metadata-test")
+            .header("x-amz-meta-author", "alice")
+            .header("x-amz-meta-version", "2")
+            .body(Body::from("content"))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
 
     // GET and verify metadata headers.
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/metadata-test")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/metadata-test")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -930,19 +1039,19 @@ async fn test_user_metadata_passthrough() {
 
 #[tokio::test]
 async fn test_error_response_is_xml() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
-    let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket/nonexistent")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket/nonexistent")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert_eq!(
@@ -984,42 +1093,40 @@ fn test_xml_escape() {
 /// `max-keys` entirely and always returns all matching objects.
 #[tokio::test]
 async fn test_bug3_list_objects_max_keys_ignored() {
-    let (app, bearer) = test_router_with_key().await;
+    let (app, key_id, secret) = test_router_with_key().await;
 
     // Write 5 objects with a shared prefix.
     for i in 0..5 {
-        let _ = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("PUT")
-                    .uri(format!("/mybucket/page/item-{i}"))
-                    .header("authorization", format!("Bearer {bearer}"))
-                    .body(Body::from(format!("value-{i}")))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        let req = sign_request(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/mybucket/page/item-{i}"))
+                .body(Body::from(format!("value-{i}")))
+                .unwrap(),
+            &key_id,
+            &secret,
+        );
+
+        let _ = app.clone().oneshot(req).await.unwrap();
     }
 
     // List with max-keys=2.
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/mybucket?list-type=2&prefix=page/&max-keys=2")
-                .header("authorization", format!("Bearer {bearer}"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/mybucket?list-type=2&prefix=page/&max-keys=2")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
 
-    // BUG 3: maxKeys is ignored — all 5 objects are returned instead of 2.
+    // BUG 3: maxKeys is ignored -- all 5 objects are returned instead of 2.
     // The XML response hardcodes <MaxKeys>1000</MaxKeys> and
     // <IsTruncated>false</IsTruncated> regardless of query params.
     assert!(

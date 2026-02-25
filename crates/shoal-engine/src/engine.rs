@@ -47,6 +47,12 @@ pub trait ShoalEngine: Send + Sync {
     /// List objects in a bucket with an optional prefix filter.
     async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError>;
 
+    /// Create an API key, persist it, and replicate via LogTree+gossip.
+    async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError>;
+
+    /// Delete an API key, persist the deletion, and replicate via LogTree+gossip.
+    async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError>;
+
     /// Return a reference to the metadata store.
     ///
     /// Protocol adapters use this for admin operations (API key management,

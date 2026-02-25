@@ -76,21 +76,14 @@ pub(crate) async fn create_api_key(
     let key_id = gen_access_key_id();
     let secret = gen_secret_access_key();
 
-    // Persist to MetaStore first — if this fails, don't add to the cache.
+    // Persist to MetaStore + replicate via LogTree+gossip.
     state
         .engine
-        .meta()
-        .put_api_key(&key_id, &secret)
-        .map_err(|e| S3Error::Internal {
-            message: format!("failed to persist api key: {e}"),
-        })?;
-
-    // Update the in-memory cache.
-    state
-        .api_keys
-        .write()
+        .create_api_key(&key_id, &secret)
         .await
-        .insert(key_id.clone(), secret.clone());
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to create api key: {e}"),
+        })?;
 
     info!(access_key_id = %key_id, "api_key_created");
 
@@ -121,12 +114,17 @@ pub(crate) struct ApiKeyInfo {
 pub(crate) async fn list_api_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApiKeyInfo>>, S3Error> {
-    let keys = state.api_keys.read().await;
-    let list: Vec<ApiKeyInfo> = keys
-        .keys()
-        .map(|id| ApiKeyInfo {
-            access_key_id: id.clone(),
-        })
+    let ids = state
+        .engine
+        .meta()
+        .list_api_key_ids()
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to list api keys: {e}"),
+        })?;
+
+    let list: Vec<ApiKeyInfo> = ids
+        .into_iter()
+        .map(|id| ApiKeyInfo { access_key_id: id })
         .collect();
 
     Ok(Json(list))
@@ -144,23 +142,27 @@ pub(crate) async fn delete_api_key(
     State(state): State<AppState>,
     Path(access_key_id): Path<String>,
 ) -> Result<axum::response::Response, S3Error> {
-    // Check the key exists in the cache.
-    let existed = {
-        let mut keys = state.api_keys.write().await;
-        keys.remove(&access_key_id).is_some()
-    };
+    // Check the key exists in MetaStore.
+    let exists = state
+        .engine
+        .meta()
+        .get_api_key(&access_key_id)
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to check api key: {e}"),
+        })?
+        .is_some();
 
-    if !existed {
+    if !exists {
         return Err(S3Error::InvalidRequest {
             message: format!("api key not found: {access_key_id}"),
         });
     }
 
-    // Remove from persistent store.
+    // Delete from MetaStore + replicate via LogTree+gossip.
     state
         .engine
-        .meta()
         .delete_api_key(&access_key_id)
+        .await
         .map_err(|e| S3Error::Internal {
             message: format!("failed to delete api key: {e}"),
         })?;

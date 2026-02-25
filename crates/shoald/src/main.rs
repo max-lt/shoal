@@ -702,6 +702,25 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                                     key: key.clone(),
                                                 });
                                             }
+                                            shoal_logtree::Action::CreateApiKey {
+                                                access_key_id,
+                                                secret_access_key,
+                                            } => {
+                                                if let Err(e) = meta_gossip
+                                                    .put_api_key(access_key_id, secret_access_key)
+                                                {
+                                                    warn!(%e, "failed to apply gossiped api key creation");
+                                                }
+                                            }
+                                            shoal_logtree::Action::DeleteApiKey {
+                                                access_key_id,
+                                            } => {
+                                                if let Err(e) =
+                                                    meta_gossip.delete_api_key(access_key_id)
+                                                {
+                                                    warn!(%e, "failed to apply gossiped api key deletion");
+                                                }
+                                            }
                                             _ => {} // Merge, Snapshot — no key-level event
                                         }
 

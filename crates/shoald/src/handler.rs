@@ -105,7 +105,7 @@ fn handle_provide_log_entries(
     entry_bytes_list: Vec<Vec<u8>>,
     manifest_pairs: Vec<(ObjectId, Vec<u8>)>,
     log_tree: Option<&Arc<LogTree>>,
-    meta: &MetaStore,
+    meta: &Arc<MetaStore>,
     pending_buf: &PendingBuffer,
     transport: Option<&Arc<dyn Transport>>,
     address_book: &Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
@@ -148,7 +148,23 @@ fn handle_provide_log_entries(
         }
 
         match log_tree.receive_entry(&entry, manifest) {
-            Ok(true) => applied += 1,
+            Ok(true) => {
+                // Apply API key actions to MetaStore.
+                match &entry.action {
+                    shoal_logtree::Action::CreateApiKey {
+                        access_key_id,
+                        secret_access_key,
+                    } => {
+                        let _ = meta.put_api_key(access_key_id, secret_access_key);
+                    }
+                    shoal_logtree::Action::DeleteApiKey { access_key_id } => {
+                        let _ = meta.delete_api_key(access_key_id);
+                    }
+                    _ => {}
+                }
+
+                applied += 1;
+            }
             Ok(false) => {} // already known
             Err(LogTreeError::MissingParents(parents)) => {
                 // Buffer for later.
@@ -180,6 +196,7 @@ fn handle_provide_log_entries(
     {
         let transport = transport.clone();
         let log_tree = log_tree.clone();
+        let meta = meta.clone();
         let pending_buf = pending_buf.clone();
         let address_book = address_book.clone();
 
@@ -220,6 +237,23 @@ fn handle_provide_log_entries(
                             }
                         }
                         let _ = log_tree.apply_sync_entries(&entries, &mans);
+
+                        // Apply API key actions from synced entries to MetaStore.
+                        for entry in &entries {
+                            match &entry.action {
+                                shoal_logtree::Action::CreateApiKey {
+                                    access_key_id,
+                                    secret_access_key,
+                                } => {
+                                    let _ = meta.put_api_key(access_key_id, secret_access_key);
+                                }
+                                shoal_logtree::Action::DeleteApiKey { access_key_id } => {
+                                    let _ = meta.delete_api_key(access_key_id);
+                                }
+                                _ => {}
+                            }
+                        }
+
                         pending::drain_pending(&log_tree, &pending_buf);
                     }
                     Err(e) => {

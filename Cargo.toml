@@ -95,6 +95,11 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # Constant-time comparison (auth)
 subtle = "2"
 
+# HMAC / SHA-256 (AWS Signature V4)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
 # System
 libc = "0.2"
 dirs = "6"

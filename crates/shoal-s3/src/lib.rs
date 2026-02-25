@@ -19,10 +19,12 @@
 //! ## Authentication
 //!
 //! - **Admin endpoints** (`/admin/keys`): open, no auth required.
-//! - **S3 data-plane**: all other endpoints require an API key created via
-//!   the admin endpoint. Supply `Authorization: Bearer <access_key_id>:<secret_access_key>`.
+//! - **S3 data-plane**: all other endpoints require AWS Signature V4
+//!   authentication using an API key created via the admin endpoint.
+//!   Standard S3 clients (AWS CLI, boto3, Bun S3Client) work out of the box.
 //!   If no API keys exist, all S3 requests are rejected (403).
 
+mod auth;
 mod error;
 mod handlers;
 mod xml;
@@ -39,7 +41,6 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{delete, post, put};
 use shoal_engine::ShoalEngine;
-use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -64,39 +65,25 @@ pub(crate) struct AppState {
     pub engine: Arc<dyn ShoalEngine>,
     /// In-flight multipart uploads.
     pub uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
-    /// Active API keys: `access_key_id` → `secret_access_key`.
-    pub api_keys: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// Authentication middleware for S3 data-plane routes.
 ///
-/// Every request must supply `Authorization: Bearer <access_key_id>:<secret_access_key>`
-/// matching an existing API key. Secret comparison is constant-time to prevent
-/// timing attacks (using the `subtle` crate, same approach as rustfs).
+/// Verifies AWS Signature V4 (`Authorization: AWS4-HMAC-SHA256 ...`) against
+/// the stored API keys. Constant-time signature comparison prevents timing
+/// attacks.
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
-    let keys = state.api_keys.read().await;
+    let keys = state.engine.meta().load_all_api_keys().unwrap_or_default();
 
-    let authenticated = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .and_then(|v| v.split_once(':'))
-        .is_some_and(|(key_id, secret)| {
-            keys.get(key_id)
-                .is_some_and(|stored| stored.as_bytes().ct_eq(secret.as_bytes()).into())
-        });
-
-    if !authenticated {
+    if let Err(_e) = auth::verify_sigv4(&request, &keys) {
         warn!("unauthorized S3 request");
         return Err(S3Error::AccessDenied);
     }
 
-    drop(keys);
     Ok(next.run(request).await)
 }
 
@@ -113,24 +100,11 @@ pub struct S3Server {
 
 impl S3Server {
     /// Create a new S3 server with the given configuration.
-    ///
-    /// On startup, loads any previously persisted API keys from MetaStore
-    /// into the in-memory auth cache.
     pub fn new(config: S3ServerConfig) -> Self {
-        // Load persisted API keys from MetaStore into the in-memory cache.
-        let persisted_keys = config.engine.meta().load_all_api_keys().unwrap_or_default();
-
-        let key_count = persisted_keys.len();
-
         let state = AppState {
             engine: config.engine,
             uploads: Arc::new(RwLock::new(HashMap::new())),
-            api_keys: Arc::new(RwLock::new(persisted_keys)),
         };
-
-        if key_count > 0 {
-            tracing::info!(key_count, "loaded persisted API keys from MetaStore");
-        }
 
         let router = Self::build_router(state);
         Self { router }

@@ -53,6 +53,13 @@ pub enum Action {
         /// blake3 hash of the serialized materialized state.
         state_hash: [u8; 32],
     },
+    /// Create an API key.
+    CreateApiKey {
+        access_key_id: String,
+        secret_access_key: String,
+    },
+    /// Delete an API key.
+    DeleteApiKey { access_key_id: String },
 }
 
 /// A versioned record for a specific `(bucket, key)` pair.

@@ -1138,6 +1138,24 @@ impl ShoalNode {
                                     applied,
                                     "applied log entries from peer"
                                 );
+
+                                // Apply API key actions from synced entries to MetaStore.
+                                for entry in &entries {
+                                    match &entry.action {
+                                        shoal_logtree::Action::CreateApiKey {
+                                            access_key_id,
+                                            secret_access_key,
+                                        } => {
+                                            let _ = self
+                                                .meta
+                                                .put_api_key(access_key_id, secret_access_key);
+                                        }
+                                        shoal_logtree::Action::DeleteApiKey { access_key_id } => {
+                                            let _ = self.meta.delete_api_key(access_key_id);
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                             total_applied += applied;
                         }
@@ -1406,6 +1424,60 @@ impl ShoalNode {
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // API key management
+    // ------------------------------------------------------------------
+
+    /// Create an API key, persist to MetaStore, and replicate via LogTree+gossip.
+    pub async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError> {
+        // 1. Persist to MetaStore.
+        self.meta.put_api_key(key_id, secret)?;
+
+        // 2. Append to LogTree + broadcast (if configured).
+        if let Some(log_tree) = &self.log_tree {
+            let entry = log_tree.append_create_api_key(key_id, secret)?;
+            let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry {
+                    entry_bytes,
+                    manifest_bytes: None,
+                };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast api key creation via gossip");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Delete an API key, persist to MetaStore, and replicate via LogTree+gossip.
+    pub async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError> {
+        // 1. Persist to MetaStore.
+        self.meta.delete_api_key(key_id)?;
+
+        // 2. Append to LogTree + broadcast (if configured).
+        if let Some(log_tree) = &self.log_tree {
+            let entry = log_tree.append_delete_api_key(key_id)?;
+            let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry {
+                    entry_bytes,
+                    manifest_bytes: None,
+                };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast api key deletion via gossip");
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ======================================================================
@@ -1442,6 +1514,14 @@ impl ShoalEngine for ShoalNode {
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
         ShoalNode::list_objects(self, bucket, prefix).await
+    }
+
+    async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError> {
+        ShoalNode::create_api_key(self, key_id, secret).await
+    }
+
+    async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError> {
+        ShoalNode::delete_api_key(self, key_id).await
     }
 
     fn meta(&self) -> &Arc<MetaStore> {

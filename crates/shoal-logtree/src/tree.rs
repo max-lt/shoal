@@ -62,6 +62,25 @@ impl LogTree {
         Ok(entry)
     }
 
+    /// Append a CreateApiKey action. Returns the new LogEntry.
+    pub fn append_create_api_key(&self, access_key_id: &str, secret: &str) -> Result<LogEntry> {
+        let action = Action::CreateApiKey {
+            access_key_id: access_key_id.to_string(),
+            secret_access_key: secret.to_string(),
+        };
+
+        self.append(action)
+    }
+
+    /// Append a DeleteApiKey action. Returns the new LogEntry.
+    pub fn append_delete_api_key(&self, access_key_id: &str) -> Result<LogEntry> {
+        let action = Action::DeleteApiKey {
+            access_key_id: access_key_id.to_string(),
+        };
+
+        self.append(action)
+    }
+
     /// Append a Delete action. Returns the new LogEntry.
     pub fn append_delete(&self, bucket: &str, key: &str) -> Result<LogEntry> {
         let action = Action::Delete {
@@ -641,8 +660,12 @@ impl LogTree {
                 };
                 self.insert_version(bucket, key, version)?;
             }
-            Action::Merge | Action::Snapshot { .. } => {
-                // No state change.
+            Action::Merge
+            | Action::Snapshot { .. }
+            | Action::CreateApiKey { .. }
+            | Action::DeleteApiKey { .. } => {
+                // No LogTree-internal state change. API key actions are
+                // applied to MetaStore externally by the engine / gossip receiver.
             }
         }
         Ok(())
