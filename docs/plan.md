@@ -2,35 +2,24 @@
 
 ## How to Use This Document
 
-This is the **complete architecture and implementation plan** for Shoal. Read the whole thing first to understand the vision, then implement **one milestone at a time**.
-
-When asked to work on a milestone:
-
-1. Read the milestone requirements carefully
-2. Implement all checkboxes
-3. Write all specified tests
-4. Run `cargo test` for the affected crates — everything must pass
-5. Run `cargo clippy -- -D warnings` — must be clean
-6. Run `cargo fmt`
-7. **STOP.** Do not proceed to the next milestone unless explicitly asked.
+This is the **architecture and implementation plan** for Shoal. All 16 milestones (0-15) are complete.
+For future work, follow the same workflow: implement, test, clippy, fmt, stop.
 
 ---
 
 ## What is Shoal?
 
-Shoal is a distributed, self-healing object storage engine written in **100% pure Rust**. Think of it as a lightweight, peer-to-peer alternative to S3-compatible storage that can run anywhere — from a Raspberry Pi with an SD card to a 128-core datacenter server with NVMe arrays.
+Shoal is a distributed, self-healing object storage engine written in **100% pure Rust**. A lightweight, peer-to-peer alternative to S3-compatible storage that runs anywhere — from a Raspberry Pi to a datacenter server.
 
-Nodes discover each other automatically, form a cluster, distribute data using erasure coding across available nodes, and self-repair when nodes join or leave. The system exposes an S3-compatible HTTP API on top.
-
-The name "Shoal" comes from a shoal of fish — lightweight individual units that move together, self-organize, and reform when members disappear.
+Nodes discover each other automatically, form a cluster, distribute data using erasure coding, and self-repair when nodes join or leave. S3-compatible HTTP API on top.
 
 ## Core Design Principles
 
-1. **Pure Rust** — Zero C/C++ bindings. Zero `cc` build scripts. Cross-compilation must be trivial.
-2. **Adaptive** — Same binary runs on a Raspberry Pi 4 and a datacenter monster. Config adapts to available resources.
-3. **Self-healing** — Nodes join and leave. The cluster detects failures, rebalances, and repairs automatically.
-4. **Content-addressed** — All data is identified by its BLAKE3 hash. Integrity is verifiable at every layer.
-5. **Deterministic placement** — Every node can independently compute where any shard belongs. No central coordinator.
+1. **Pure Rust** — Zero C/C++ bindings. Zero `cc` build scripts.
+2. **Adaptive** — Same binary on RPi and datacenter. Config adapts to resources.
+3. **Self-healing** — Cluster detects failures, rebalances, and repairs automatically.
+4. **Content-addressed** — All data identified by BLAKE3 hash. Integrity at every layer.
+5. **Deterministic placement** — Every node independently computes shard placement. No coordinator.
 
 ## Architecture Overview
 
@@ -64,53 +53,30 @@ The name "Shoal" comes from a shoal of fish — lightweight individual units tha
 
 All dependencies are pure Rust:
 
-| Layer            | Crate                  | Purpose                                                                           |
-| ---------------- | ---------------------- | --------------------------------------------------------------------------------- |
-| Hashing          | `blake3`               | Content addressing, integrity verification                                        |
-| Metadata         | `fjall` v3             | LSM-tree embedded KV store (manifests, shard map, membership state, repair queue) |
-| Erasure coding   | `reed-solomon-simd` v3 | Reed-Solomon with runtime SIMD detection (AVX2, SSSE3, Neon)                      |
-| Networking       | `iroh` 0.96            | QUIC connections, hole punching, relay fallback                                   |
-| Gossip/broadcast | `iroh-gossip` 0.96     | HyParView + PlumTree epidemic broadcast for cluster events                        |
-| Membership       | `foca`                 | SWIM protocol for failure detection (plugged into iroh transport)                 |
-| CDC              | `fastcdc` v3           | Content-defined chunking for inter-version deduplication                          |
-| Compression      | `zstd` 0.13            | Per-chunk zstd compression (level 3)                                              |
-| Signing          | `ed25519-dalek` v2     | Cryptographic signatures for LogTree entries                                      |
-| Serialization    | `postcard` + `serde`   | Compact binary serialization                                                      |
-| HTTP             | `axum` + `hyper`       | S3-compatible API                                                                 |
-| Async            | `tokio`                | Runtime                                                                           |
-| Observability    | `tracing` + `metrics`  | Logging and metrics                                                               |
-| Benchmarking     | `criterion` 0.5        | Performance benchmarks (CDC, erasure, full pipeline)                              |
+| Layer            | Crate                  | Purpose                                              |
+| ---------------- | ---------------------- | ---------------------------------------------------- |
+| Hashing          | `blake3`               | Content addressing, integrity verification           |
+| Metadata         | `fjall` v3             | LSM-tree embedded KV store                           |
+| Erasure coding   | `reed-solomon-simd` v3 | Reed-Solomon with runtime SIMD detection             |
+| Networking       | `iroh` 0.96            | QUIC connections, hole punching, relay fallback      |
+| Gossip/broadcast | `iroh-gossip` 0.96     | HyParView + PlumTree epidemic broadcast              |
+| Membership       | `foca`                 | SWIM protocol for failure detection                  |
+| CDC              | `fastcdc` v3           | Content-defined chunking for deduplication           |
+| Compression      | `zstd` 0.13            | Per-chunk zstd compression (level 3)                 |
+| Signing          | `ed25519-dalek` v2     | Cryptographic signatures for LogTree entries         |
+| Serialization    | `postcard` + `serde`   | Compact binary serialization                         |
+| HTTP             | `axum` + `hyper`       | S3-compatible API                                    |
+| Async            | `tokio`                | Runtime                                              |
+| Observability    | `tracing` + `metrics`  | Logging and metrics                                  |
+| Benchmarking     | `criterion` 0.5        | Performance benchmarks                               |
 
 ### Why these choices?
 
-- **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing when thousands of shard locations update. Keyspaces give clean separation. Fjall is a local cache/index, not the source of truth — everything is reconstructible from the cluster.
-- **foca over custom SWIM**: Production-grade SWIM+Inf.+Susp. implementation, `no_std` compatible, pluggable transport. We pipe foca messages over iroh connections.
-- **iroh-gossip over foca for broadcast**: foca handles membership/failure detection; iroh-gossip handles event dissemination (new shard available, repair needed, etc). Different tools for different jobs.
-- **Custom shard transfer over iroh-blobs**: We build a simple shard transfer protocol on iroh QUIC streams instead.
-- **Consistent hash ring is hand-written**: ~150 lines. No existing crate handles the ring diff computation (which shards must move when membership changes) that we need for rebalancing.
-
-## Monorepo Structure
-
-```
-shoal/
-├── Cargo.toml                        (workspace)
-├── crates/
-│   ├── shoal-types/                  Shared types, IDs, configs
-│   ├── shoal-store/                  Trait ShardStore + backends
-│   ├── shoal-cas/                    Content addressing, CDC chunking, manifests
-│   ├── shoal-meta/                   Metadata store (wraps Fjall)
-│   ├── shoal-erasure/                Reed-Solomon (wraps reed-solomon-simd)
-│   ├── shoal-placement/              Consistent hashing ring
-│   ├── shoal-cluster/                Membership (foca) + gossip (iroh-gossip)
-│   ├── shoal-repair/                 Auto-repair & rebalancing
-│   ├── shoal-net/                    Network protocol on iroh
-│   ├── shoal-engine/                 Node orchestrator
-│   ├── shoal-logtree/                DAG-based mutation tracking (ed25519 signed)
-│   ├── shoal-s3/                     S3 HTTP API
-│   └── shoald/                       Daemon binary (was shoal-cli)
-├── tests/
-│   └── integration/
-```
+- **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing. Fjall is a local cache/index, not source of truth.
+- **foca over custom SWIM**: Production-grade SWIM+Inf.+Susp., `no_std` compatible, pluggable transport over iroh.
+- **iroh-gossip over foca for broadcast**: foca = membership/failure detection; iroh-gossip = event dissemination.
+- **Custom shard transfer over iroh-blobs**: Simple protocol on iroh QUIC streams.
+- **Hand-written consistent hash ring**: ~150 lines. No crate handles ring diff computation for rebalancing.
 
 ## Key Data Types
 
@@ -123,25 +89,23 @@ pub struct NodeId([u8; 32]);       // derived from iroh endpoint key
 
 // === Core structures ===
 pub struct Manifest {
-    pub version: u8,            // format version (current: 1), prevents cross-version corruption
+    pub version: u8,
     pub object_id: ObjectId,
     pub total_size: u64,
     pub chunk_size: u32,
     pub chunks: Vec<ChunkMeta>,
     pub created_at: u64,
-    pub metadata: BTreeMap<String, String>,  // user metadata (content-type, etc)
+    pub metadata: BTreeMap<String, String>,
 }
 
 pub struct ChunkMeta {
     pub chunk_id: ChunkId,
     pub offset: u64,
-    pub raw_length: u32,            // uncompressed size
-    pub stored_length: u32,         // compressed size (== raw_length if uncompressed)
+    pub raw_length: u32,
+    pub stored_length: u32,
     pub compression: Compression,   // None | Zstd
     pub shards: Vec<ShardMeta>,
 }
-
-pub enum Compression { None, Zstd }
 
 pub struct ShardMeta {
     pub shard_id: ShardId,
@@ -149,33 +113,29 @@ pub struct ShardMeta {
     pub size: u32,
 }
 
-// === Cluster ===
 pub struct Member {
     pub node_id: NodeId,
-    pub addr: NodeAddr,       // iroh address
-    pub capacity: u64,        // available storage bytes
+    pub addr: NodeAddr,
+    pub capacity: u64,
     pub state: MemberState,   // Alive | Suspect | Dead
-    pub generation: u64,      // incremented on restart
+    pub generation: u64,
 }
 
-// === Adaptive config ===
 pub struct NodeConfig {
-    pub storage_backend: StorageBackend,   // Memory | File | Direct(io_uring)
-    pub chunk_size: u32,                    // 128KB (RPi) .. 256KB (default) .. 4MB (datacenter)
+    pub storage_backend: StorageBackend,   // Memory | File | Direct
+    pub chunk_size: u32,                    // 128KB..4MB
     pub erasure_k: u8,                      // data shards (2..16)
     pub erasure_m: u8,                      // parity shards (1..8)
-    pub repair_max_bandwidth: u64,          // bytes/sec for repair traffic
+    pub repair_max_bandwidth: u64,
     pub repair_concurrent_transfers: u16,   // 1 (RPi) .. 64 (datacenter)
     pub gossip_interval_ms: u32,
-    pub replication_boundary: ReplicationBoundary,
-    pub zone_write_ack: ZoneWriteAck,
     pub repair_circuit_breaker: RepairCircuitBreaker,
 }
 
 pub struct RepairCircuitBreaker {
-    pub max_down_fraction: f64,             // default 0.5 — suspend repair if ≥50% nodes down
-    pub queue_pressure_threshold: usize,    // default 10000 — throttle when queue exceeds this
-    pub rebalance_cooldown_secs: u64,       // default 60 — wait after node comes back
+    pub max_down_fraction: f64,             // default 0.5
+    pub queue_pressure_threshold: usize,    // default 10000
+    pub rebalance_cooldown_secs: u64,       // default 60
 }
 ```
 
@@ -183,617 +143,70 @@ pub struct RepairCircuitBreaker {
 
 ### Write Path
 
-1. Client sends PUT via S3 API
-2. Object data is split into variable-size chunks using **Content-Defined Chunking** (FastCDC v2020, min=16KB, avg=64KB, max=256KB). CDC boundaries are determined by content fingerprints, enabling inter-version deduplication: unchanged regions keep the same ChunkId.
-3. Each chunk is **compressed with zstd** (level 3). If compressed size >= raw size, the chunk is stored uncompressed (Compression::None).
-4. Each compressed chunk → Reed-Solomon encode → k data shards + m parity shards
-5. Each shard is BLAKE3-hashed to get its ShardId
-6. Distribute shards to ring owners via QUIC (with retry queue for failures)
-7. Build manifest (with raw_length, stored_length, compression per chunk) → persist in Fjall + broadcast via gossip/LogTree
-8. LogTree entry (signed with ed25519) records the mutation for DAG-based consistency
-9. ObjectId (blake3 of serialized manifest) stored in Fjall: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
-10. Every object, regardless of size, goes through this same pipeline — no inline shortcut
+1. Client PUT via S3 API
+2. CDC chunking (FastCDC v2020, min=16KB, avg=64KB, max=256KB)
+3. zstd compress each chunk (level 3). Skip if compressed >= raw size
+4. Reed-Solomon encode → k data + m parity shards
+5. BLAKE3 hash each shard → ShardId
+6. Distribute shards to ring owners via QUIC
+7. Build manifest → persist in Fjall + broadcast via gossip/LogTree
+8. LogTree entry (ed25519 signed) records mutation
+9. ObjectId = blake3(serialized manifest), stored in Fjall
+10. Every object goes through this same pipeline — no inline shortcut
 
 ### Read Path
 
-1. Client sends GET via S3 API
-2. Look up manifest in local Fjall (always available via gossip/LogTree)
-3. For each chunk: fetch shards from ring owners (local store first, remote via QUIC)
-4. EC decode → **decompress** (if compression == Zstd) → verify raw_length matches
-5. Concatenate reconstructed chunks → return to client
+1. Client GET via S3 API
+2. Look up manifest in Fjall
+3. For each chunk: fetch shards from ring owners (local first, remote via QUIC)
+4. EC decode → decompress → verify raw_length
+5. Concatenate → return to client
 
 ### Node Join
 
-1. New node starts, connects to seed node(s) via iroh
-2. foca SWIM protocol propagates membership change
+1. New node connects to seed nodes via iroh
+2. foca SWIM propagates membership change
 3. All nodes recompute placement ring
-4. Ring diff identifies shards that must move to the new node
-5. Rebalancing transfers shards gradually (throttled)
-6. As manifest shards arrive, node decodes them and populates its local Fjall index
-7. Node is fully operational once rebalancing completes
+4. Ring diff → rebalancing transfers shards gradually (throttled)
+5. Node fully operational once rebalancing completes
 
 ### Node Failure
 
-1. foca detects unresponsive node (ping → indirect ping → suspect → dead)
-2. Membership change propagated via gossip
-3. Ring recomputed, under-replicated shards identified
-4. Repair scheduler prioritizes: shards with fewest remaining copies first
-5. Repair executor fetches shards from surviving owners, reconstructs via RS decode if needed, writes to new owners
+1. foca detects (ping → indirect ping → suspect → dead)
+2. Membership change propagated via gossip, ring recomputed
+3. Repair scheduler prioritizes shards with fewest remaining copies
+4. Repair executor fetches/reconstructs shards, writes to new owners
 
 ### Anti-Entropy (Background)
 
-- Each node periodically verifies: "Do I hold all shards the ring assigns me?"
-- Each node periodically verifies shard integrity: re-hash and compare to ShardId
-- Corrupted or missing shards → added to repair queue
+- Periodic verification: do I hold all shards the ring assigns me?
+- Periodic integrity: re-hash and compare to ShardId
+- Corrupted/missing shards → repair queue
 
 ---
 
-# Implementation Plan
-
-Work through these milestones **in order**. After each milestone, **run all tests** and make sure everything passes before moving on. Commit after each milestone.
-
----
-
-## Milestone 0 — Workspace Setup ✅
-
-Set up the Rust workspace and all crate skeletons.
-
-- [x] Create `shoal/Cargo.toml` workspace with all member crates
-- [x] Create each crate directory with `Cargo.toml` and `src/lib.rs` (or `src/main.rs` for `shoal-cli`)
-- [x] Set up `[workspace.dependencies]` with all shared deps (blake3, fjall, reed-solomon-simd, iroh, iroh-gossip, foca, postcard, serde, axum, tokio, tracing, thiserror, anyhow, bytes)
-- [x] Verify the entire workspace compiles: `cargo build`
-- [x] Verify iroh 0.96 and iroh-gossip 0.96 version compatibility
-
-**Test**: `cargo build` succeeds with no errors.
-
----
-
-## Milestone 1 — `shoal-types` ✅
-
-All shared types and identifiers.
-
-- [x] Define `ShardId`, `ChunkId`, `ObjectId` as newtype wrappers around `[u8; 32]`
-- [x] Implement `Display` (hex), `Debug`, `From<[u8; 32]>`, `AsRef<[u8]>`, `Clone`, `Copy`, `PartialEq`, `Eq`, `Hash`, `Ord`, `PartialOrd` for all ID types
-- [x] Implement `Serialize` / `Deserialize` (via serde) for all ID types
-- [x] Define `NodeId` (also `[u8; 32]`, derived from iroh key)
-- [x] Define `Manifest`, `ChunkMeta`, `ShardMeta` structs with serde derives
-- [x] Define `Member` and `MemberState` enum (`Alive`, `Suspect`, `Dead`)
-- [x] Define `NodeConfig` with all adaptive fields and sensible defaults
-- [x] Define `StorageBackend` enum (`Memory`, `File`, `Direct`)
-- [x] Define `ErasureConfig` struct (`k`, `m`, `chunk_size`)
-- [x] Define `ClusterEvent` enum: `NodeJoined(Member)`, `NodeLeft(NodeId)`, `NodeDead(NodeId)`, `ShardStored(ShardId, NodeId)`, `RepairNeeded(ShardId)`
-- [x] Helper functions: `ShardId::from_data(data: &[u8]) -> ShardId` (blake3 hash), same for `ChunkId`, `ObjectId`
-- [x] ID types also implement `as_bytes() -> &[u8; 32]` accessor
-
-**Tests** (26 tests):
-
-- [x] Round-trip serialize/deserialize all types with postcard
-- [x] Verify ID generation: same data → same ID, different data → different ID
-- [x] Verify Display outputs hex correctly
-- [x] `cargo test -p shoal-types` passes
-
----
-
-## Milestone 2 — `shoal-store` ✅
-
-The shard storage trait and in-memory backend.
-
-- [x] Define the `ShardStore` trait using `Bytes` for zero-copy:
-
-  ```rust
-  #[async_trait]
-  pub trait ShardStore: Send + Sync {
-      async fn put(&self, id: ShardId, data: Bytes) -> Result<()>;
-      async fn get(&self, id: ShardId) -> Result<Option<Bytes>>;
-      async fn delete(&self, id: ShardId) -> Result<()>;
-      async fn contains(&self, id: ShardId) -> Result<bool>;
-      async fn list(&self) -> Result<Vec<ShardId>>;
-      async fn capacity(&self) -> Result<StorageCapacity>;
-      async fn verify(&self, id: ShardId) -> Result<bool>;
-  }
-  ```
-
-- [x] Implement `MemoryStore` using `RwLock<HashMap<ShardId, Bytes>>`
-- [x] `MemoryStore::capacity()` tracked via `AtomicU64` counter (O(1) per operation)
-- [x] `MemoryStore::verify()` re-hashes stored data and compares to ShardId
-- [x] Implement `FileStore` — one file per shard, 2-level fan-out directory layout
-  - Atomic writes: write to temp file, then rename (crash-safe)
-  - `contains()` uses async `tokio::fs::metadata` (not blocking `path.exists()`)
-  - `capacity()` uses `statvfs` via `spawn_blocking` (not blocking the async runtime)
-
-**Tests** (24 tests):
-
-- [x] `MemoryStore`: put/get round-trip, get nonexistent, delete, contains, list, verify, capacity, overwrite
-- [x] `FileStore`: same suite + fan-out structure verification + atomic write (no .tmp left)
-- [x] `cargo test -p shoal-store` passes
-
----
-
-## Milestone 3 — `shoal-cas` ✅
-
-Content addressing: chunking objects into chunks, building manifests.
-
-- [x] Implement fixed-size chunker with `Chunk.data: Bytes` (zero-copy through pipeline)
-- [x] Implement **Content-Defined Chunking** (CDC) using FastCDC v2020 algorithm
-  - Fixed parameters: min=16KB, avg=64KB, max=256KB (must never change for dedup consistency)
-  - `CdcChunker::new()` for standard params, `with_sizes()` for testing
-  - `chunk()` for sync, `chunk_stream()` for async readers
-- [x] `Chunk.id` = `blake3(chunk.data)`, last chunk may be smaller than min_size
-- [x] Implement streaming chunker (`chunk_stream` takes `impl AsyncRead + Unpin`)
-- [x] Implement `build_manifest` and `build_manifest_with_timestamp` (deterministic testing)
-  - `ObjectId` = blake3 of postcard-serialized content (without object_id field)
-- [x] Implement manifest serialization/deserialization with postcard
-
-**Tests**:
-
-- [x] Chunking: 0 bytes, exact size, size+1, 3.5x size (fixed-size chunker)
-- [x] CDC: empty data, small file single chunk, chunk sizes within bounds, deterministic
-- [x] CDC: dedup partial modification (>80% chunk reuse with 5% change), offsets contiguous
-- [x] CDC: stream matches sync chunker
-- [x] ChunkId deterministic, deduplication (identical chunks → same ID)
-- [x] Manifest round-trip, ObjectId deterministic, ObjectId changes with content
-- [x] `cargo test -p shoal-cas` passes
-
----
-
-## Milestone 4 — `shoal-erasure` ✅
-
-Erasure coding wrapper around reed-solomon-simd.
-
-- [x] Implement `ErasureEncoder::encode(chunk) -> (Vec<Shard>, original_size)`
-  - `Shard` has `id: ShardId`, `index: u8` (0..k for data, k..k+m for parity), `data: Bytes`
-  - Automatic padding: `ceil(len/k)` rounded up to even (reed-solomon-simd requirement)
-- [x] Implement `decode(k, m, shards, original_size) -> Vec<u8>`
-  - Fast-path: if all k data shards present, skip RS decode (just concatenate)
-  - Full RS decode when missing data shards
-- [x] Implement `suggest_config(node_count) -> (k, m)`:
-  - 1→(1,0), 2→(1,1), 3→(2,1), 4→(2,2), 5→(3,2), 6-11→(4,2), 12+→(8,4)
-  - Guarantee: k+m never exceeds node_count
-
-**Tests** (21 tests):
-
-- [x] Encode/decode: all shards, data-only, parity-only, mixed, all combinations for k=2/m=2
-- [x] Padding (non-divisible chunk), 1MB chunk, deterministic IDs
-- [x] Fewer than k shards → error, empty chunk → error
-- [x] Adaptive config: all node counts 0-50, never exceeds nodes
-- [x] `cargo test -p shoal-erasure` passes
-
----
-
-## Milestone 5 — `shoal-placement` ✅
-
-Consistent hashing ring for deterministic shard placement (~150 lines).
-
-- [x] `Ring` struct with `BTreeMap<u64, NodeId>` vnodes, `HashMap<NodeId, NodeInfo>` metadata
-- [x] vnode positions: `blake3(node_id ++ vnode_index)` truncated to u64
-- [x] `Ring::owners(&ShardId, replication_factor) -> Vec<NodeId>`: clockwise walk, distinct physical nodes
-- [x] `Ring::add_node`, `add_node_with_weight`, `remove_node`
-- [x] `Ring::diff(old, new, shard_ids, replication_factor) -> Vec<Migration>`
-- [x] Weighted nodes: `add_node_with_weight` for capacity-proportional vnode counts
-
-**Tests** (12 tests):
-
-- [x] Single node ownership, balanced 2-node distribution (~50/50)
-- [x] Consistent hashing: ~1/N moves on add, only removed node's shards redistribute
-- [x] Replication factor 3 → 3 distinct owners, replication > nodes → all nodes
-- [x] Weighted 2x → ~2x shards, diff identifies migrations to new node
-- [x] Deterministic placement, empty ring, re-add updates weight
-- [x] `cargo test -p shoal-placement` passes
-
----
-
-## Milestone 6 — `shoal-meta` ✅
-
-Metadata store wrapping Fjall for persistent state.
-
-**Important**: Fjall is a **local cache and index**, never the source of truth for user data.
-Everything in Fjall is reconstructible from the cluster. Manifests are themselves stored
-as regular erasure-coded objects in the cluster. If Fjall is lost, the node can reconstruct
-its index by scanning manifest shards from the cluster.
-
-- [x] Initialize Fjall `Database` with the following keyspaces:
-  - `objects` — user key (bucket/key string) → ObjectId — **CACHE**, reconstructible from manifests in the cluster
-  - `manifests` — ObjectId → serialized Manifest — **CACHE**, the manifest itself is stored as a regular erasure-coded object in the cluster
-  - `shardmap` — ShardId → serialized list of NodeIds (current owners) — **CACHE**, derived from placement ring computation
-  - `membership` — NodeId → serialized Member — **CACHE**, derived from foca/gossip
-  - `repair_queue` — ShardId → priority (u64, lower = more urgent) — **LOCAL**, transient, rebuilt on restart by anti-entropy scan
-- [x] Implement typed accessors for each keyspace:
-
-  ```rust
-  pub struct MetaStore { db: fjall::Database, /* keyspaces */ }
-  impl MetaStore {
-      // Manifests (local cache)
-      pub fn put_manifest(&self, manifest: &Manifest) -> Result<()>;
-      pub fn get_manifest(&self, id: &ObjectId) -> Result<Option<Manifest>>;
-
-      // Object key mapping (local cache)
-      pub fn put_object_key(&self, bucket: &str, key: &str, id: &ObjectId) -> Result<()>;
-      pub fn get_object_key(&self, bucket: &str, key: &str) -> Result<Option<ObjectId>>;
-      pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>>;
-      pub fn delete_object_key(&self, bucket: &str, key: &str) -> Result<()>;
-
-      // Shard map (local cache)
-      pub fn put_shard_owners(&self, id: &ShardId, owners: &[NodeId]) -> Result<()>;
-      pub fn get_shard_owners(&self, id: &ShardId) -> Result<Option<Vec<NodeId>>>;
-
-      // Membership (local cache)
-      pub fn put_member(&self, member: &Member) -> Result<()>;
-      pub fn get_member(&self, id: &NodeId) -> Result<Option<Member>>;
-      pub fn list_members(&self) -> Result<Vec<Member>>;
-      pub fn remove_member(&self, id: &NodeId) -> Result<()>;
-
-      // Repair queue (local, transient)
-      pub fn enqueue_repair(&self, id: &ShardId, priority: u64) -> Result<()>;
-      pub fn dequeue_repair(&self) -> Result<Option<ShardId>>;
-      pub fn repair_queue_len(&self) -> Result<usize>;
-  }
-  ```
-
-- [x] All serialization via postcard
-- [x] `MetaStore::open(path)` and `MetaStore::open_temporary()` (in-memory for tests)
-
-**Tests**:
-
-- [x] Manifest put/get round-trip
-- [x] Object key put/get/list/delete
-- [x] List objects with prefix filtering
-- [x] Shard owners put/get
-- [x] Member CRUD
-- [x] Repair queue: enqueue, dequeue in priority order, len
-- [x] Persistence: write, drop store, reopen, read back
-- [x] `cargo test -p shoal-meta` passes
-
----
-
-## Milestone 7 — Full Local Pipeline (Integration) ✅
-
-Connect store + cas + erasure + placement + meta into a working local write/read pipeline. No networking yet.
-
-- [x] Create an integration test in `tests/integration/local_pipeline.rs`:
-  1. Create a `NodeConfig` with chunk_size=1024, k=2, m=1
-  2. Create 3 `MemoryStore` instances (simulating 3 nodes)
-  3. Create a `Ring` with 3 nodes
-  4. Create a `MetaStore` (temporary)
-  5. **Write path**: take a test object (e.g., 5000 bytes of random data)
-     - Chunk it → 5 chunks (4 × 1024 + 1 × 904)
-     - Erasure encode each chunk → 3 shards per chunk (k=2, m=1)
-     - Use ring to determine owner for each shard
-     - Store each shard in the corresponding MemoryStore
-     - Build and persist Manifest in MetaStore
-  6. **Read path**: given the object key
-     - Look up Manifest
-     - For each chunk, fetch k shards from their stores
-     - Erasure decode
-     - Concatenate → verify equals original data
-  7. **Failure path**: delete 1 shard per chunk (simulating a node loss)
-     - Read should still succeed (k shards remain)
-  8. **Total failure**: delete 2 shards per chunk
-     - Read should fail gracefully (fewer than k shards)
-
-- [x] All assertions pass
-- [x] `cargo test --test local_pipeline` passes
-
----
-
-## Milestone 8 — `shoal-net` ✅
-
-Network protocol on top of iroh.
-
-- [x] Define protocol messages (postcard-serialized):
-
-  ```rust
-  pub enum ShoalMessage {
-      // Shard transfer
-      ShardPush { shard_id: ShardId, data: Vec<u8> },
-      ShardRequest { shard_id: ShardId },
-      ShardResponse { shard_id: ShardId, data: Option<Vec<u8>> },
-
-      // Cluster events (broadcast via gossip)
-      ClusterEvent(ClusterEvent),
-
-      // Membership (piggybacked on foca)
-      MembershipUpdate(Vec<Member>),
-
-      // Health
-      Ping { timestamp: u64 },
-      Pong { timestamp: u64 },
-  }
-  ```
-
-- [x] Implement `ShoalTransport`:
-  - Wraps an `iroh::Endpoint`
-  - `send_message(node_id, message)` — opens a QUIC stream, sends postcard-encoded message
-  - `recv_message(stream)` — reads and decodes
-  - Handles connection pooling (reuse connections to same node)
-- [x] Implement shard transfer:
-  - `push_shard(node_id, shard_id, data)` — sends shard to a node
-  - `pull_shard(node_id, shard_id)` — requests a shard from a node
-  - **End-to-end integrity** (see Production Hardening): Receiver verifies blake3 hash matches shard_id before accepting. Requester verifies pull responses. Manifest gossip verifies ObjectId = blake3(serialized manifest). Reject on mismatch, try another node.
-- [x] Define ALPN protocol identifier: `b"shoal/0"`
-- [x] Implement request handler that dispatches incoming messages
-
-**Tests**:
-
-- [x] Spin up 2 iroh endpoints in-process
-- [x] Send a shard from node A to node B, verify it arrives intact
-- [x] Pull a shard from node B, verify it matches
-- [x] Send corrupted shard (wrong data for the shard_id) → receiver rejects
-- [x] `cargo test -p shoal-net` passes
-
----
-
-## Milestone 9 — `shoal-cluster` ✅
-
-Membership management combining foca (SWIM) and iroh-gossip.
-
-- [x] Implement foca integration:
-  - Implement foca's `Identity` trait for `Member`
-  - Implement foca's `Runtime` trait using tokio timers + iroh transport
-  - Wrap foca in a `MembershipService` that:
-    - Runs the SWIM protocol loop
-    - Emits `ClusterEvent::NodeJoined`, `NodeLeft`, `NodeDead` when membership changes
-    - Persists membership state to MetaStore
-- [x] Implement gossip integration:
-  - Create a gossip topic for the cluster (derived from a shared cluster secret/key)
-  - Broadcast `ClusterEvent`s via iroh-gossip
-  - Receive and process events from other nodes
-- [x] Implement `ClusterState`:
-
-  ```rust
-  pub struct ClusterState {
-      members: RwLock<HashMap<NodeId, Member>>,
-      ring: RwLock<Ring>,
-      local_node_id: NodeId,
-      event_tx: broadcast::Sender<ClusterEvent>,
-  }
-  ```
-
-  - When membership changes → recompute ring
-  - Expose `subscribe()` for other components to react to cluster events
-
-**Tests**:
-
-- [x] Spin up 3 nodes in-process, verify they discover each other via foca
-- [x] All 3 nodes have consistent membership view within 5 seconds
-- [x] Kill one node → other 2 detect it as Dead within configurable timeout
-- [x] New node joins → all existing nodes learn about it
-- [x] ClusterState ring is recomputed on membership change
-- [x] Events are received by subscribers
-- [x] `cargo test -p shoal-cluster` passes
-
----
-
-## Milestone 10 — `shoal-repair` ✅
-
-Auto-repair and rebalancing.
-
-- [x] Implement `RepairDetector`:
-  - Subscribes to `ClusterEvent`s
-  - On `NodeDead`: compute which shards were owned by dead node → enqueue in repair queue
-  - Periodically: scan local shards, verify they match ring placement, report anomalies
-- [x] Implement `RepairScheduler`:
-  - Reads from repair queue (MetaStore)
-  - Prioritizes: shards with fewer surviving copies get higher priority
-  - Respects rate limits: `repair_max_bandwidth`, `repair_concurrent_transfers`
-  - On RPi: 1 concurrent transfer, 1MB/s max
-  - On datacenter: 64 concurrent transfers, 1GB/s max
-- [x] Implement `RepairExecutor`:
-  - For each shard to repair:
-    1. Find nodes that still have copies (from shard map)
-    2. Fetch the shard (or reconstruct via erasure decoding from sibling shards of the same chunk)
-    3. Push to new owner (determined by current ring)
-    4. Update shard map in MetaStore
-- [x] Implement `Throttle`:
-  - Token bucket rate limiter for repair bandwidth
-  - Adaptive: reduce repair rate when node is under read/write load
-- [x] Implement `RepairCircuitBreaker` logic (see `NodeConfig.repair_circuit_breaker`):
-  - If ≥`max_down_fraction` of nodes are down → STOP all repair, log CRITICAL
-  - If a node was down < `rebalance_cooldown_secs` → don't rebalance its shards
-  - Exponential backoff on repair rate when multiple nodes are flapping
-  - Queue pressure: throttle aggressively when queue exceeds `queue_pressure_threshold`
-- [x] Implement majority-vote deep scrub:
-  - For each local shard, compute blake3 hash
-  - Ask N peers who also hold this shard for their hash (lightweight RPC, 32 bytes)
-  - If local hash matches majority → shard is good
-  - If local hash differs from majority → local shard is corrupt, fetch correct version
-  - If no majority agrees → flag for manual inspection, do NOT auto-repair
-
-**Tests**:
-
-- [x] 3 nodes, store an object, kill 1 node → repair detector enqueues shards
-- [x] Scheduler dequeues in priority order
-- [x] Executor successfully repairs a shard by fetching from surviving node
-- [x] Executor successfully repairs a shard by RS reconstruction when direct copy unavailable
-- [x] Rate limiting: repair doesn't exceed configured bandwidth
-- [x] Circuit breaker: repair stops when ≥50% of nodes are down
-- [x] Circuit breaker: no rebalance during cooldown period after node restart
-- [x] After repair: object is fully readable again
-- [x] `cargo test -p shoal-repair` passes
-
----
-
-## Milestone 11 — `shoal-engine` ✅
-
-The node orchestrator that ties everything together.
-
-- [x] Implement `ShoalNode`:
-  ```rust
-  pub struct ShoalNode {
-      config: NodeConfig,
-      node_id: NodeId,
-      store: Arc<dyn ShardStore>,
-      meta: Arc<MetaStore>,
-      cluster: Arc<ClusterState>,
-      transport: Arc<ShoalTransport>,
-      // background task handles
-  }
-  ```
-- [x] `ShoalNode::start(config)`:
-  1. Initialize iroh endpoint
-  2. Open MetaStore
-  3. Initialize ShardStore (Memory or File based on config)
-  4. Start foca membership service
-  5. Start gossip
-  6. Start repair detector + scheduler + executor as background tasks
-  7. Start incoming message handler
-- [x] `ShoalNode::put_object(bucket, key, data, metadata)`:
-  - Full write path: CDC chunk → zstd compress → erasure encode → distribute shards → build manifest → persist in Fjall + broadcast via gossip/LogTree
-- [x] `ShoalNode::get_object(bucket, key)`:
-  - Full read path: lookup ObjectId in Fjall → fetch shards per chunk → erasure decode → decompress → verify raw_length → concatenate → return
-- [x] `ShoalNode::delete_object(bucket, key)`:
-  - Remove manifest and key mapping
-  - Enqueue shard cleanup (background)
-- [x] Graceful shutdown: persist state, notify cluster of departure
-
-**Tests**:
-
-- [x] Start a single node, put object, get object → matches
-- [x] Start 3 nodes, put object, get from any node → matches
-- [x] Start 3 nodes, put object, stop 1 node, get from surviving node → works (after repair)
-- [x] Small objects: put/get a tiny object (e.g. 10 bytes) → same pipeline, still works
-- [x] Delete object: key no longer resolves
-- [x] Graceful shutdown and restart: data persists
-- [x] `cargo test -p shoal-engine` passes
-
----
-
-## Milestone 12 — `shoal-s3` ✅
-
-S3-compatible HTTP API.
-
-- [x] Implement axum router with S3 endpoints:
-  - `PUT /{bucket}/{key}` → PutObject
-  - `GET /{bucket}/{key}` → GetObject
-  - `DELETE /{bucket}/{key}` → DeleteObject
-  - `HEAD /{bucket}/{key}` → HeadObject (metadata only)
-  - `GET /{bucket}?list-type=2&prefix=...` → ListObjectsV2
-  - `PUT /{bucket}` → CreateBucket (just a namespace in the key mapping)
-- [x] Implement AWS SigV4 authentication (or start with a simple shared-secret auth)
-- [x] Proper S3 XML responses (ListObjectsV2 result, error responses)
-- [x] Multipart upload support:
-  - `POST /{bucket}/{key}?uploads` → InitiateMultipartUpload
-  - `PUT /{bucket}/{key}?partNumber=N&uploadId=X` → UploadPart
-  - `POST /{bucket}/{key}?uploadId=X` → CompleteMultipartUpload
-- [x] Content-Type and user metadata pass-through
-- [x] ETags (blake3 hex of object)
-
-**Tests**:
-
-- [x] PutObject + GetObject via HTTP client (reqwest)
-- [x] HeadObject returns correct content-length and metadata
-- [x] ListObjectsV2 with prefix filtering
-- [x] DeleteObject then GetObject → 404
-- [x] Multipart upload: 3-part upload → complete → get → matches
-- [ ] Test with `aws-cli` or `s3cmd` against the running server
-- [x] `cargo test -p shoal-s3` passes
-
----
-
-## Milestone 13 — `shoald` (daemon binary) ✅
-
-The daemon binary that brings it all together. Renamed from `shoal-cli` to `shoald`.
-
-- [x] TOML config file:
-
-  ```toml
-  [node]
-  data_dir = "/var/lib/shoal"
-  s3_listen_addr = "0.0.0.0:4821"
-
-  [cluster]
-  secret = "my-cluster-secret"
-  peers = ["endpoint-id@192.168.1.10:4820"]
-
-  [storage]
-  backend = "file"  # or "memory"
-
-  [erasure]
-  k = 4
-  m = 2
-
-  [repair]
-  max_bandwidth = "100MB/s"
-  concurrent_transfers = 8
-
-  [s3]
-  auth_secret = "shoalsecret"
-  ```
-
-- [x] CLI commands:
-  - `shoald start` — start the node (with `--peer`, `--secret`, `--memory`, `-d`, `-l` flags)
-  - `shoald status` — show cluster status (members, shard distribution)
-  - `shoald repair status` — show repair queue
-  - `shoald benchmark` — run a quick read/write benchmark
-- [x] Auto-detection: if no config specified, detect available RAM and disk, set sensible defaults
-- [x] Tracing subscriber setup with configurable log level
-- [x] SIGTERM/SIGINT graceful shutdown handler (drains in-flight requests, shuts down router)
-- [x] LogTree integration (DAG-based mutation tracking with ed25519 signatures)
-- [x] Persistent node identity (iroh SecretKey stored in `data_dir/node.key`)
-- [x] Cluster-specific ALPN derived from shared secret for connection isolation
-
-**Tests**:
-
-- [x] Config parsing from TOML
-- [x] Start node, verify it binds to ports
-- [x] `cargo test -p shoald` passes
-
----
-
-## Milestone 14 — End-to-End Integration Tests ✅
-
-Full cluster tests with real networking.
-
-- [x] `tests/integration/cluster_formation.rs`:
-  - Start 5 nodes in-process with different ports
-  - Verify all 5 discover each other within 10 seconds
-  - Verify consistent ring across all nodes
-
-- [x] `tests/integration/write_read.rs`:
-  - 5-node cluster
-  - Write 100 objects of varying sizes (1KB to 10MB)
-  - Read each object from a random node → verify matches
-  - Write and immediately read → consistency check
-
-- [x] `tests/integration/node_failure.rs`:
-  - 5-node cluster, write 50 objects
-  - Kill 1 node
-  - Wait for repair to complete
-  - Read all 50 objects → all succeed
-  - Kill another node
-  - Read all 50 objects → all still succeed (k=4, m=2 tolerates 2 failures)
-
-- [x] `tests/integration/rebalancing.rs`:
-  - 3-node cluster, write 50 objects
-  - Add 2 more nodes
-  - Wait for rebalancing
-  - Verify shard distribution is roughly even across 5 nodes
-  - Read all objects → succeed
-
-- [x] `tests/integration/stress.rs`:
-  - 5-node cluster
-  - Concurrent writers (10 threads) writing 1000 objects total
-  - Concurrent readers (10 threads) reading random objects
-  - Verify no data corruption
-
-- [x] All integration tests pass: `cargo test --test '*'`
-
----
-
-## Milestone 15 — Chaos Tests ✅
-
-- [x] `tests/chaos/random_kill.rs`:
-  - 7-node cluster
-  - Background: continuously write and read objects
-  - Every 5 seconds: kill a random node, wait 2 seconds, restart it
-  - After 60 seconds: verify all objects are readable
-  - No data loss allowed
-
-- [x] `tests/chaos/network_partition.rs`:
-  - 6-node cluster
-  - Simulate network partition (3 vs 3)
-  - Both sides should remain operational for reads of local data
-  - Heal partition
-  - Verify cluster reconverges and all data is consistent
+# Completed Milestones
+
+All milestones are complete. Summary for reference:
+
+| #  | Milestone                    | Crate(s)                     | Status |
+| -- | ---------------------------- | ---------------------------- | ------ |
+| 0  | Workspace Setup              | (all)                        | ✅      |
+| 1  | Shared Types                 | shoal-types                  | ✅      |
+| 2  | Shard Store                  | shoal-store                  | ✅      |
+| 3  | Content Addressing           | shoal-cas                    | ✅      |
+| 4  | Erasure Coding               | shoal-erasure                | ✅      |
+| 5  | Placement Ring               | shoal-placement              | ✅      |
+| 6  | Metadata Store               | shoal-meta                   | ✅      |
+| 7  | Local Pipeline Integration   | tests/integration            | ✅      |
+| 8  | Network Protocol             | shoal-net                    | ✅      |
+| 9  | Cluster Membership           | shoal-cluster                | ✅      |
+| 10 | Auto-Repair                  | shoal-repair                 | ✅      |
+| 11 | Engine Orchestrator          | shoal-engine                 | ✅      |
+| 12 | S3 HTTP API                  | shoal-s3                     | ✅      |
+| 13 | Daemon Binary                | shoald                       | ✅      |
+| 14 | End-to-End Integration Tests | tests/integration            | ✅      |
+| 15 | Chaos Tests                  | tests/chaos                  | ✅      |
 
 ---
 
@@ -801,62 +214,40 @@ Full cluster tests with real networking.
 
 ### Error Handling
 
-- Use `thiserror` for library error types in each crate
-- Use `anyhow` only in `shoal-cli` (the binary)
-- Every error type should be descriptive and include context
+- `thiserror` for library error types, `anyhow` only in `shoald`
+- Every error type should be descriptive with context
 
 ### Logging
 
-- Use `tracing` throughout, with structured fields
-- Important events: shard stored, shard transferred, node joined, node died, repair started, repair completed
-- Debug level: individual message sends/receives
-- Trace level: ring computation details
+- `tracing` throughout with structured fields
+- Important: shard stored/transferred, node joined/died, repair started/completed
+- Debug: individual message sends/receives
+- Trace: ring computation details
 
 ### Performance Considerations
 
-- On writes: pipeline the erasure encoding — start encoding chunk N+1 while chunk N's shards are being distributed
-- On reads: fetch shards in parallel across nodes
-- Repair: always respect the rate limiter, never starve client traffic
-- All objects, regardless of size, go through the same pipeline (no inline shortcut)
+- Writes: pipeline erasure encoding (encode chunk N+1 while distributing chunk N)
+- Reads: fetch shards in parallel across nodes
+- Repair: always respect rate limiter, never starve client traffic
+- All objects same pipeline (no inline shortcut)
 
-### Small Object Packing
+### Production Hardening
 
-Small objects (smaller than `chunk_size`) are packed together into shared chunks to avoid wasting space and erasure coding overhead on tiny payloads.
-
-**Design**: `ChunkMeta` already carries `offset` and `size` fields. For large objects, each chunk maps 1:1 to a data range. For small objects, multiple objects can share the same underlying chunk — each object's `ChunkMeta` references a `(chunk_id, offset, size)` slice within the shared chunk.
-
-**Write path** (implemented in `shoal-engine`, Milestone 11):
-- The engine maintains an `OpenChunk` buffer per node (or per bucket) that accumulates small objects.
-- When an object arrives that is smaller than `chunk_size`, it is appended to the current `OpenChunk` buffer at the next available offset.
-- When the buffer is full (or a flush interval elapses), the entire chunk is erasure-coded and distributed like any regular chunk.
-- Each small object gets its own `Manifest` whose single `ChunkMeta` points to the shared chunk at its `(offset, size)`.
-
-**Read path**: Fetch the shared chunk (or reconstruct it from shards), then extract the byte range `[offset..offset+size]`.
-
-**Deletion and compaction**: Deleting a small object only removes its manifest and key mapping. The underlying shared chunk remains until a background compaction pass detects that all (or most) objects referencing it are deleted, at which point the chunk can be garbage-collected. This is a late-stage optimization (post-Milestone 11).
-
-**No code changes needed now** — the existing `ChunkMeta` struct already supports this via its `offset` and `size` fields. The packing logic will be implemented in `shoal-engine` (Milestone 11).
-
-### Production Hardening (Lessons from Ceph, MinIO, Meta)
-
-These protections are built into Shoal's design from day one, informed by
-real-world incidents at Ceph, MinIO, Meta/Facebook, CERN, and others:
-
-* **Content-addressing everywhere**: Every shard, chunk, and manifest is identified by its BLAKE3 hash. Corruption is detectable at every layer.
-* **Verify-on-read**: `FileStore` re-hashes every shard on read. Corrupt data is treated as missing (returns `CorruptShard` error), not returned to the client. The read path will fetch from another node and RS-decode instead. Cost: ~60µs for a 64KB shard (blake3 hashes at 1GB/s+).
-* **End-to-end integrity**: Network transfers (Milestone 8) verify blake3 hashes at the receiver on every hop. Push path: receiver hashes data, compares to ShardId. Pull path: requester hashes response. Manifest gossip: verify ObjectId = blake3(serialized manifest). No trust boundaries.
-* **Manifest versioning**: `version: u8` field enables safe format evolution. `deserialize_manifest` rejects unknown versions with a clear error. Prevents Ceph-style cross-version corruption (January 2026 "fast EC" incident: format change without versioning caused 340K scrub errors).
-* **Rebalancing circuit breaker** (Milestone 10): `RepairCircuitBreaker` in `NodeConfig` prevents cascade meltdowns. If ≥50% of nodes are down → suspend all repair. If a node was down < cooldown period → don't rebalance its shards (probably rebooting). Queue pressure threshold throttles aggressively. Inspired by Ceph's 2018 rebalancing storm where one OSD restart cascaded into total unavailability.
-* **Majority-vote scrub** (Milestone 10): Background anti-entropy uses peer consensus, not primary-wins, to identify corrupt shards. Compute local hash, ask N peers for theirs, majority wins. If no majority → flag for manual inspection. Prevents Ceph's scrub-propagates-corruption bug where the primary held the corrupt copy.
-* **m=1 warnings**: `suggest_config` returns `ErasureSuggestion` with a warning when m≤1. Warns that during repair of a failed shard, a second failure will cause data loss.
-* **Inode monitoring**: `FileStore::capacity()` reports inode usage via statvfs and warns at >80% usage. Recommendation: use XFS over ext4 for production (XFS dynamically allocates inodes; ext4 requires `mkfs.ext4 -N <count>`).
+- **Content-addressing everywhere**: BLAKE3 hash at every layer
+- **Verify-on-read**: FileStore re-hashes every shard, corruption treated as missing
+- **End-to-end integrity**: Network transfers verify blake3 at receiver on every hop
+- **Manifest versioning**: `version: u8` field, reject unknown versions
+- **Rebalancing circuit breaker**: Stop repair if >=50% nodes down, cooldown after restart, queue pressure throttling
+- **Majority-vote scrub**: Peer consensus for corruption detection, not primary-wins
+- **m=1 warnings**: `suggest_config` warns when parity is insufficient
+- **Inode monitoring**: `FileStore::capacity()` warns at >80% inode usage
 
 ### Things NOT to do yet
 
-- No encryption at rest (later)
-- No bucket-level ACLs (later)
-- No object versioning (later — LogTree provides mutation history but not S3-style versioning)
-- No lifecycle policies (later)
-- No `io_uring` / `O_DIRECT` backend (later, behind feature flag)
-- No `ZoneReplicator` — cross-zone replication is designed but not yet coded
-- No small object packing — CDC handles most efficiency concerns; packing is a future optimization
+- No encryption at rest
+- No bucket-level ACLs
+- No object versioning (LogTree provides mutation history but not S3-style versioning)
+- No lifecycle policies
+- No `io_uring` / `O_DIRECT` backend
+- No `ZoneReplicator` (cross-zone replication)
+- No small object packing (future optimization)
