@@ -87,6 +87,7 @@ pub(crate) async fn list_objects(
 
 /// Handle PUT for objects — dispatches between PutObject and UploadPart
 /// based on query parameters.
+#[tracing::instrument(skip(state, params, headers, body), fields(response_status = tracing::field::Empty, etag = tracing::field::Empty))]
 pub(crate) async fn put_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -125,6 +126,10 @@ pub(crate) async fn put_object_handler(
         .put_object(&bucket, &key, &body, metadata)
         .await?;
     let etag = format!("\"{object_id}\"");
+
+    let span = tracing::Span::current();
+    span.record("response_status", 200u16);
+    span.record("etag", tracing::field::display(&etag));
 
     info!(bucket = %bucket, key = %key, %object_id, "put_object");
 
@@ -183,6 +188,7 @@ async fn upload_part(
 // -----------------------------------------------------------------------
 
 /// Retrieve an object and return it in the response body.
+#[tracing::instrument(skip(state), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
 pub(crate) async fn get_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -194,6 +200,10 @@ pub(crate) async fn get_object_handler(
         .map_err(|e| engine_to_s3(e, &bucket, &key))?;
 
     let etag = format!("\"{0}\"", manifest.object_id);
+
+    let span = tracing::Span::current();
+    span.record("response_status", 200u16);
+    span.record("content_length", data.len() as u64);
 
     let mut builder = Response::builder()
         .status(StatusCode::OK)
@@ -220,6 +230,7 @@ pub(crate) async fn get_object_handler(
 /// Delete an object.
 ///
 /// S3 spec: DELETE is idempotent — deleting a non-existent key returns 204.
+#[tracing::instrument(skip(state))]
 pub(crate) async fn delete_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -246,6 +257,7 @@ pub(crate) async fn delete_object_handler(
 // -----------------------------------------------------------------------
 
 /// Return object metadata without fetching the body.
+#[tracing::instrument(skip(state))]
 pub(crate) async fn head_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,

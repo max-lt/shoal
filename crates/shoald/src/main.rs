@@ -17,6 +17,7 @@
 
 mod config;
 mod handler;
+mod telemetry;
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -186,7 +187,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let mut config = CliConfig::load(cli.config.as_deref()).context("failed to load config")?;
 
-    setup_tracing(&config.log.level);
+    // Initialize telemetry (tracing subscriber + optional OTel export).
+    // Env vars override TOML values for OTel configuration.
+    telemetry::init(&telemetry::TelemetryConfig {
+        level: config.log.level.clone(),
+        otlp_endpoint: std::env::var("OTLP_ENDPOINT")
+            .ok()
+            .or_else(|| config.telemetry.otlp_endpoint.clone())
+            .unwrap_or_default(),
+        otlp_headers: std::env::var("OTLP_HEADERS")
+            .ok()
+            .or_else(|| config.telemetry.otlp_headers.clone())
+            .unwrap_or_default(),
+        service_name: std::env::var("OTLP_SERVICE_NAME")
+            .ok()
+            .or_else(|| config.telemetry.service_name.clone())
+            .unwrap_or_default(),
+        instance_id: String::new(), // filled later with actual node_id
+    });
 
     match cli.command {
         Commands::Start {
@@ -221,16 +239,6 @@ async fn main() -> Result<()> {
         },
         Commands::Benchmark { count, size } => cmd_benchmark(&config, count, size).await,
     }
-}
-
-/// Initialize the `tracing` subscriber with the given level filter.
-///
-/// Respects `RUST_LOG` env var if set, otherwise uses the config value.
-fn setup_tracing(level: &str) {
-    use tracing_subscriber::EnvFilter;
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 // -----------------------------------------------------------------------
@@ -982,6 +990,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     //    waits for in-flight handlers, then closes the endpoint).
     info!("shutting down iroh router");
     router.shutdown().await.context("router shutdown failed")?;
+
+    // 4. Flush pending OTel spans and logs.
+    telemetry::shutdown();
 
     info!("shutdown complete");
     Ok(())

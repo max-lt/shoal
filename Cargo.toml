@@ -77,6 +77,14 @@ toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# OpenTelemetry (gated behind `telemetry` feature in shoald)
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "tls-webpki-roots"] }
+tracing-opentelemetry = "0.32"
+opentelemetry-appender-tracing = { version = "0.31", features = ["experimental_use_tracing_span_context"] }
+tonic = "0.14"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

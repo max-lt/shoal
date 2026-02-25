@@ -342,6 +342,7 @@ impl ShoalNode {
     /// Store an object: chunk → erasure-encode → distribute → build manifest.
     ///
     /// Returns the [`ObjectId`] of the stored object.
+    #[tracing::instrument(skip(self, data, metadata), fields(total_size = data.len(), object_id = tracing::field::Empty))]
     pub async fn put_object(
         &self,
         bucket: &str,
@@ -606,6 +607,8 @@ impl ShoalNode {
             object_id,
         });
 
+        tracing::Span::current().record("object_id", tracing::field::display(&object_id));
+
         info!(
             bucket, key, %object_id,
             chunks = chunk_metas.len(),
@@ -624,6 +627,7 @@ impl ShoalNode {
     /// Looks up the manifest, fetches shards (locally first, then from
     /// remote peers), erasure-decodes each chunk, and returns the
     /// reconstructed data.
+    #[tracing::instrument(skip(self), fields(object_id = tracing::field::Empty, chunks = tracing::field::Empty))]
     pub async fn get_object(
         &self,
         bucket: &str,
@@ -781,6 +785,10 @@ impl ShoalNode {
             result.extend_from_slice(&chunk_data);
         }
 
+        let span = tracing::Span::current();
+        span.record("object_id", tracing::field::display(&object_id));
+        span.record("chunks", manifest.chunks.len());
+
         info!(
             bucket, key, %object_id,
             size = result.len(),
@@ -798,6 +806,7 @@ impl ShoalNode {
     ///
     /// Shard data is left in place for now; a background GC pass would
     /// clean up orphaned shards (post-milestone optimization).
+    #[tracing::instrument(skip(self))]
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
         if let Some(log_tree) = &self.log_tree {
             // LogTree mode: append delete entry + broadcast.

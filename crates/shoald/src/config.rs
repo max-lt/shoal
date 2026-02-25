@@ -25,6 +25,8 @@ pub struct CliConfig {
     pub s3: S3Section,
     /// Logging configuration.
     pub log: LogSection,
+    /// OpenTelemetry configuration (requires `telemetry` feature).
+    pub telemetry: TelemetrySection,
 }
 
 /// `[node]` section.
@@ -146,6 +148,31 @@ impl Default for LogSection {
             level: "info".to_string(),
         }
     }
+}
+
+/// `[telemetry]` section.
+///
+/// Configures OpenTelemetry export. Only effective when compiled with the
+/// `telemetry` feature. Without it, these values are parsed but ignored.
+///
+/// Environment variables `OTLP_ENDPOINT`, `OTLP_HEADERS`, and
+/// `OTLP_SERVICE_NAME` override the corresponding TOML values.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct TelemetrySection {
+    /// OTLP collector endpoint (e.g. `"https://otlp.example.com:4317"`).
+    ///
+    /// If empty, OTel export is disabled even with the `telemetry` feature.
+    /// Can be overridden by `OTLP_ENDPOINT` env var.
+    pub otlp_endpoint: Option<String>,
+    /// Custom OTLP headers in `key=value,key2=value2` format (for auth).
+    ///
+    /// Can be overridden by `OTLP_HEADERS` env var.
+    pub otlp_headers: Option<String>,
+    /// Service name reported in OTel resource attributes.
+    ///
+    /// Defaults to `"shoald"`. Can be overridden by `OTLP_SERVICE_NAME` env var.
+    pub service_name: Option<String>,
 }
 
 impl CliConfig {

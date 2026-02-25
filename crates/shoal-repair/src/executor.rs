@@ -100,6 +100,7 @@ impl RepairExecutor {
     /// 3. If direct copy fails, attempt RS reconstruction from sibling shards.
     /// 4. Store the shard locally if we are an owner, or push to the correct node.
     /// 5. Update the shard map.
+    #[tracing::instrument(skip(self, throttle), fields(method = tracing::field::Empty))]
     pub async fn repair_shard(
         &self,
         shard_id: ShardId,
@@ -116,9 +117,13 @@ impl RepairExecutor {
         let data = self.try_direct_fetch(shard_id).await;
 
         let shard_data = match data {
-            Some(d) => d,
+            Some(d) => {
+                tracing::Span::current().record("method", "direct_copy");
+                d
+            }
             None => {
                 // Strategy 2: RS reconstruction from sibling shards.
+                tracing::Span::current().record("method", "rs_reconstruct");
                 debug!(%shard_id, "direct fetch failed — attempting RS reconstruction");
                 self.try_rs_reconstruct(shard_id).await?
             }
