@@ -150,4 +150,20 @@ impl S3Server {
         tracing::info!(addr, "S3 server listening");
         axum::serve(listener, self.router).await
     }
+
+    /// Serve the S3 API with graceful shutdown triggered by the given future.
+    ///
+    /// When `shutdown` completes, the server stops accepting new connections
+    /// and waits for in-flight requests to finish.
+    pub async fn serve_with_shutdown(
+        self,
+        addr: &str,
+        shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> Result<(), std::io::Error> {
+        let listener = tokio::net::TcpListener::bind(addr).await?;
+        tracing::info!(addr, "S3 server listening");
+        axum::serve(listener, self.router)
+            .with_graceful_shutdown(shutdown)
+            .await
+    }
 }

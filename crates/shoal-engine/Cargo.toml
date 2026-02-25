@@ -34,3 +34,10 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 ntest = "0.9"
+criterion = { workspace = true }
+shoal-cluster = { workspace = true }
+shoal-store = { workspace = true }
+
+[[bench]]
+name = "pipeline"
+harness = false

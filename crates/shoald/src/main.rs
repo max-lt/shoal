@@ -758,18 +758,21 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         config.repair_concurrent_transfers(),
         1000, // poll interval: check repair queue every second
     );
-    let repair_detector = RepairDetector::new(
+    let repair_detector = Arc::new(RepairDetector::new(
         cluster.clone(),
         meta.clone(),
         store.clone(),
         replication_factor,
-    );
+    ));
 
     // Spawn repair background tasks.
     let detector_events = cluster.subscribe();
-    tokio::spawn(async move {
-        repair_detector.run(detector_events).await;
-    });
+    {
+        let detector = repair_detector.clone();
+        tokio::spawn(async move {
+            detector.run(detector_events).await;
+        });
+    }
     tokio::spawn(async move {
         repair_scheduler.run().await;
     });
@@ -778,6 +781,47 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         bandwidth = config.repair_max_bandwidth_bytes(),
         "repair subsystem started"
     );
+
+    // --- Anti-entropy background scan ---
+    // Periodically scan local shards to verify integrity and placement.
+    // Corrupt or misplaced shards are enqueued for repair.
+    {
+        let detector = repair_detector.clone();
+        let scan_interval_secs = config.anti_entropy_interval_secs();
+        tokio::spawn(async move {
+            // Initial delay: let the node settle before the first scan.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            info!(
+                interval_secs = scan_interval_secs,
+                "anti-entropy background scan started"
+            );
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_secs(scan_interval_secs));
+            loop {
+                interval.tick().await;
+                match detector.scan_local_shards().await {
+                    Ok(result) => {
+                        if result.corrupt > 0 || result.misplaced > 0 {
+                            warn!(
+                                scanned = result.total_scanned,
+                                corrupt = result.corrupt,
+                                misplaced = result.misplaced,
+                                "anti-entropy scan found issues"
+                            );
+                        } else {
+                            debug!(
+                                scanned = result.total_scanned,
+                                "anti-entropy scan: all shards healthy"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%e, "anti-entropy scan failed");
+                    }
+                }
+            }
+        });
+    }
 
     // --- Pending push retry loop ---
     // Retries shard pushes that failed during writes (transient network issues).
@@ -842,7 +886,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
 
     info!(addr = %config.node.s3_listen_addr, "S3 API ready");
     server
-        .serve(&config.node.s3_listen_addr)
+        .serve_with_shutdown(&config.node.s3_listen_addr, shutdown_signal())
         .await
         .context("S3 server failed")?;
 
@@ -851,7 +895,66 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     info!("shutting down iroh router");
     router.shutdown().await.context("router shutdown failed")?;
 
+    info!("shutdown complete");
     Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Signal handling
+// -----------------------------------------------------------------------
+
+/// Wait for a SIGTERM or SIGINT (Ctrl-C) signal.
+///
+/// On the first signal, the returned future resolves and initiates graceful
+/// shutdown (S3 server stops accepting, in-flight requests drain, router
+/// closes). If a second signal arrives while shutdown is in progress, the
+/// process exits immediately.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => info!("received SIGINT (Ctrl-C), initiating graceful shutdown"),
+        () = terminate => info!("received SIGTERM, initiating graceful shutdown"),
+    }
+
+    // If a second signal arrives during shutdown, exit immediately.
+    tokio::spawn(async {
+        let second = async {
+            let ctrl_c = tokio::signal::ctrl_c();
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                        .expect("failed to install second SIGTERM handler");
+                tokio::select! {
+                    _ = ctrl_c => {},
+                    _ = term.recv() => {},
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                ctrl_c.await.ok();
+            }
+        };
+        second.await;
+        warn!("received second signal during shutdown — forcing exit");
+        std::process::exit(1);
+    });
 }
 
 // -----------------------------------------------------------------------

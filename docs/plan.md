@@ -38,6 +38,8 @@ The name "Shoal" comes from a shoal of fish — lightweight individual units tha
 ┌─────────────────────────────┐
 │   S3 HTTP API (axum)        │  shoal-s3
 ├─────────────────────────────┤
+│   Daemon (shoald)           │  shoald
+├─────────────────────────────┤
 │   Engine (orchestrator)     │  shoal-engine
 ├──────────┬──────────────────┤
 │ Repair   │  Cluster         │  shoal-repair / shoal-cluster
@@ -46,9 +48,11 @@ The name "Shoal" comes from a shoal of fish — lightweight individual units tha
 │ Erasure  │  Placement       │  shoal-erasure / shoal-placement
 │ Coding   │  (hash ring)     │
 ├──────────┴──────────────────┤
+│   LogTree (mutation DAG)    │  shoal-logtree
+├─────────────────────────────┤
 │   Metadata Store (Fjall)    │  shoal-meta
 ├─────────────────────────────┤
-│   Content Addressing        │  shoal-cas
+│   Content Addressing (CDC)  │  shoal-cas
 ├─────────────────────────────┤
 │   Shard Store (trait)       │  shoal-store
 ├─────────────────────────────┤
@@ -65,20 +69,24 @@ All dependencies are pure Rust:
 | Hashing          | `blake3`               | Content addressing, integrity verification                                        |
 | Metadata         | `fjall` v3             | LSM-tree embedded KV store (manifests, shard map, membership state, repair queue) |
 | Erasure coding   | `reed-solomon-simd` v3 | Reed-Solomon with runtime SIMD detection (AVX2, SSSE3, Neon)                      |
-| Networking       | `iroh` 0.35 (stable)   | QUIC connections, hole punching, relay fallback                                   |
-| Gossip/broadcast | `iroh-gossip`          | HyParView + PlumTree epidemic broadcast for cluster events                        |
+| Networking       | `iroh` 0.96            | QUIC connections, hole punching, relay fallback                                   |
+| Gossip/broadcast | `iroh-gossip` 0.96     | HyParView + PlumTree epidemic broadcast for cluster events                        |
 | Membership       | `foca`                 | SWIM protocol for failure detection (plugged into iroh transport)                 |
+| CDC              | `fastcdc` v3           | Content-defined chunking for inter-version deduplication                          |
+| Compression      | `zstd` 0.13            | Per-chunk zstd compression (level 3)                                              |
+| Signing          | `ed25519-dalek` v2     | Cryptographic signatures for LogTree entries                                      |
 | Serialization    | `postcard` + `serde`   | Compact binary serialization                                                      |
 | HTTP             | `axum` + `hyper`       | S3-compatible API                                                                 |
 | Async            | `tokio`                | Runtime                                                                           |
 | Observability    | `tracing` + `metrics`  | Logging and metrics                                                               |
+| Benchmarking     | `criterion` 0.5        | Performance benchmarks (CDC, erasure, full pipeline)                              |
 
 ### Why these choices?
 
 - **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing when thousands of shard locations update. Keyspaces give clean separation. Fjall is a local cache/index, not the source of truth — everything is reconstructible from the cluster.
 - **foca over custom SWIM**: Production-grade SWIM+Inf.+Susp. implementation, `no_std` compatible, pluggable transport. We pipe foca messages over iroh connections.
 - **iroh-gossip over foca for broadcast**: foca handles membership/failure detection; iroh-gossip handles event dissemination (new shard available, repair needed, etc). Different tools for different jobs.
-- **Custom shard transfer over iroh-blobs**: iroh-blobs post-0.35 is marked "not production quality". We build a simple shard transfer protocol on iroh QUIC streams instead.
+- **Custom shard transfer over iroh-blobs**: We build a simple shard transfer protocol on iroh QUIC streams instead.
 - **Consistent hash ring is hand-written**: ~150 lines. No existing crate handles the ring diff computation (which shards must move when membership changes) that we need for rebalancing.
 
 ## Monorepo Structure
@@ -89,7 +97,7 @@ shoal/
 ├── crates/
 │   ├── shoal-types/                  Shared types, IDs, configs
 │   ├── shoal-store/                  Trait ShardStore + backends
-│   ├── shoal-cas/                    Content addressing, chunking, manifests
+│   ├── shoal-cas/                    Content addressing, CDC chunking, manifests
 │   ├── shoal-meta/                   Metadata store (wraps Fjall)
 │   ├── shoal-erasure/                Reed-Solomon (wraps reed-solomon-simd)
 │   ├── shoal-placement/              Consistent hashing ring
@@ -97,12 +105,11 @@ shoal/
 │   ├── shoal-repair/                 Auto-repair & rebalancing
 │   ├── shoal-net/                    Network protocol on iroh
 │   ├── shoal-engine/                 Node orchestrator
+│   ├── shoal-logtree/                DAG-based mutation tracking (ed25519 signed)
 │   ├── shoal-s3/                     S3 HTTP API
-│   └── shoal-cli/                    Binary entrypoint
+│   └── shoald/                       Daemon binary (was shoal-cli)
 ├── tests/
-│   ├── integration/
-│   └── chaos/
-└── benches/
+│   └── integration/
 ```
 
 ## Key Data Types
@@ -128,9 +135,13 @@ pub struct Manifest {
 pub struct ChunkMeta {
     pub chunk_id: ChunkId,
     pub offset: u64,
-    pub size: u32,
+    pub raw_length: u32,            // uncompressed size
+    pub stored_length: u32,         // compressed size (== raw_length if uncompressed)
+    pub compression: Compression,   // None | Zstd
     pub shards: Vec<ShardMeta>,
 }
+
+pub enum Compression { None, Zstd }
 
 pub struct ShardMeta {
     pub shard_id: ShardId,
@@ -173,26 +184,23 @@ pub struct RepairCircuitBreaker {
 ### Write Path
 
 1. Client sends PUT via S3 API
-2. Object data is chunked into fixed-size chunks (size depends on config)
-3. Determine local zone from this node's topology + `ReplicationBoundary`
-4. Each chunk → Reed-Solomon encode → k data shards + m parity shards
+2. Object data is split into variable-size chunks using **Content-Defined Chunking** (FastCDC v2020, min=16KB, avg=64KB, max=256KB). CDC boundaries are determined by content fingerprints, enabling inter-version deduplication: unchanged regions keep the same ChunkId.
+3. Each chunk is **compressed with zstd** (level 3). If compressed size >= raw size, the chunk is stored uncompressed (Compression::None).
+4. Each compressed chunk → Reed-Solomon encode → k data shards + m parity shards
 5. Each shard is BLAKE3-hashed to get its ShardId
-6. Distribute shards via local zone's ring
-7. Build manifest → gossip broadcast to ALL nodes (all zones)
-8. ACK to client per `ZoneWriteAck` policy
-9. Background (`ZoneReplicator` in `shoal-engine`, Milestone 11):
-   → Send full chunk data to other zones
-   → Each remote zone EC-encodes independently via its own ring
-10. ObjectId (blake3 of serialized manifest) is stored in local Fjall index: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
-11. Every object, regardless of size, goes through this same pipeline — no inline shortcut
+6. Distribute shards to ring owners via QUIC (with retry queue for failures)
+7. Build manifest (with raw_length, stored_length, compression per chunk) → persist in Fjall + broadcast via gossip/LogTree
+8. LogTree entry (signed with ed25519) records the mutation for DAG-based consistency
+9. ObjectId (blake3 of serialized manifest) stored in Fjall: `objects[bucket/key] → ObjectId`, `manifests[ObjectId] → Manifest`
+10. Every object, regardless of size, goes through this same pipeline — no inline shortcut
 
 ### Read Path
 
 1. Client sends GET via S3 API
-2. Look up manifest in local Fjall (always available via gossip)
-3. Fetch shards from LOCAL zone's ring only
-4. EC decode → stream reconstructed chunks to client
-5. Never crosses zone boundaries for normal reads
+2. Look up manifest in local Fjall (always available via gossip/LogTree)
+3. For each chunk: fetch shards from ring owners (local store first, remote via QUIC)
+4. EC decode → **decompress** (if compression == Zstd) → verify raw_length matches
+5. Concatenate reconstructed chunks → return to client
 
 ### Node Join
 
@@ -234,7 +242,7 @@ Set up the Rust workspace and all crate skeletons.
 - [x] Create each crate directory with `Cargo.toml` and `src/lib.rs` (or `src/main.rs` for `shoal-cli`)
 - [x] Set up `[workspace.dependencies]` with all shared deps (blake3, fjall, reed-solomon-simd, iroh, iroh-gossip, foca, postcard, serde, axum, tokio, tracing, thiserror, anyhow, bytes)
 - [x] Verify the entire workspace compiles: `cargo build`
-- [x] Verify iroh 0.35 and iroh-gossip version compatibility (iroh-gossip 0.35 with `net` feature)
+- [x] Verify iroh 0.96 and iroh-gossip 0.96 version compatibility
 
 **Test**: `cargo build` succeeds with no errors.
 
@@ -306,17 +314,23 @@ The shard storage trait and in-memory backend.
 Content addressing: chunking objects into chunks, building manifests.
 
 - [x] Implement fixed-size chunker with `Chunk.data: Bytes` (zero-copy through pipeline)
-- [x] `Chunk.id` = `blake3(chunk.data)`, last chunk may be smaller
+- [x] Implement **Content-Defined Chunking** (CDC) using FastCDC v2020 algorithm
+  - Fixed parameters: min=16KB, avg=64KB, max=256KB (must never change for dedup consistency)
+  - `CdcChunker::new()` for standard params, `with_sizes()` for testing
+  - `chunk()` for sync, `chunk_stream()` for async readers
+- [x] `Chunk.id` = `blake3(chunk.data)`, last chunk may be smaller than min_size
 - [x] Implement streaming chunker (`chunk_stream` takes `impl AsyncRead + Unpin`)
 - [x] Implement `build_manifest` and `build_manifest_with_timestamp` (deterministic testing)
   - `ObjectId` = blake3 of postcard-serialized content (without object_id field)
 - [x] Implement manifest serialization/deserialization with postcard
 
-**Tests** (13 tests):
+**Tests**:
 
-- [x] Chunking: 0 bytes, exact size, size+1, 3.5x size
+- [x] Chunking: 0 bytes, exact size, size+1, 3.5x size (fixed-size chunker)
+- [x] CDC: empty data, small file single chunk, chunk sizes within bounds, deterministic
+- [x] CDC: dedup partial modification (>80% chunk reuse with 5% change), offsets contiguous
+- [x] CDC: stream matches sync chunker
 - [x] ChunkId deterministic, deduplication (identical chunks → same ID)
-- [x] Streaming chunker matches sync chunker
 - [x] Manifest round-trip, ObjectId deterministic, ObjectId changes with content
 - [x] `cargo test -p shoal-cas` passes
 
@@ -623,9 +637,9 @@ The node orchestrator that ties everything together.
   6. Start repair detector + scheduler + executor as background tasks
   7. Start incoming message handler
 - [x] `ShoalNode::put_object(bucket, key, data, metadata)`:
-  - Full write path: chunk → erasure → distribute shards → build manifest → store manifest as erasure-coded object → update local Fjall index
+  - Full write path: CDC chunk → zstd compress → erasure encode → distribute shards → build manifest → persist in Fjall + broadcast via gossip/LogTree
 - [x] `ShoalNode::get_object(bucket, key)`:
-  - Full read path: lookup ObjectId in Fjall → fetch manifest shards → decode manifest → fetch data shards → decode → return
+  - Full read path: lookup ObjectId in Fjall → fetch shards per chunk → erasure decode → decompress → verify raw_length → concatenate → return
 - [x] `ShoalNode::delete_object(bucket, key)`:
   - Remove manifest and key mapping
   - Enqueue shard cleanup (background)
@@ -675,25 +689,23 @@ S3-compatible HTTP API.
 
 ---
 
-## Milestone 13 — `shoal-cli` ✅
+## Milestone 13 — `shoald` (daemon binary) ✅
 
-The binary that brings it all together.
+The daemon binary that brings it all together. Renamed from `shoal-cli` to `shoald`.
 
 - [x] TOML config file:
 
   ```toml
   [node]
   data_dir = "/var/lib/shoal"
-  listen_addr = "0.0.0.0:4820"
   s3_listen_addr = "0.0.0.0:4821"
 
   [cluster]
   secret = "my-cluster-secret"
-  seeds = ["node-id-hex@192.168.1.10:4820"]
+  peers = ["endpoint-id@192.168.1.10:4820"]
 
   [storage]
   backend = "file"  # or "memory"
-  chunk_size = 262144
 
   [erasure]
   k = 4
@@ -704,23 +716,26 @@ The binary that brings it all together.
   concurrent_transfers = 8
 
   [s3]
-  access_key = "shoal"
-  secret_key = "shoalsecret"
+  auth_secret = "shoalsecret"
   ```
 
 - [x] CLI commands:
-  - `shoal start` — start the node
-  - `shoal status` — show cluster status (members, shard distribution)
-  - `shoal repair status` — show repair queue
-  - `shoal benchmark` — run a quick read/write benchmark
+  - `shoald start` — start the node (with `--peer`, `--secret`, `--memory`, `-d`, `-l` flags)
+  - `shoald status` — show cluster status (members, shard distribution)
+  - `shoald repair status` — show repair queue
+  - `shoald benchmark` — run a quick read/write benchmark
 - [x] Auto-detection: if no config specified, detect available RAM and disk, set sensible defaults
 - [x] Tracing subscriber setup with configurable log level
+- [x] SIGTERM/SIGINT graceful shutdown handler (drains in-flight requests, shuts down router)
+- [x] LogTree integration (DAG-based mutation tracking with ed25519 signatures)
+- [x] Persistent node identity (iroh SecretKey stored in `data_dir/node.key`)
+- [x] Cluster-specific ALPN derived from shared secret for connection isolation
 
 **Tests**:
 
 - [x] Config parsing from TOML
 - [x] Start node, verify it binds to ports
-- [x] `cargo test -p shoal-cli` passes
+- [x] `cargo test -p shoald` passes
 
 ---
 
@@ -840,7 +855,8 @@ real-world incidents at Ceph, MinIO, Meta/Facebook, CERN, and others:
 
 - No encryption at rest (later)
 - No bucket-level ACLs (later)
-- No versioning (later)
+- No object versioning (later — LogTree provides mutation history but not S3-style versioning)
 - No lifecycle policies (later)
 - No `io_uring` / `O_DIRECT` backend (later, behind feature flag)
-- No `ZoneReplicator` implementation yet (Milestone 11) — cross-zone replication is designed but not yet coded
+- No `ZoneReplicator` — cross-zone replication is designed but not yet coded
+- No small object packing — CDC handles most efficiency concerns; packing is a future optimization

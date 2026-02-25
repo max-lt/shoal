@@ -96,3 +96,6 @@ zstd = "0.13"
 
 # Testing
 tempfile = "3"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["async_tokio"] }

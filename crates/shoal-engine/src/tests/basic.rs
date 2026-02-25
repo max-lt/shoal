@@ -263,11 +263,11 @@ async fn test_head_object_chunk_count() {
     // empty data produces 0 chunks.
     // (size, min_chunks, max_chunks)
     let cases: &[(usize, usize, usize)] = &[
-        (0, 0, 0),           // empty → 0 chunks
-        (1, 1, 1),           // tiny → 1 chunk
-        (255, 1, 1),         // small → 1 chunk
-        (1024, 1, 1),        // below CDC min → 1 chunk
-        (16_384, 1, 1),      // at CDC min → 1 chunk
+        (0, 0, 0),                // empty → 0 chunks
+        (1, 1, 1),                // tiny → 1 chunk
+        (255, 1, 1),              // small → 1 chunk
+        (1024, 1, 1),             // below CDC min → 1 chunk
+        (16_384, 1, 1),           // at CDC min → 1 chunk
         (300_000, 2, usize::MAX), // above CDC max → multiple chunks
     ];
 

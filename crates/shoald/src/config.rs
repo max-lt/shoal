@@ -115,6 +115,11 @@ pub struct RepairSection {
     pub max_bandwidth: Option<String>,
     /// Number of concurrent shard transfers during repair.
     pub concurrent_transfers: Option<u16>,
+    /// Interval in seconds between anti-entropy background scans.
+    ///
+    /// Each scan re-hashes all local shards and verifies ring placement.
+    /// Defaults to 600 (10 minutes).
+    pub anti_entropy_interval_secs: Option<u64>,
 }
 
 /// `[s3]` section.
@@ -238,6 +243,13 @@ impl CliConfig {
     /// Defaults to 100 MB.
     pub fn cache_max_bytes(&self) -> u64 {
         self.storage.cache_max_bytes.unwrap_or(100 * 1024 * 1024)
+    }
+
+    /// Interval in seconds between anti-entropy background scans.
+    ///
+    /// Defaults to 600 (10 minutes).
+    pub fn anti_entropy_interval_secs(&self) -> u64 {
+        self.repair.anti_entropy_interval_secs.unwrap_or(600)
     }
 }
 

@@ -17,13 +17,13 @@ IMPORTANT: Run `cargo clippy -- -D warnings` and `cargo fmt --check` before cons
 
 ## Workspace Layout
 
-Rust monorepo. All crates live in `crates/`. Integration tests in `tests/`. Benches in `benches/`.
+Rust monorepo. All crates live in `crates/`. Integration tests in `tests/`. Criterion benches in each crate's `benches/`.
 
 ```
 crates/
   shoal-types/       Shared types, IDs (ShardId, ChunkId, ObjectId, NodeId)
   shoal-store/       ShardStore trait + MemoryStore, FileStore backends
-  shoal-cas/         Content addressing, chunking, manifests
+  shoal-cas/         Content addressing, CDC chunking, manifests
   shoal-meta/        Metadata persistence (wraps Fjall)
   shoal-erasure/     Reed-Solomon erasure coding (wraps reed-solomon-simd)
   shoal-placement/   Consistent hashing ring (hand-written, ~150 lines)
@@ -31,13 +31,14 @@ crates/
   shoal-repair/      Auto-repair, rebalancing, throttling
   shoal-net/         Network protocol on iroh QUIC
   shoal-engine/      Node orchestrator, write/read pipelines
+  shoal-logtree/     DAG-based mutation tracking (ed25519 signed)
   shoal-s3/          S3-compatible HTTP API (axum)
-  shoal-cli/         Binary entrypoint
+  shoald/            Daemon binary
 ```
 
 ## Code Style
 
-- `thiserror` for error types in library crates, `anyhow` only in `shoal-cli`
+- `thiserror` for error types in library crates, `anyhow` only in `shoald`
 - `tracing` for all logging, with structured fields. No `println!`
 - Serialization: `postcard` + `serde` for wire format and persistence
 - All IDs are `[u8; 32]` newtypes. Use `blake3` for hashing
@@ -52,12 +53,16 @@ crates/
 | Hashing        | `blake3`                                          |
 | Metadata DB    | `fjall` v3 (LSM-tree)                             |
 | Erasure coding | `reed-solomon-simd` v3                            |
-| Networking     | `iroh` 0.35 (stable)                              |
-| Gossip         | `iroh-gossip` (version compatible with iroh 0.35) |
+| Networking     | `iroh` 0.96                                       |
+| Gossip         | `iroh-gossip` 0.96                                |
 | Membership     | `foca` (SWIM protocol)                            |
+| CDC            | `fastcdc` v3 (content-defined chunking)           |
+| Compression    | `zstd` 0.13 (per-chunk, level 3)                  |
+| Signing        | `ed25519-dalek` v2 (LogTree entry signatures)     |
 | Serialization  | `postcard`, `serde`                               |
 | HTTP           | `axum`                                            |
 | Async          | `tokio`                                           |
+| Benchmarking   | `criterion` 0.5                                   |
 
 IMPORTANT: Never add a dependency that requires C/C++ compilation or `cc` build script. If unsure, check the dep's build.rs before adding.
 
