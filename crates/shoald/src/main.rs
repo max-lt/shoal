@@ -780,6 +780,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     }
 
     let engine = Arc::new(engine_builder);
+    let engine_dyn: Arc<dyn shoal_engine::ShoalEngine> = engine.clone();
 
     // --- Repair subsystem ---
     // Wire up the repair detector, scheduler, and executor as background
@@ -961,7 +962,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     }
 
     // --- S3 HTTP API ---
-    let server = S3Server::new(S3ServerConfig { engine });
+    let server = S3Server::new(S3ServerConfig { engine: engine_dyn });
 
     info!(addr = %config.node.s3_listen_addr, "S3 API ready");
     server
@@ -1305,7 +1306,7 @@ mod tests {
             })
             .await;
 
-        let engine = Arc::new(ShoalNode::new(
+        let engine: Arc<dyn shoal_engine::ShoalEngine> = Arc::new(ShoalNode::new(
             ShoalNodeConfig {
                 node_id,
                 chunk_size: 1024,

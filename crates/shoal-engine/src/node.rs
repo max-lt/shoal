@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::cache::ShardCache;
+use crate::engine::ShoalEngine;
 use crate::error::EngineError;
 use crate::pending::{self, PendingBuffer};
 
@@ -1404,5 +1405,46 @@ impl ShoalNode {
                 warn!(%e, "unicast broadcast task panicked");
             }
         }
+    }
+}
+
+// ======================================================================
+// ShoalEngine trait implementation
+// ======================================================================
+
+#[async_trait::async_trait]
+impl ShoalEngine for ShoalNode {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        metadata: BTreeMap<String, String>,
+    ) -> Result<ObjectId, EngineError> {
+        ShoalNode::put_object(self, bucket, key, data, metadata).await
+    }
+
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(Vec<u8>, Manifest), EngineError> {
+        ShoalNode::get_object(self, bucket, key).await
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+        ShoalNode::head_object(self, bucket, key).await
+    }
+
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
+        ShoalNode::delete_object(self, bucket, key).await
+    }
+
+    async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
+        ShoalNode::list_objects(self, bucket, prefix).await
+    }
+
+    fn meta(&self) -> &Arc<MetaStore> {
+        ShoalNode::meta(self)
     }
 }
