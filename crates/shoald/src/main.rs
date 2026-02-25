@@ -782,12 +782,19 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         "repair subsystem started"
     );
 
+    // --- Shutdown coordination ---
+    // A watch channel lets background tasks observe when shutdown begins so
+    // they can abort long-running work (e.g. a mid-flight anti-entropy scan)
+    // instead of blocking the shutdown sequence.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
     // --- Anti-entropy background scan ---
     // Periodically scan local shards to verify integrity and placement.
     // Corrupt or misplaced shards are enqueued for repair.
     {
         let detector = repair_detector.clone();
         let scan_interval_secs = config.anti_entropy_interval_secs();
+        let mut shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
             // Initial delay: let the node settle before the first scan.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -798,25 +805,41 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(scan_interval_secs));
             loop {
-                interval.tick().await;
-                match detector.scan_local_shards().await {
-                    Ok(result) => {
-                        if result.corrupt > 0 || result.misplaced > 0 {
-                            warn!(
-                                scanned = result.total_scanned,
-                                corrupt = result.corrupt,
-                                misplaced = result.misplaced,
-                                "anti-entropy scan found issues"
-                            );
-                        } else {
-                            debug!(
-                                scanned = result.total_scanned,
-                                "anti-entropy scan: all shards healthy"
-                            );
+                // Wait for the next tick or a shutdown signal.
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown_rx.changed() => {
+                        info!("anti-entropy scan interrupted by shutdown");
+                        break;
+                    }
+                }
+
+                // Run the scan, but abort if shutdown arrives mid-scan.
+                tokio::select! {
+                    result = detector.scan_local_shards() => {
+                        match result {
+                            Ok(r) if r.corrupt > 0 || r.misplaced > 0 => {
+                                warn!(
+                                    scanned = r.total_scanned,
+                                    corrupt = r.corrupt,
+                                    misplaced = r.misplaced,
+                                    "anti-entropy scan found issues"
+                                );
+                            }
+                            Ok(r) => {
+                                debug!(
+                                    scanned = r.total_scanned,
+                                    "anti-entropy scan: all shards healthy"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(%e, "anti-entropy scan failed");
+                            }
                         }
                     }
-                    Err(e) => {
-                        warn!(%e, "anti-entropy scan failed");
+                    _ = shutdown_rx.changed() => {
+                        info!("anti-entropy scan interrupted by shutdown");
+                        break;
                     }
                 }
             }
@@ -890,8 +913,22 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         .await
         .context("S3 server failed")?;
 
-    // Gracefully shut down the iroh router (stops accepting new connections,
-    // waits for in-flight handlers, then closes the endpoint).
+    // --- Graceful shutdown sequence ---
+
+    // 1. Signal background tasks (anti-entropy, etc.) to stop.
+    let _ = shutdown_tx.send(true);
+
+    // 2. Notify the cluster we're leaving so peers update immediately
+    //    instead of waiting for the foca SWIM timeout.
+    info!("notifying cluster of departure");
+    if let Err(e) = membership_handle.leave() {
+        warn!(%e, "failed to send leave notification");
+    }
+    // Give foca a moment to disseminate the leave message.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 3. Shut down the iroh router (stops accepting new connections,
+    //    waits for in-flight handlers, then closes the endpoint).
     info!("shutting down iroh router");
     router.shutdown().await.context("router shutdown failed")?;
 

@@ -156,6 +156,11 @@ impl ClusterState {
     pub async fn node_ids(&self) -> Vec<NodeId> {
         self.members.read().await.keys().copied().collect()
     }
+
+    /// Broadcast a cluster event to all subscribers.
+    pub fn emit_event(&self, event: ClusterEvent) {
+        let _ = self.event_tx.send(event);
+    }
 }
 
 impl std::fmt::Debug for ClusterState {

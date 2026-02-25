@@ -251,6 +251,12 @@ pub enum ClusterEvent {
     ShardStored(ShardId, NodeId),
     /// A shard needs repair (under-replicated or corrupted).
     RepairNeeded(ShardId),
+    /// The local node is now active in the cluster (foca considers it joined).
+    ///
+    /// Emitted once the SWIM protocol has confirmed this node's membership.
+    /// Components can wait for this event before starting work that depends
+    /// on cluster participation (e.g. rebalancing, shard transfers).
+    NodeReady(NodeId),
 }
 
 /// Payload types that travel through the gossip broadcast layer.
