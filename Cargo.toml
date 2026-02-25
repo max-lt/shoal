@@ -92,6 +92,9 @@ anyhow = "1"
 # Signing
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 
+# Constant-time comparison (auth)
+subtle = "2"
+
 # System
 libc = "0.2"
 dirs = "6"

@@ -7,9 +7,11 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Response, StatusCode};
+use serde::Serialize;
 use tracing::info;
 
 use crate::AppState;
@@ -18,6 +20,158 @@ use crate::xml;
 
 /// Atomic counter for generating unique upload IDs.
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+// -----------------------------------------------------------------------
+// POST /admin/keys — CreateApiKey (no auth required)
+// -----------------------------------------------------------------------
+
+/// Table of uppercase alphanumeric characters used for access key IDs.
+const ALPHA_NUMERIC: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+/// Generate an access key ID: `"SHOAL"` prefix + 15 uppercase alphanumeric chars.
+///
+/// The result is safe to log and identifies the key without revealing any secret.
+fn gen_access_key_id() -> String {
+    use rand::RngCore;
+    let mut rng = rand::rng();
+    let mut out = String::with_capacity(20);
+    out.push_str("SHOAL");
+
+    for _ in 0..15 {
+        let idx = (rng.next_u32() as usize) % ALPHA_NUMERIC.len();
+        out.push(ALPHA_NUMERIC[idx] as char);
+    }
+
+    out
+}
+
+/// Generate a secret access key: 40 lowercase hex characters (20 random bytes).
+///
+/// Never log this value.
+fn gen_secret_access_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 20];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Response body for `POST /admin/keys`.
+#[derive(Serialize)]
+pub(crate) struct CreateApiKeyResponse {
+    pub access_key_id: String,
+    pub secret_access_key: String,
+}
+
+/// Create a new API key pair, persist it in MetaStore, and return it.
+///
+/// Requires `Authorization: Bearer <admin_secret>`. The returned
+/// `access_key_id` is safe to log; `secret_access_key` must be stored securely
+/// and is never returned again.
+///
+/// Use `Authorization: Bearer <access_key_id>:<secret_access_key>` for subsequent
+/// S3 requests.
+pub(crate) async fn create_api_key(
+    State(state): State<AppState>,
+) -> Result<(StatusCode, Json<CreateApiKeyResponse>), S3Error> {
+    let key_id = gen_access_key_id();
+    let secret = gen_secret_access_key();
+
+    // Persist to MetaStore first — if this fails, don't add to the cache.
+    state
+        .engine
+        .meta()
+        .put_api_key(&key_id, &secret)
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to persist api key: {e}"),
+        })?;
+
+    // Update the in-memory cache.
+    state
+        .api_keys
+        .write()
+        .await
+        .insert(key_id.clone(), secret.clone());
+
+    info!(access_key_id = %key_id, "api_key_created");
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateApiKeyResponse {
+            access_key_id: key_id,
+            secret_access_key: secret,
+        }),
+    ))
+}
+
+// -----------------------------------------------------------------------
+// GET /admin/keys — ListApiKeys
+// -----------------------------------------------------------------------
+
+/// Response item for `GET /admin/keys`.
+///
+/// Only the access key ID is returned — secrets are never exposed.
+#[derive(Serialize)]
+pub(crate) struct ApiKeyInfo {
+    pub access_key_id: String,
+}
+
+/// List all API key IDs (secrets are NOT returned).
+///
+/// Requires `Authorization: Bearer <admin_secret>`.
+pub(crate) async fn list_api_keys(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<ApiKeyInfo>>, S3Error> {
+    let keys = state.api_keys.read().await;
+    let list: Vec<ApiKeyInfo> = keys
+        .keys()
+        .map(|id| ApiKeyInfo {
+            access_key_id: id.clone(),
+        })
+        .collect();
+
+    Ok(Json(list))
+}
+
+// -----------------------------------------------------------------------
+// DELETE /admin/keys/{access_key_id} — DeleteApiKey
+// -----------------------------------------------------------------------
+
+/// Delete an API key pair by access key ID.
+///
+/// Requires `Authorization: Bearer <admin_secret>`. Returns 204 on success,
+/// 404 if the key does not exist.
+pub(crate) async fn delete_api_key(
+    State(state): State<AppState>,
+    Path(access_key_id): Path<String>,
+) -> Result<axum::response::Response, S3Error> {
+    // Check the key exists in the cache.
+    let existed = {
+        let mut keys = state.api_keys.write().await;
+        keys.remove(&access_key_id).is_some()
+    };
+
+    if !existed {
+        return Err(S3Error::InvalidRequest {
+            message: format!("api key not found: {access_key_id}"),
+        });
+    }
+
+    // Remove from persistent store.
+    state
+        .engine
+        .meta()
+        .delete_api_key(&access_key_id)
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to delete api key: {e}"),
+        })?;
+
+    info!(access_key_id = %access_key_id, "api_key_deleted");
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
 
 /// Generate a unique multipart upload ID using an atomic counter + blake3.
 fn generate_upload_id() -> String {

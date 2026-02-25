@@ -961,10 +961,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     }
 
     // --- S3 HTTP API ---
-    let server = S3Server::new(S3ServerConfig {
-        engine,
-        auth_secret: config.s3_auth_secret(),
-    });
+    let server = S3Server::new(S3ServerConfig { engine });
 
     info!(addr = %config.node.s3_listen_addr, "S3 API ready");
     server
@@ -1323,10 +1320,7 @@ mod tests {
             cluster,
         ));
 
-        let server = S3Server::new(S3ServerConfig {
-            engine,
-            auth_secret: None,
-        });
+        let server = S3Server::new(S3ServerConfig { engine });
 
         // Bind the listener ourselves so we can discover the actual port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

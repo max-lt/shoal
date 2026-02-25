@@ -125,14 +125,12 @@ pub struct RepairSection {
 }
 
 /// `[s3]` section.
+///
+/// API keys are created at runtime via `POST /admin/keys` (currently open,
+/// no auth required on admin endpoints).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct S3Section {
-    /// S3 access key (used in Bearer auth).
-    pub access_key: Option<String>,
-    /// S3 secret key (used as the Bearer token secret).
-    pub secret_key: Option<String>,
-}
+pub struct S3Section {}
 
 /// `[log]` section.
 #[derive(Debug, Deserialize)]
@@ -241,11 +239,6 @@ impl CliConfig {
         self.erasure.shard_replication.unwrap_or(1)
     }
 
-    /// S3 auth secret derived from the configured secret key.
-    pub fn s3_auth_secret(&self) -> Option<String> {
-        self.s3.secret_key.clone()
-    }
-
     /// Effective maximum repair bandwidth in bytes per second.
     ///
     /// Parses human-readable strings like `"100MB/s"`, `"1GB/s"`, `"1MB/s"`.
@@ -340,8 +333,6 @@ max_bandwidth = "100MB/s"
 concurrent_transfers = 8
 
 [s3]
-access_key = "shoal"
-secret_key = "shoalsecret"
 
 [log]
 level = "debug"
@@ -359,8 +350,6 @@ level = "debug"
         assert_eq!(config.erasure.m, Some(2));
         assert_eq!(config.repair.max_bandwidth.as_deref(), Some("100MB/s"));
         assert_eq!(config.repair.concurrent_transfers, Some(8));
-        assert_eq!(config.s3.access_key.as_deref(), Some("shoal"));
-        assert_eq!(config.s3.secret_key.as_deref(), Some("shoalsecret"));
         assert_eq!(config.log.level, "debug");
     }
 
@@ -377,7 +366,6 @@ level = "debug"
         assert_eq!(config.chunk_size(), 262_144);
         assert_eq!(config.erasure_k(), 4);
         assert_eq!(config.erasure_m(), 2);
-        assert!(config.s3_auth_secret().is_none());
     }
 
     #[test]

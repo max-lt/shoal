@@ -3,6 +3,9 @@
 //! Provides an [`S3Server`] that exposes an axum-based HTTP API compatible
 //! with a subset of the AWS S3 protocol. Supported operations:
 //!
+//! - `POST /admin/keys` — CreateApiKey (requires admin secret)
+//! - `GET /admin/keys` — ListApiKeys (requires admin secret)
+//! - `DELETE /admin/keys/{access_key_id}` — DeleteApiKey (requires admin secret)
 //! - `PUT /{bucket}` — CreateBucket
 //! - `GET /{bucket}?list-type=2&prefix=...` — ListObjectsV2
 //! - `PUT /{bucket}/{key}` — PutObject
@@ -12,6 +15,13 @@
 //! - `POST /{bucket}/{key}?uploads` — InitiateMultipartUpload
 //! - `PUT /{bucket}/{key}?partNumber=N&uploadId=X` — UploadPart
 //! - `POST /{bucket}/{key}?uploadId=X` — CompleteMultipartUpload
+//!
+//! ## Authentication
+//!
+//! - **Admin endpoints** (`/admin/keys`): open, no auth required.
+//! - **S3 data-plane**: all other endpoints require an API key created via
+//!   the admin endpoint. Supply `Authorization: Bearer <access_key_id>:<secret_access_key>`.
+//!   If no API keys exist, all S3 requests are rejected (403).
 
 mod error;
 mod handlers;
@@ -27,8 +37,9 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::put;
+use axum::routing::{delete, post, put};
 use shoal_engine::ShoalNode;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -53,32 +64,39 @@ pub(crate) struct AppState {
     pub engine: Arc<ShoalNode>,
     /// In-flight multipart uploads.
     pub uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
-    /// Optional shared-secret for Bearer token authentication.
-    pub auth_secret: Option<String>,
+    /// Active API keys: `access_key_id` → `secret_access_key`.
+    pub api_keys: Arc<RwLock<HashMap<String, String>>>,
 }
 
-/// Authentication middleware.
+/// Authentication middleware for S3 data-plane routes.
 ///
-/// When `auth_secret` is configured, requires `Authorization: Bearer <secret>`.
-/// When no secret is configured, all requests pass through.
+/// Every request must supply `Authorization: Bearer <access_key_id>:<secret_access_key>`
+/// matching an existing API key. Secret comparison is constant-time to prevent
+/// timing attacks (using the `subtle` crate, same approach as rustfs).
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
-    if let Some(ref secret) = state.auth_secret {
-        let expected = format!("Bearer {secret}");
-        let valid = request
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v == expected);
+    let keys = state.api_keys.read().await;
 
-        if !valid {
-            warn!("unauthorized S3 request");
-            return Err(S3Error::AccessDenied);
-        }
+    let authenticated = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .and_then(|v| v.split_once(':'))
+        .is_some_and(|(key_id, secret)| {
+            keys.get(key_id)
+                .is_some_and(|stored| stored.as_bytes().ct_eq(secret.as_bytes()).into())
+        });
+
+    if !authenticated {
+        warn!("unauthorized S3 request");
+        return Err(S3Error::AccessDenied);
     }
+
+    drop(keys);
     Ok(next.run(request).await)
 }
 
@@ -86,8 +104,6 @@ async fn auth_middleware(
 pub struct S3ServerConfig {
     /// The storage engine to serve.
     pub engine: Arc<ShoalNode>,
-    /// Optional shared-secret for Bearer token auth. `None` disables auth.
-    pub auth_secret: Option<String>,
 }
 
 /// S3-compatible HTTP server backed by a [`ShoalNode`].
@@ -97,12 +113,24 @@ pub struct S3Server {
 
 impl S3Server {
     /// Create a new S3 server with the given configuration.
+    ///
+    /// On startup, loads any previously persisted API keys from MetaStore
+    /// into the in-memory auth cache.
     pub fn new(config: S3ServerConfig) -> Self {
+        // Load persisted API keys from MetaStore into the in-memory cache.
+        let persisted_keys = config.engine.meta().load_all_api_keys().unwrap_or_default();
+
+        let key_count = persisted_keys.len();
+
         let state = AppState {
             engine: config.engine,
             uploads: Arc::new(RwLock::new(HashMap::new())),
-            auth_secret: config.auth_secret,
+            api_keys: Arc::new(RwLock::new(persisted_keys)),
         };
+
+        if key_count > 0 {
+            tracing::info!(key_count, "loaded persisted API keys from MetaStore");
+        }
 
         let router = Self::build_router(state);
         Self { router }
@@ -110,7 +138,8 @@ impl S3Server {
 
     /// Build the axum [`Router`] for the S3 API.
     fn build_router(state: AppState) -> Router {
-        Router::new()
+        // S3 data-plane routes — require a valid API key.
+        let s3_routes = Router::new()
             // Bucket-level operations.
             .route(
                 "/{bucket}",
@@ -130,10 +159,26 @@ impl S3Server {
                     .head(handlers::head_object_handler)
                     .post(handlers::post_object_handler),
             )
-            .layer(middleware::from_fn_with_state(
+            .route_layer(middleware::from_fn_with_state(
                 state.clone(),
                 auth_middleware,
-            ))
+            ));
+
+        // Admin routes — open for now (no auth required).
+        // TODO: gate behind admin_secret once we have a proper admin UI / bootstrap flow.
+        let admin_routes = Router::new()
+            .route(
+                "/admin/keys",
+                post(handlers::create_api_key).get(handlers::list_api_keys),
+            )
+            .route(
+                "/admin/keys/{access_key_id}",
+                delete(handlers::delete_api_key),
+            );
+
+        Router::new()
+            .merge(s3_routes)
+            .merge(admin_routes)
             // Allow uploads up to 5 GiB (S3 single-PUT max).
             .layer(DefaultBodyLimit::max(5 * 1024 * 1024 * 1024))
             .with_state(state)

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
+use serde::Deserialize;
 use shoal_cluster::ClusterState;
+use shoal_engine::ShoalNode;
 use shoal_meta::MetaStore;
 use shoal_store::MemoryStore;
 use shoal_types::{Member, MemberState, NodeId, NodeTopology};
@@ -15,7 +17,7 @@ use crate::{S3Server, S3ServerConfig};
 
 const TEST_MAX_BYTES: u64 = 1_000_000_000;
 
-/// Create a test S3 router backed by a single-node engine.
+/// Create a test S3 router (no API keys provisioned yet).
 async fn test_router() -> axum::Router {
     let node_id = NodeId::from([1u8; 32]);
     let store = Arc::new(MemoryStore::new(TEST_MAX_BYTES));
@@ -32,7 +34,7 @@ async fn test_router() -> axum::Router {
         })
         .await;
 
-    let engine = Arc::new(shoal_engine::ShoalNode::new(
+    let engine = Arc::new(ShoalNode::new(
         shoal_engine::ShoalNodeConfig {
             node_id,
             chunk_size: 1024,
@@ -47,50 +49,43 @@ async fn test_router() -> axum::Router {
         cluster,
     ));
 
-    S3Server::new(S3ServerConfig {
-        engine,
-        auth_secret: None,
-    })
-    .into_router()
+    S3Server::new(S3ServerConfig { engine }).into_router()
 }
 
-/// Create a test S3 router with auth enabled.
-async fn test_router_with_auth(secret: &str) -> axum::Router {
-    let node_id = NodeId::from([1u8; 32]);
-    let store = Arc::new(MemoryStore::new(TEST_MAX_BYTES));
-    let meta = Arc::new(MetaStore::open_temporary().unwrap());
-    let cluster = ClusterState::new(node_id, 128);
+/// Deserialized response from `POST /admin/keys`.
+#[derive(Deserialize)]
+struct ApiKeyResponse {
+    access_key_id: String,
+    secret_access_key: String,
+}
 
-    cluster
-        .add_member(Member {
-            node_id,
-            capacity: TEST_MAX_BYTES,
-            state: MemberState::Alive,
-            generation: 1,
-            topology: NodeTopology::default(),
-        })
-        .await;
+/// Create a test router and provision one API key.
+///
+/// Returns `(router, s3_bearer)` where `s3_bearer` is the value to pass as
+/// `Authorization: Bearer <value>` on S3 data-plane routes.
+async fn test_router_with_key() -> (axum::Router, String) {
+    let app = test_router().await;
 
-    let engine = Arc::new(shoal_engine::ShoalNode::new(
-        shoal_engine::ShoalNodeConfig {
-            node_id,
-            chunk_size: 1024,
-            erasure_k: 2,
-            erasure_m: 1,
-            vnodes_per_node: 128,
-            shard_replication: 1,
-            cache_max_bytes: u64::MAX,
-        },
-        store,
-        meta,
-        cluster,
-    ));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
 
-    S3Server::new(S3ServerConfig {
-        engine,
-        auth_secret: Some(secret.to_string()),
-    })
-    .into_router()
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_string(response).await;
+    let key: ApiKeyResponse = serde_json::from_str(&body).expect("valid JSON response");
+
+    (
+        app,
+        format!("{}:{}", key.access_key_id, key.secret_access_key),
+    )
 }
 
 /// Read the full response body as bytes.
@@ -115,7 +110,7 @@ async fn body_string(response: axum::response::Response) -> String {
 
 #[tokio::test]
 async fn test_put_get_object() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
     let data = b"hello world, this is shoal!";
 
     // PUT object.
@@ -126,6 +121,7 @@ async fn test_put_get_object() {
                 .method("PUT")
                 .uri("/mybucket/hello.txt")
                 .header("content-type", "text/plain")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from(data.as_slice()))
                 .unwrap(),
         )
@@ -149,6 +145,7 @@ async fn test_put_get_object() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/hello.txt")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -180,7 +177,7 @@ async fn test_put_get_object() {
 
 #[tokio::test]
 async fn test_head_object() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
     let data = vec![42u8; 3000];
 
     // PUT.
@@ -192,6 +189,7 @@ async fn test_head_object() {
                 .uri("/mybucket/headtest")
                 .header("content-type", "application/octet-stream")
                 .header("x-amz-meta-custom", "value42")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from(data))
                 .unwrap(),
         )
@@ -204,6 +202,7 @@ async fn test_head_object() {
             Request::builder()
                 .method("HEAD")
                 .uri("/mybucket/headtest")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -251,7 +250,7 @@ async fn test_head_object() {
 
 #[tokio::test]
 async fn test_list_objects_with_prefix() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     // PUT several objects.
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/c.txt"] {
@@ -261,6 +260,7 @@ async fn test_list_objects_with_prefix() {
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/mybucket/{key}"))
+                    .header("authorization", format!("Bearer {bearer}"))
                     .body(Body::from("data"))
                     .unwrap(),
             )
@@ -275,6 +275,7 @@ async fn test_list_objects_with_prefix() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket?list-type=2&prefix=photos/")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -304,6 +305,7 @@ async fn test_list_objects_with_prefix() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket?list-type=2")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -320,7 +322,7 @@ async fn test_list_objects_with_prefix() {
 
 #[tokio::test]
 async fn test_delete_then_get_404() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     // PUT.
     let _ = app
@@ -329,6 +331,7 @@ async fn test_delete_then_get_404() {
             Request::builder()
                 .method("PUT")
                 .uri("/mybucket/delme")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from("byebye"))
                 .unwrap(),
         )
@@ -342,6 +345,7 @@ async fn test_delete_then_get_404() {
             Request::builder()
                 .method("DELETE")
                 .uri("/mybucket/delme")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -356,6 +360,7 @@ async fn test_delete_then_get_404() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/delme")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -373,7 +378,7 @@ async fn test_delete_then_get_404() {
 
 #[tokio::test]
 async fn test_multipart_upload_3_parts() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
     let part1: Vec<u8> = vec![0xAA; 1024];
     let part2: Vec<u8> = vec![0xBB; 1024];
     let part3: Vec<u8> = vec![0xCC; 512];
@@ -386,6 +391,7 @@ async fn test_multipart_upload_3_parts() {
                 .method("POST")
                 .uri("/mybucket/multipart.bin?uploads")
                 .header("content-type", "application/octet-stream")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -415,11 +421,13 @@ async fn test_multipart_upload_3_parts() {
                     .uri(format!(
                         "/mybucket/multipart.bin?uploadId={upload_id}&partNumber={num}"
                     ))
+                    .header("authorization", format!("Bearer {bearer}"))
                     .body(Body::from(data.clone()))
                     .unwrap(),
             )
             .await
             .unwrap();
+
         assert_eq!(response.status(), StatusCode::OK);
         assert!(response.headers().get("etag").is_some());
     }
@@ -438,6 +446,7 @@ async fn test_multipart_upload_3_parts() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/mybucket/multipart.bin?uploadId={upload_id}"))
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from(complete_body))
                 .unwrap(),
         )
@@ -454,6 +463,7 @@ async fn test_multipart_upload_3_parts() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/multipart.bin")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -476,13 +486,14 @@ async fn test_multipart_upload_3_parts() {
 
 #[tokio::test]
 async fn test_create_bucket() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/newbucket")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -493,12 +504,233 @@ async fn test_create_bucket() {
 }
 
 // -----------------------------------------------------------------------
-// Auth: Bearer token
+// Admin: POST /admin/keys
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_auth_required_no_header() {
-    let app = test_router_with_auth("mysecret").await;
+async fn test_create_api_key_returns_valid_pair() {
+    let app = test_router().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "application/json"
+    );
+
+    let body = body_string(response).await;
+    let key: ApiKeyResponse = serde_json::from_str(&body).expect("valid JSON response");
+
+    assert!(
+        key.access_key_id.starts_with("SHOAL"),
+        "access_key_id must start with SHOAL"
+    );
+    assert_eq!(
+        key.access_key_id.len(),
+        20,
+        "access_key_id must be 20 chars"
+    );
+    assert_eq!(
+        key.secret_access_key.len(),
+        40,
+        "secret_access_key must be 40 hex chars"
+    );
+    assert!(
+        key.secret_access_key.chars().all(|c| c.is_ascii_hexdigit()),
+        "secret must be lowercase hex"
+    );
+}
+
+#[tokio::test]
+async fn test_admin_keys_endpoint_is_open() {
+    let app = test_router().await;
+
+    // No auth header → still works (admin endpoints are open).
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_list_api_keys_returns_ids_only() {
+    let app = test_router().await;
+
+    // Create two keys.
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/keys")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    // List keys.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    let keys: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(keys.len(), 2);
+
+    // Each entry has access_key_id but NO secret_access_key.
+    for key in &keys {
+        assert!(key.get("access_key_id").is_some());
+        assert!(key.get("secret_access_key").is_none());
+    }
+}
+
+#[tokio::test]
+async fn test_delete_api_key_revokes_access() {
+    let app = test_router().await;
+
+    // Create a key.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = body_string(response).await;
+    let key: ApiKeyResponse = serde_json::from_str(&body).unwrap();
+    let s3_bearer = format!("{}:{}", key.access_key_id, key.secret_access_key);
+
+    // Verify the key works for S3 operations.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/testobj")
+                .header("authorization", format!("Bearer {s3_bearer}"))
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Delete the key via admin endpoint.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/admin/keys/{}", key.access_key_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Verify the key no longer works.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/testobj2")
+                .header("authorization", format!("Bearer {s3_bearer}"))
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Verify listing shows zero keys.
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/admin/keys")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let body = body_string(response).await;
+    let keys: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert!(keys.is_empty());
+}
+
+#[tokio::test]
+async fn test_delete_nonexistent_api_key_returns_400() {
+    let app = test_router().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/admin/keys/SHOALDOESNOTEXIST1234")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+// -----------------------------------------------------------------------
+// S3 auth: access key ID + secret access key
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_s3_auth_required_no_header() {
+    let (app, _bearer) = test_router_with_key().await;
 
     // No auth header → 403.
     let response = app
@@ -518,16 +750,19 @@ async fn test_auth_required_no_header() {
 }
 
 #[tokio::test]
-async fn test_auth_required_wrong_secret() {
-    let app = test_router_with_auth("mysecret").await;
+async fn test_s3_auth_wrong_key_rejected() {
+    let (app, _bearer) = test_router_with_key().await;
 
-    // Wrong secret → 403.
+    // Wrong key pair → 403.
     let response = app
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/mybucket/key")
-                .header("authorization", "Bearer wrong")
+                .header(
+                    "authorization",
+                    "Bearer SHOALXXXXXXXXXXXXXXX:wrongsecretwrongsecretwrongsecretwrong",
+                )
                 .body(Body::from("data"))
                 .unwrap(),
         )
@@ -538,16 +773,16 @@ async fn test_auth_required_wrong_secret() {
 }
 
 #[tokio::test]
-async fn test_auth_correct_secret() {
-    let app = test_router_with_auth("mysecret").await;
+async fn test_s3_auth_correct_bearer_accepted() {
+    let (app, bearer) = test_router_with_key().await;
 
-    // Correct secret → 200.
+    // Correct bearer → 200.
     let response = app
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/mybucket/key")
-                .header("authorization", "Bearer mysecret")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from("data"))
                 .unwrap(),
         )
@@ -557,19 +792,39 @@ async fn test_auth_correct_secret() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn test_s3_without_key_always_rejected() {
+    // Even with no API keys created, S3 routes reject unauthenticated requests.
+    let app = test_router().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/mybucket/key")
+                .body(Body::from("data"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 // -----------------------------------------------------------------------
 // GET nonexistent → 404
 // -----------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_get_nonexistent_returns_404() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/doesnotexist")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -587,13 +842,14 @@ async fn test_get_nonexistent_returns_404() {
 
 #[tokio::test]
 async fn test_etag_is_blake3_hex() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("PUT")
                 .uri("/mybucket/etagtest")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from("test data"))
                 .unwrap(),
         )
@@ -616,7 +872,7 @@ async fn test_etag_is_blake3_hex() {
 
 #[tokio::test]
 async fn test_user_metadata_passthrough() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     // PUT with metadata.
     let _ = app
@@ -627,6 +883,7 @@ async fn test_user_metadata_passthrough() {
                 .uri("/mybucket/metadata-test")
                 .header("x-amz-meta-author", "alice")
                 .header("x-amz-meta-version", "2")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::from("content"))
                 .unwrap(),
         )
@@ -639,6 +896,7 @@ async fn test_user_metadata_passthrough() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/metadata-test")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -672,13 +930,14 @@ async fn test_user_metadata_passthrough() {
 
 #[tokio::test]
 async fn test_error_response_is_xml() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("GET")
                 .uri("/mybucket/nonexistent")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -725,7 +984,7 @@ fn test_xml_escape() {
 /// `max-keys` entirely and always returns all matching objects.
 #[tokio::test]
 async fn test_bug3_list_objects_max_keys_ignored() {
-    let app = test_router().await;
+    let (app, bearer) = test_router_with_key().await;
 
     // Write 5 objects with a shared prefix.
     for i in 0..5 {
@@ -735,6 +994,7 @@ async fn test_bug3_list_objects_max_keys_ignored() {
                 Request::builder()
                     .method("PUT")
                     .uri(format!("/mybucket/page/item-{i}"))
+                    .header("authorization", format!("Bearer {bearer}"))
                     .body(Body::from(format!("value-{i}")))
                     .unwrap(),
             )
@@ -749,6 +1009,7 @@ async fn test_bug3_list_objects_max_keys_ignored() {
             Request::builder()
                 .method("GET")
                 .uri("/mybucket?list-type=2&prefix=page/&max-keys=2")
+                .header("authorization", format!("Bearer {bearer}"))
                 .body(Body::empty())
                 .unwrap(),
         )

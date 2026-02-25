@@ -24,6 +24,7 @@ enum Backend {
         membership: Keyspace,
         repair_queue: Keyspace,
         peers: Keyspace,
+        api_keys: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -42,6 +43,8 @@ struct MemoryBackend {
     repair_queue: RwLock<BTreeMap<Vec<u8>, [u8; 32]>>,
     /// NodeId bytes → serialized Vec<SocketAddr>.
     peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
+    /// access_key_id (String) → secret_access_key (String).
+    api_keys: RwLock<HashMap<String, String>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -80,6 +83,7 @@ impl MetaStore {
                 membership: RwLock::new(HashMap::new()),
                 repair_queue: RwLock::new(BTreeMap::new()),
                 peers: RwLock::new(HashMap::new()),
+                api_keys: RwLock::new(HashMap::new()),
             })),
         }
     }
@@ -91,6 +95,7 @@ impl MetaStore {
         let membership = db.keyspace("membership", KeyspaceCreateOptions::default)?;
         let repair_queue = db.keyspace("repair_queue", KeyspaceCreateOptions::default)?;
         let peers = db.keyspace("peers", KeyspaceCreateOptions::default)?;
+        let api_keys = db.keyspace("api_keys", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -99,6 +104,7 @@ impl MetaStore {
             membership,
             repair_queue,
             peers,
+            api_keys,
         })
     }
 
@@ -439,6 +445,100 @@ impl MetaStore {
         }
         debug!(node_id = %node_id, "removed peer addresses");
         Ok(())
+    }
+
+    // ----- API keys (persistent, local to this node) -----
+
+    /// Store an API key pair. Overwrites if the access key already exists.
+    pub fn put_api_key(&self, access_key_id: &str, secret_access_key: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Fjall { api_keys, .. } => {
+                api_keys.insert(access_key_id.as_bytes(), secret_access_key.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.api_keys
+                    .write()
+                    .unwrap()
+                    .insert(access_key_id.to_string(), secret_access_key.to_string());
+            }
+        }
+        debug!(access_key_id, "stored api key");
+        Ok(())
+    }
+
+    /// Retrieve the secret for a given access key ID.
+    pub fn get_api_key(&self, access_key_id: &str) -> Result<Option<String>> {
+        match &self.backend {
+            Backend::Fjall { api_keys, .. } => {
+                let Some(value) = api_keys.get(access_key_id.as_bytes())? else {
+                    return Ok(None);
+                };
+                let secret = String::from_utf8(value.to_vec()).map_err(|e| {
+                    MetaError::CorruptData(format!("api key secret is not UTF-8: {e}"))
+                })?;
+                Ok(Some(secret))
+            }
+            Backend::Memory(m) => Ok(m.api_keys.read().unwrap().get(access_key_id).cloned()),
+        }
+    }
+
+    /// Delete an API key pair by access key ID.
+    pub fn delete_api_key(&self, access_key_id: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Fjall { api_keys, .. } => {
+                api_keys.remove(access_key_id.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.api_keys.write().unwrap().remove(access_key_id);
+            }
+        }
+        debug!(access_key_id, "deleted api key");
+        Ok(())
+    }
+
+    /// List all access key IDs (secrets are NOT returned).
+    pub fn list_api_key_ids(&self) -> Result<Vec<String>> {
+        match &self.backend {
+            Backend::Fjall { api_keys, .. } => {
+                let mut result = Vec::new();
+
+                for guard in api_keys.iter() {
+                    let (k, _v) = guard.into_inner()?;
+                    let key_id = String::from_utf8(k.to_vec()).map_err(|e| {
+                        MetaError::CorruptData(format!("api key ID is not UTF-8: {e}"))
+                    })?;
+                    result.push(key_id);
+                }
+
+                Ok(result)
+            }
+            Backend::Memory(m) => Ok(m.api_keys.read().unwrap().keys().cloned().collect()),
+        }
+    }
+
+    /// Load all API key pairs into a HashMap.
+    ///
+    /// Used at startup to populate the in-memory auth cache.
+    pub fn load_all_api_keys(&self) -> Result<HashMap<String, String>> {
+        match &self.backend {
+            Backend::Fjall { api_keys, .. } => {
+                let mut result = HashMap::new();
+
+                for guard in api_keys.iter() {
+                    let (k, v) = guard.into_inner()?;
+                    let key_id = String::from_utf8(k.to_vec()).map_err(|e| {
+                        MetaError::CorruptData(format!("api key ID is not UTF-8: {e}"))
+                    })?;
+                    let secret = String::from_utf8(v.to_vec()).map_err(|e| {
+                        MetaError::CorruptData(format!("api key secret is not UTF-8: {e}"))
+                    })?;
+                    result.insert(key_id, secret);
+                }
+
+                Ok(result)
+            }
+            Backend::Memory(m) => Ok(m.api_keys.read().unwrap().clone()),
+        }
     }
 
     // ----- Repair queue (local, transient) -----
