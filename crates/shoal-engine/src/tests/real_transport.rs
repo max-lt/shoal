@@ -21,7 +21,7 @@ use iroh_quinn::TokioRuntime;
 use rustls_pki_types::PrivateKeyDer;
 use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
-use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, ShoalTransport, Transport};
+use shoal_net::{NetError, ShoalMessage, ShoalTransport, Transport};
 use shoal_store::{MemoryStore, ShardStore};
 use shoal_types::*;
 use tokio::sync::{Mutex, RwLock};
@@ -227,12 +227,11 @@ impl Transport for QuinnTransport {
         Self::send_message(&conn, msg).await
     }
 
-    async fn pull_manifest(
+    async fn pull_manifests(
         &self,
         addr: iroh::EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError> {
+        manifest_ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, Vec<u8>)>, NetError> {
         let sock = self
             .resolve(&addr)
             .await
@@ -245,50 +244,14 @@ impl Transport for QuinnTransport {
             .map_err(|e| NetError::StreamOpen(e.to_string()))?;
 
         let request = ShoalMessage::ManifestRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            manifest_ids: manifest_ids.to_vec(),
         };
         Self::send_on_stream(&mut send, &request).await?;
 
         let response = Self::recv_message(&mut recv).await?;
 
         match response {
-            ShoalMessage::ManifestResponse {
-                manifest_bytes: Some(bytes),
-                ..
-            } => Ok(Some(bytes)),
-            ShoalMessage::ManifestResponse {
-                manifest_bytes: None,
-                ..
-            } => Ok(None),
-            other => Err(NetError::Serialization(format!(
-                "unexpected response: {other:?}"
-            ))),
-        }
-    }
-
-    async fn pull_all_manifests(
-        &self,
-        addr: iroh::EndpointAddr,
-    ) -> Result<Vec<ManifestSyncEntry>, NetError> {
-        let sock = self
-            .resolve(&addr)
-            .await
-            .ok_or_else(|| NetError::Connect("unknown peer".into()))?;
-        let conn = self.get_connection(sock).await?;
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
-
-        let request = ShoalMessage::ManifestSyncRequest;
-        Self::send_on_stream(&mut send, &request).await?;
-
-        let response = Self::recv_message(&mut recv).await?;
-
-        match response {
-            ShoalMessage::ManifestSyncResponse { entries } => Ok(entries),
+            ShoalMessage::ManifestResponse { manifests } => Ok(manifests),
             other => Err(NetError::Serialization(format!(
                 "unexpected response: {other:?}"
             ))),
@@ -299,9 +262,9 @@ impl Transport for QuinnTransport {
         &self,
         _addr: iroh::EndpointAddr,
         _my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         // Not needed for these tests.
-        Ok((vec![], vec![]))
+        Ok(vec![])
     }
 
     async fn pull_log_sync(
@@ -309,9 +272,18 @@ impl Transport for QuinnTransport {
         _addr: iroh::EndpointAddr,
         _entry_hashes: &[[u8; 32]],
         _my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         // Not needed for these tests.
-        Ok((vec![], vec![]))
+        Ok(vec![])
+    }
+
+    async fn pull_api_keys(
+        &self,
+        _addr: iroh::EndpointAddr,
+        _access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError> {
+        // Not needed for these tests.
+        Ok(vec![])
     }
 }
 
@@ -322,9 +294,9 @@ impl Transport for QuinnTransport {
 /// Spawn a protocol handler loop for incoming connections on a quinn endpoint.
 ///
 /// Mirrors the production `ShoalProtocol` handler in `shoald/src/handler.rs`:
-/// - Uni streams: `ManifestPut`
+/// - Uni streams: `LogEntryBroadcast` (fire-and-forget)
 /// - Bi streams: `ShardPush`→`ShardPushAck`, `ShardRequest`→`ShardResponse`,
-///   `ManifestRequest`→`ManifestResponse`, `ManifestSyncRequest`→`ManifestSyncResponse`
+///   `ManifestRequest`→`ManifestResponse`, `ApiKeyRequest`→`ApiKeyResponse`
 fn spawn_protocol_handler(
     endpoint: iroh_quinn::Endpoint,
     store: Arc<dyn ShardStore>,
@@ -337,28 +309,14 @@ fn spawn_protocol_handler(
                 Err(_) => continue,
             };
 
-            // Spawn uni-stream handler (ManifestPut only — ShardPush moved to bi-stream).
+            // Spawn uni-stream handler (LogEntryBroadcast, etc.).
             let conn_uni = conn.clone();
-            let meta_uni = meta.clone();
             tokio::spawn(async move {
                 while let Ok(mut recv) = conn_uni.accept_uni().await {
-                    let Ok(msg) = QuinnTransport::recv_message(&mut recv).await else {
+                    let Ok(_msg) = QuinnTransport::recv_message(&mut recv).await else {
                         break;
                     };
-                    match msg {
-                        ShoalMessage::ManifestPut {
-                            bucket,
-                            key,
-                            manifest_bytes,
-                        } => {
-                            if let Ok(manifest) = postcard::from_bytes::<Manifest>(&manifest_bytes)
-                            {
-                                let _ = meta_uni.put_manifest(&manifest);
-                                let _ = meta_uni.put_object_key(&bucket, &key, &manifest.object_id);
-                            }
-                        }
-                        _ => {}
-                    }
+                    // No uni-stream messages need handling in these tests.
                 }
             });
 
@@ -385,38 +343,32 @@ fn spawn_protocol_handler(
                                     data: data.map(|b| b.to_vec()),
                                 })
                             }
-                            ShoalMessage::ManifestRequest { bucket, key } => {
-                                let manifest_bytes = meta
-                                    .get_object_key(&bucket, &key)
-                                    .ok()
-                                    .flatten()
-                                    .and_then(|oid| meta.get_manifest(&oid).ok().flatten())
-                                    .and_then(|m| postcard::to_allocvec(&m).ok());
-                                Some(ShoalMessage::ManifestResponse {
-                                    bucket,
-                                    key,
-                                    manifest_bytes,
-                                })
-                            }
-                            ShoalMessage::ManifestSyncRequest => {
-                                let entries = meta
-                                    .list_all_object_entries()
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter_map(|(bucket, key, oid)| {
-                                        let manifest = meta.get_manifest(&oid).ok().flatten()?;
+                            ShoalMessage::ManifestRequest { manifest_ids } => {
+                                let manifests: Vec<(ObjectId, Vec<u8>)> = manifest_ids
+                                    .iter()
+                                    .filter_map(|oid| {
+                                        let manifest = meta.get_manifest(oid).ok().flatten()?;
                                         let bytes = postcard::to_allocvec(&manifest).ok()?;
-                                        Some(ManifestSyncEntry {
-                                            bucket,
-                                            key,
-                                            manifest_bytes: bytes,
-                                        })
+                                        Some((*oid, bytes))
                                     })
                                     .collect();
-                                Some(ShoalMessage::ManifestSyncResponse { entries })
+                                Some(ShoalMessage::ManifestResponse { manifests })
+                            }
+                            ShoalMessage::ApiKeyRequest { access_key_ids } => {
+                                let keys: Vec<(String, String)> = access_key_ids
+                                    .iter()
+                                    .filter_map(|kid| {
+                                        meta.get_api_key(kid)
+                                            .ok()
+                                            .flatten()
+                                            .map(|s| (kid.clone(), s))
+                                    })
+                                    .collect();
+                                Some(ShoalMessage::ApiKeyResponse { keys })
                             }
                             _ => None,
                         };
+
                         if let Some(resp) = response {
                             let _ = QuinnTransport::send_on_stream(&mut send, &resp).await;
                         }
@@ -462,8 +414,10 @@ struct QuicTestCluster {
     nodes: Vec<ShoalNode>,
     #[allow(dead_code)]
     node_ids: Vec<NodeId>,
+    #[allow(dead_code)]
     transports: Vec<Arc<QuinnTransport>>,
     /// EndpointAddrs for address book lookups (keyed by iroh identity).
+    #[allow(dead_code)]
     endpoint_addrs: Vec<iroh::EndpointAddr>,
     #[allow(dead_code)]
     cluster: Arc<ClusterState>,
@@ -601,29 +555,23 @@ impl QuicTestCluster {
         &self.nodes[i]
     }
 
-    /// Broadcast a manifest from one node to all others over real QUIC.
+    /// Broadcast a manifest from one node to all others.
+    ///
+    /// In the new architecture, manifests are synced via the LogTree, not via
+    /// `ManifestPut` QUIC messages. For these tests we directly write the
+    /// manifest into each peer's MetaStore (same approach as the mock cluster).
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
         let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
-        let manifest_bytes = postcard::to_allocvec(&manifest).unwrap();
 
-        let msg = ShoalMessage::ManifestPut {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            manifest_bytes,
-        };
-
-        let transport = &self.transports[from];
-        for (i, addr) in self.endpoint_addrs.iter().enumerate() {
+        for (i, node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;
             }
-            if let Err(e) = transport.send_to(addr.clone(), &msg).await {
-                warn!(%e, "failed to broadcast manifest to node {i}");
-            }
+            node.meta().put_manifest(&manifest).unwrap();
+            node.meta()
+                .put_object_key(bucket, key, &manifest.object_id)
+                .unwrap();
         }
-
-        // Wait for broadcasts to be processed.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 
@@ -702,7 +650,7 @@ async fn test_quic_cross_node_manifest_sync() {
         .await
         .unwrap();
 
-    // Broadcast manifest over real QUIC uni streams.
+    // Broadcast manifest to other nodes.
     c.broadcast_manifest(0, "bucket", "cross").await;
 
     // GET from node 1.
@@ -761,74 +709,7 @@ async fn test_quic_concurrent_writes() {
     }
 }
 
-/// 3e. Manifest sync from peers via bi-directional QUIC streams.
-///
-/// Simulates a late-joining node: node 3 loses its metadata (mimicking a
-/// cold start) and must recover all manifests by pulling from peers over
-/// real QUIC bi-directional streams.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ntest::timeout(30000)]
-async fn test_quic_manifest_sync_from_peers() {
-    let c = QuicTestCluster::new(4, 4096, 2, 2).await;
-
-    // PUT 5 objects on node 0.
-    // put_object broadcasts manifests to all peers (including node 3).
-    let mut objects = Vec::new();
-    for i in 0..5 {
-        let key = format!("sync-{i}");
-        let data = test_data(3000 + i * 500);
-        c.node(0)
-            .put_object("bucket", &key, &data, BTreeMap::new())
-            .await
-            .unwrap();
-        objects.push((key, data));
-    }
-
-    // Manifest broadcasts are uni-stream (fire-and-forget), so a short
-    // yield is sufficient for the async runtime to process them.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-    // Verify all nodes received manifests via broadcast.
-    for i in 0..4 {
-        for (key, _) in &objects {
-            assert!(
-                c.node(i).head_object("bucket", key).await.is_ok(),
-                "node {i} should have manifest for {key} after broadcast"
-            );
-        }
-    }
-
-    // Simulate node 3 losing its metadata (cold restart / data loss).
-    for (key, _) in &objects {
-        c.node(3).meta().delete_object_key("bucket", key).unwrap();
-    }
-
-    // Verify node 3 no longer has any object keys.
-    for (key, _) in &objects {
-        assert!(
-            c.node(3)
-                .meta()
-                .get_object_key("bucket", key)
-                .unwrap()
-                .is_none(),
-            "node 3 should have lost {key}"
-        );
-    }
-
-    // Node 3 syncs manifests from peers via bi-directional QUIC streams.
-    let synced = c.node(3).sync_manifests_from_peers().await.unwrap();
-    assert!(
-        synced >= 5,
-        "expected at least 5 synced manifests, got {synced}"
-    );
-
-    // GET all 5 from node 3 — shards fetched via real QUIC.
-    for (key, expected) in &objects {
-        let (got, _) = c
-            .node(3)
-            .get_object("bucket", key)
-            .await
-            .unwrap_or_else(|e| panic!("GET {key} from node 3 failed: {e}"));
-        assert_eq!(&got, expected, "data mismatch for key {key} on node 3");
-    }
-}
+// NOTE: The old `test_quic_manifest_sync_from_peers` test was removed because
+// it relied on `ManifestSyncRequest`/`ManifestSyncResponse` and `pull_all_manifests`,
+// which have been removed. Manifest sync now happens via the LogTree (pull_log_entries).
+// LogTree-based sync is tested in the `networked` test module.

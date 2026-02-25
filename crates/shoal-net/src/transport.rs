@@ -338,16 +338,15 @@ impl ShoalTransport {
         }
     }
 
-    /// Request a manifest from a remote node by bucket/key.
+    /// Batch-request manifests from a remote node by ObjectId.
     ///
     /// Opens a bidirectional stream: sends a `ManifestRequest`, receives a
-    /// `ManifestResponse`. Returns the raw manifest bytes if found.
-    pub async fn pull_manifest(
+    /// `ManifestResponse`. Returns (ObjectId, raw manifest bytes) pairs.
+    pub async fn pull_manifests(
         &self,
         addr: EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError> {
+        manifest_ids: &[shoal_types::ObjectId],
+    ) -> Result<Vec<(shoal_types::ObjectId, Vec<u8>)>, NetError> {
         let conn = self.get_connection(addr).await?;
 
         let (mut send, mut recv) = conn
@@ -356,8 +355,7 @@ impl ShoalTransport {
             .map_err(|e| NetError::StreamOpen(e.to_string()))?;
 
         let request = ShoalMessage::ManifestRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            manifest_ids: manifest_ids.to_vec(),
         };
         let payload =
             postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
@@ -369,17 +367,10 @@ impl ShoalTransport {
         let response = Self::recv_message(&mut recv).await?;
 
         match response {
-            ShoalMessage::ManifestResponse {
-                manifest_bytes: Some(bytes),
-                ..
-            } => {
-                debug!(%bucket, %key, "pulled manifest from peer");
-                Ok(Some(bytes))
+            ShoalMessage::ManifestResponse { manifests } => {
+                debug!(count = manifests.len(), "pulled manifests from peer");
+                Ok(manifests)
             }
-            ShoalMessage::ManifestResponse {
-                manifest_bytes: None,
-                ..
-            } => Ok(None),
             other => Err(NetError::Serialization(format!(
                 "unexpected response type: {other:?}"
             ))),
@@ -488,52 +479,16 @@ impl ShoalTransport {
         Ok(())
     }
 
-    /// Pull all manifests from a remote peer (bulk sync).
-    ///
-    /// Opens a bidirectional stream: sends a `ManifestSyncRequest`, receives a
-    /// `ManifestSyncResponse`. Used to catch up on historical manifests when
-    /// a node joins the cluster.
-    pub async fn pull_all_manifests(
-        &self,
-        addr: EndpointAddr,
-    ) -> Result<Vec<crate::ManifestSyncEntry>, NetError> {
-        let conn = self.get_connection(addr).await?;
-
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
-
-        let request = ShoalMessage::ManifestSyncRequest;
-        let payload =
-            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
-        send.write_all(&(payload.len() as u32).to_be_bytes())
-            .await?;
-        send.write_all(&payload).await?;
-        send.finish()?;
-
-        let response = Self::recv_message(&mut recv).await?;
-
-        match response {
-            ShoalMessage::ManifestSyncResponse { entries } => {
-                debug!(count = entries.len(), "received manifest sync response");
-                Ok(entries)
-            }
-            other => Err(NetError::Serialization(format!(
-                "unexpected response type: {other:?}"
-            ))),
-        }
-    }
-
     /// Pull missing log entries from a remote peer.
     ///
     /// Opens a bidirectional stream: sends a `LogSyncRequest` with our tips,
-    /// receives a `LogSyncResponse` with entries and manifests we're missing.
+    /// receives a `LogSyncResponse` with entries we're missing.
+    /// Manifests are pulled separately via `pull_manifests`.
     pub async fn pull_log_entries(
         &self,
         addr: EndpointAddr,
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         let conn = self.get_connection(addr).await?;
 
         let (mut send, mut recv) = conn
@@ -554,13 +509,9 @@ impl ShoalTransport {
         let response = Self::recv_message(&mut recv).await?;
 
         match response {
-            ShoalMessage::LogSyncResponse { entries, manifests } => {
-                debug!(
-                    entries = entries.len(),
-                    manifests = manifests.len(),
-                    "received log sync response"
-                );
-                Ok((entries, manifests))
+            ShoalMessage::LogSyncResponse { entries } => {
+                debug!(entries = entries.len(), "received log sync response");
+                Ok(entries)
             }
             other => Err(NetError::Serialization(format!(
                 "unexpected response type: {other:?}"
@@ -572,12 +523,13 @@ impl ShoalTransport {
     ///
     /// Opens a bidirectional stream: sends a `LogSyncPull`, receives a
     /// `LogSyncPullResponse` with the transitive closure of entries.
+    /// Manifests are pulled separately via `pull_manifests`.
     pub async fn pull_log_sync(
         &self,
         addr: EndpointAddr,
         entry_hashes: &[[u8; 32]],
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         let conn = self.get_connection(addr).await?;
 
         let (mut send, mut recv) = conn
@@ -599,13 +551,48 @@ impl ShoalTransport {
         let response = Self::recv_message(&mut recv).await?;
 
         match response {
-            ShoalMessage::LogSyncPullResponse { entries, manifests } => {
-                debug!(
-                    entries = entries.len(),
-                    manifests = manifests.len(),
-                    "received log sync pull response"
-                );
-                Ok((entries, manifests))
+            ShoalMessage::LogSyncPullResponse { entries } => {
+                debug!(entries = entries.len(), "received log sync pull response");
+                Ok(entries)
+            }
+            other => Err(NetError::Serialization(format!(
+                "unexpected response type: {other:?}"
+            ))),
+        }
+    }
+
+    /// Batch-request API key secrets from a remote node.
+    ///
+    /// Opens a bidirectional stream: sends an `ApiKeyRequest`, receives an
+    /// `ApiKeyResponse`. Returns (access_key_id, secret_access_key) pairs.
+    pub async fn pull_api_keys(
+        &self,
+        addr: EndpointAddr,
+        access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        let request = ShoalMessage::ApiKeyRequest {
+            access_key_ids: access_key_ids.to_vec(),
+        };
+        let payload =
+            postcard::to_allocvec(&request).map_err(|e| NetError::Serialization(e.to_string()))?;
+        send.write_all(&(payload.len() as u32).to_be_bytes())
+            .await?;
+        send.write_all(&payload).await?;
+        send.finish()?;
+
+        let response = Self::recv_message(&mut recv).await?;
+
+        match response {
+            ShoalMessage::ApiKeyResponse { keys } => {
+                debug!(count = keys.len(), "pulled api keys from peer");
+                Ok(keys)
             }
             other => Err(NetError::Serialization(format!(
                 "unexpected response type: {other:?}"
@@ -646,27 +633,19 @@ impl crate::Transport for ShoalTransport {
         self.send_to(addr, msg).await
     }
 
-    async fn pull_manifest(
+    async fn pull_manifests(
         &self,
         addr: EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, crate::NetError> {
-        self.pull_manifest(addr, bucket, key).await
-    }
-
-    async fn pull_all_manifests(
-        &self,
-        addr: EndpointAddr,
-    ) -> Result<Vec<crate::ManifestSyncEntry>, crate::NetError> {
-        self.pull_all_manifests(addr).await
+        manifest_ids: &[shoal_types::ObjectId],
+    ) -> Result<Vec<(shoal_types::ObjectId, Vec<u8>)>, crate::NetError> {
+        self.pull_manifests(addr, manifest_ids).await
     }
 
     async fn pull_log_entries(
         &self,
         addr: EndpointAddr,
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), crate::NetError> {
+    ) -> Result<Vec<Vec<u8>>, crate::NetError> {
         self.pull_log_entries(addr, my_tips).await
     }
 
@@ -675,7 +654,15 @@ impl crate::Transport for ShoalTransport {
         addr: EndpointAddr,
         entry_hashes: &[[u8; 32]],
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), crate::NetError> {
+    ) -> Result<Vec<Vec<u8>>, crate::NetError> {
         self.pull_log_sync(addr, entry_hashes, my_tips).await
+    }
+
+    async fn pull_api_keys(
+        &self,
+        addr: EndpointAddr,
+        access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, crate::NetError> {
+        self.pull_api_keys(addr, access_key_ids).await
     }
 }

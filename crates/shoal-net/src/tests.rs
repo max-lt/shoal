@@ -8,7 +8,7 @@ mod tests {
     use bytes::Bytes;
     use iroh_quinn::TokioRuntime;
     use rustls_pki_types::PrivateKeyDer;
-    use shoal_types::{ClusterEvent, Member, MemberState, NodeId, NodeTopology, ShardId};
+    use shoal_types::{ClusterEvent, Member, MemberState, NodeId, NodeTopology, ObjectId, ShardId};
 
     use crate::cluster_alpn;
     use crate::message::ShoalMessage;
@@ -380,22 +380,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_message_roundtrip_manifest_put() {
-        let msg = ShoalMessage::ManifestPut {
-            bucket: "my-bucket".to_string(),
-            key: "photos/cat.jpg".to_string(),
-            manifest_bytes: vec![1, 2, 3, 4, 5],
-        };
-        let encoded = postcard::to_allocvec(&msg).unwrap();
-        let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(msg, decoded);
-    }
-
-    #[tokio::test]
     async fn test_message_roundtrip_manifest_request() {
         let msg = ShoalMessage::ManifestRequest {
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
+            manifest_ids: vec![
+                ObjectId::from_data(b"manifest-1"),
+                ObjectId::from_data(b"manifest-2"),
+            ],
         };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
@@ -405,9 +395,10 @@ mod tests {
     #[tokio::test]
     async fn test_message_roundtrip_manifest_response_some() {
         let msg = ShoalMessage::ManifestResponse {
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            manifest_bytes: Some(vec![10, 20, 30]),
+            manifests: vec![
+                (ObjectId::from_data(b"obj-1"), vec![10, 20, 30]),
+                (ObjectId::from_data(b"obj-2"), vec![40, 50]),
+            ],
         };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
@@ -415,12 +406,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_message_roundtrip_manifest_response_none() {
-        let msg = ShoalMessage::ManifestResponse {
-            bucket: "bucket".to_string(),
-            key: "key".to_string(),
-            manifest_bytes: None,
-        };
+    async fn test_message_roundtrip_manifest_response_empty() {
+        let msg = ShoalMessage::ManifestResponse { manifests: vec![] };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -510,11 +497,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_message_empty_manifest_bytes() {
-        let msg = ShoalMessage::ManifestPut {
-            bucket: String::new(),
-            key: String::new(),
-            manifest_bytes: vec![],
+    async fn test_message_empty_manifest_request() {
+        let msg = ShoalMessage::ManifestRequest {
+            manifest_ids: vec![],
         };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();

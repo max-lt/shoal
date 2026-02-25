@@ -70,16 +70,32 @@ pub(crate) struct AppState {
 /// Authentication middleware for S3 data-plane routes.
 ///
 /// Verifies AWS Signature V4 (`Authorization: AWS4-HMAC-SHA256 ...`) against
-/// the stored API keys. Constant-time signature comparison prevents timing
-/// attacks.
+/// the stored API keys. If the key is not found locally, falls back to a
+/// QUIC peer pull via `engine.lookup_api_key()` before rejecting.
+/// Constant-time signature comparison prevents timing attacks.
 async fn auth_middleware(
     State(state): State<AppState>,
     request: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
-    let keys = state.engine.meta().load_all_api_keys().unwrap_or_default();
+    let mut keys = state.engine.meta().load_all_api_keys().unwrap_or_default();
 
+    // If SigV4 fails, try pulling the missing key from peers before rejecting.
     if let Err(_e) = auth::verify_sigv4(&request, &keys) {
+        // Extract the access_key_id from the Authorization header to try a peer pull.
+        if let Some(access_key_id) = auth::extract_access_key_id(&request) {
+            if !keys.contains_key(&access_key_id) {
+                if let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await {
+                    keys.insert(access_key_id, secret);
+
+                    // Retry verification with the newly fetched key.
+                    if auth::verify_sigv4(&request, &keys).is_ok() {
+                        return Ok(next.run(request).await);
+                    }
+                }
+            }
+        }
+
         warn!("unauthorized S3 request");
         return Err(S3Error::AccessDenied);
     }

@@ -12,7 +12,7 @@ use bytes::Bytes;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
+use shoal_net::{NetError, ShoalMessage, Transport};
 use shoal_types::{NodeId, ObjectId, ShardId};
 use tokio::sync::RwLock;
 
@@ -209,29 +209,20 @@ impl Transport for ChaosTransport {
         self.inner.send_to(addr, msg).await
     }
 
-    async fn pull_manifest(
+    async fn pull_manifests(
         &self,
         addr: iroh::EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError> {
+        manifest_ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, Vec<u8>)>, NetError> {
         self.apply_chaos(&addr).await?;
-        self.inner.pull_manifest(addr, bucket, key).await
-    }
-
-    async fn pull_all_manifests(
-        &self,
-        addr: iroh::EndpointAddr,
-    ) -> Result<Vec<ManifestSyncEntry>, NetError> {
-        self.apply_chaos(&addr).await?;
-        self.inner.pull_all_manifests(addr).await
+        self.inner.pull_manifests(addr, manifest_ids).await
     }
 
     async fn pull_log_entries(
         &self,
         addr: iroh::EndpointAddr,
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         self.apply_chaos(&addr).await?;
         self.inner.pull_log_entries(addr, my_tips).await
     }
@@ -241,8 +232,17 @@ impl Transport for ChaosTransport {
         addr: iroh::EndpointAddr,
         entry_hashes: &[[u8; 32]],
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         self.apply_chaos(&addr).await?;
         self.inner.pull_log_sync(addr, entry_hashes, my_tips).await
+    }
+
+    async fn pull_api_keys(
+        &self,
+        addr: iroh::EndpointAddr,
+        access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError> {
+        self.apply_chaos(&addr).await?;
+        self.inner.pull_api_keys(addr, access_key_ids).await
     }
 }

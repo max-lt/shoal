@@ -53,6 +53,11 @@ pub trait ShoalEngine: Send + Sync {
     /// Delete an API key, persist the deletion, and replicate via LogTree+gossip.
     async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError>;
 
+    /// Look up an API key secret, falling back to QUIC peer pull if not found locally.
+    ///
+    /// Returns `Some(secret)` if found, `None` if no peer has it.
+    async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError>;
+
     /// Return a reference to the metadata store.
     ///
     /// Protocol adapters use this for admin operations (API key management,

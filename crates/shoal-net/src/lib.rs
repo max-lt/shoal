@@ -16,7 +16,7 @@ mod tests;
 mod transport;
 
 pub use error::NetError;
-pub use message::{ManifestSyncEntry, ShoalMessage};
+pub use message::ShoalMessage;
 pub use transport::ShoalTransport;
 
 /// Trait abstracting the network transport operations used by the engine.
@@ -44,42 +44,46 @@ pub trait Transport: Send + Sync {
     /// Send a message to a remote node (uni-directional).
     async fn send_to(&self, addr: iroh::EndpointAddr, msg: &ShoalMessage) -> Result<(), NetError>;
 
-    /// Pull a manifest from a remote node.
-    async fn pull_manifest(
-        &self,
-        addr: iroh::EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError>;
-
-    /// Pull all manifests from a remote node (bulk sync for catch-up).
+    /// Pull manifests by ObjectId from a remote node (batch).
     ///
-    /// Returns a list of `(bucket, key, manifest_bytes)` entries.
-    async fn pull_all_manifests(
+    /// Returns pairs of (ObjectId, postcard-serialized Manifest) for found manifests.
+    async fn pull_manifests(
         &self,
         addr: iroh::EndpointAddr,
-    ) -> Result<Vec<ManifestSyncEntry>, NetError>;
+        manifest_ids: &[shoal_types::ObjectId],
+    ) -> Result<Vec<(shoal_types::ObjectId, Vec<u8>)>, NetError>;
 
     /// Pull missing log entries from a remote node.
     ///
-    /// Sends our tip hashes, receives entries and manifests we are missing.
+    /// Sends our tip hashes, receives entries we are missing.
+    /// Manifests are pulled separately via `pull_manifests`.
     async fn pull_log_entries(
         &self,
         addr: iroh::EndpointAddr,
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError>;
+    ) -> Result<Vec<Vec<u8>>, NetError>;
 
     /// Targeted pull: request specific entries and their ancestor chain.
     ///
     /// Sends the hashes of entries we need (e.g. missing parents from the
     /// pending buffer) plus our tips. The responder walks backward from
     /// `entry_hashes` and returns the transitive closure up to our tips.
+    /// Manifests are pulled separately via `pull_manifests`.
     async fn pull_log_sync(
         &self,
         addr: iroh::EndpointAddr,
         entry_hashes: &[[u8; 32]],
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError>;
+    ) -> Result<Vec<Vec<u8>>, NetError>;
+
+    /// Pull API key secrets by access_key_id from a remote node (batch).
+    ///
+    /// Returns pairs of (access_key_id, secret_access_key) for found keys.
+    async fn pull_api_keys(
+        &self,
+        addr: iroh::EndpointAddr,
+        access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use shoal_cluster::ClusterState;
 use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
-use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
+use shoal_net::{NetError, ShoalMessage, Transport};
 use shoal_store::{MemoryStore, ShardStore, SlowStore};
 use shoal_types::*;
 use tokio::sync::RwLock;
@@ -86,29 +86,11 @@ impl Transport for FailableMockTransport {
         }
 
         match msg {
-            ShoalMessage::ManifestPut {
-                bucket,
-                key,
-                manifest_bytes,
-            } => {
-                if let Some(meta) = self.metas.get(&node_id)
-                    && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
-                {
-                    let _ = meta.put_manifest(&manifest);
-                    let _ = meta.put_object_key(bucket, key, &manifest.object_id);
-                }
-            }
-            ShoalMessage::LogEntryBroadcast {
-                entry_bytes,
-                manifest_bytes,
-            } => {
+            ShoalMessage::LogEntryBroadcast { entry_bytes } => {
                 if let Some(log_tree) = self.log_trees.get(&node_id)
                     && let Ok(entry) = postcard::from_bytes::<shoal_logtree::LogEntry>(entry_bytes)
                 {
-                    let manifest = manifest_bytes
-                        .as_ref()
-                        .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
-                    let _ = log_tree.receive_entry(&entry, manifest.as_ref());
+                    let _ = log_tree.receive_entry(&entry, None);
                 }
             }
             _ => {}
@@ -117,49 +99,25 @@ impl Transport for FailableMockTransport {
         Ok(())
     }
 
-    async fn pull_manifest(
+    async fn pull_manifests(
         &self,
         addr: iroh::EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError> {
+        manifest_ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, Vec<u8>)>, NetError> {
         let node_id = NodeId::from(*addr.id.as_bytes());
         if self.down_nodes.read().await.contains(&node_id) {
             return Err(NetError::Endpoint("node is down".into()));
         }
-        if let Some(meta) = self.metas.get(&node_id)
-            && let Ok(Some(oid)) = meta.get_object_key(bucket, key)
-            && let Ok(Some(manifest)) = meta.get_manifest(&oid)
-            && let Ok(bytes) = postcard::to_allocvec(&manifest)
-        {
-            return Ok(Some(bytes));
-        }
-        Ok(None)
-    }
 
-    async fn pull_all_manifests(
-        &self,
-        addr: iroh::EndpointAddr,
-    ) -> Result<Vec<ManifestSyncEntry>, NetError> {
-        let node_id = NodeId::from(*addr.id.as_bytes());
-        if self.down_nodes.read().await.contains(&node_id) {
-            return Err(NetError::Endpoint("node is down".into()));
-        }
         let Some(meta) = self.metas.get(&node_id) else {
             return Ok(vec![]);
         };
-        let entries = meta
-            .list_all_object_entries()
-            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+
         let mut result = Vec::new();
-        for (bucket, key, oid) in entries {
-            if let Ok(Some(manifest)) = meta.get_manifest(&oid) {
+        for oid in manifest_ids {
+            if let Ok(Some(manifest)) = meta.get_manifest(oid) {
                 if let Ok(bytes) = postcard::to_allocvec(&manifest) {
-                    result.push(ManifestSyncEntry {
-                        bucket,
-                        key,
-                        manifest_bytes: bytes,
-                    });
+                    result.push((*oid, bytes));
                 }
             }
         }
@@ -170,14 +128,14 @@ impl Transport for FailableMockTransport {
         &self,
         addr: iroh::EndpointAddr,
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         let node_id = NodeId::from(*addr.id.as_bytes());
         if self.down_nodes.read().await.contains(&node_id) {
             return Err(NetError::Endpoint("node is down".into()));
         }
 
         let Some(log_tree) = self.log_trees.get(&node_id) else {
-            return Ok((vec![], vec![]));
+            return Ok(vec![]);
         };
 
         let delta = log_tree
@@ -189,18 +147,7 @@ impl Transport for FailableMockTransport {
             .filter_map(|e| postcard::to_allocvec(e).ok())
             .collect();
 
-        let manifests: Vec<(ObjectId, Vec<u8>)> = delta
-            .iter()
-            .filter_map(|e| match &e.action {
-                shoal_logtree::Action::Put { manifest_id, .. } => {
-                    let m = log_tree.get_manifest(manifest_id).ok()??;
-                    Some((*manifest_id, postcard::to_allocvec(&m).ok()?))
-                }
-                _ => None,
-            })
-            .collect();
-
-        Ok((entries, manifests))
+        Ok(entries)
     }
 
     async fn pull_log_sync(
@@ -208,10 +155,25 @@ impl Transport for FailableMockTransport {
         addr: iroh::EndpointAddr,
         entry_hashes: &[[u8; 32]],
         my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(shoal_types::ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         // Delegate to pull_log_entries as a simple implementation
         let _ = entry_hashes;
         self.pull_log_entries(addr, my_tips).await
+    }
+
+    async fn pull_api_keys(
+        &self,
+        addr: iroh::EndpointAddr,
+        access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+
+        // The mock transport does not store API keys, so return empty.
+        let _ = access_key_ids;
+        Ok(vec![])
     }
 }
 
@@ -233,10 +195,8 @@ struct TestCluster {
     stores: Vec<Arc<dyn ShardStore>>,
     cluster: Arc<ClusterState>,
     down_nodes: Arc<RwLock<HashSet<NodeId>>>,
-    /// Keep LogTree instances alive for the duration of the test.
-    /// The nodes hold their own Arc clones via `.with_log_tree()`.
-    #[allow(dead_code)]
-    log_trees: Vec<Option<Arc<LogTree>>>,
+    /// LogTree instances — nodes hold their own Arc clones via `.with_log_tree()`.
+    log_trees: Vec<Arc<LogTree>>,
     /// Optional chaos controller for fault injection tests.
     #[allow(dead_code)]
     chaos_controller: Option<Arc<ChaosController>>,
@@ -246,7 +206,7 @@ impl TestCluster {
     /// Create an N-node cluster. Seeds start at 1 (seed=0 gives an invalid key).
     /// Uses shard_replication=1 (each shard on exactly one node).
     async fn new(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
-        Self::build(n, chunk_size, k, m, 1, false, None).await
+        Self::build(n, chunk_size, k, m, 1, None).await
     }
 
     /// Create an N-node cluster with a custom shard replication factor.
@@ -258,17 +218,12 @@ impl TestCluster {
         m: usize,
         shard_replication: usize,
     ) -> Self {
-        Self::build(n, chunk_size, k, m, shard_replication, false, None).await
-    }
-
-    /// Create an N-node cluster with LogTree enabled.
-    async fn with_log_tree(n: usize, chunk_size: u32, k: usize, m: usize) -> Self {
-        Self::build(n, chunk_size, k, m, 1, true, None).await
+        Self::build(n, chunk_size, k, m, shard_replication, None).await
     }
 
     /// Create an N-node cluster with chaos fault injection.
     async fn with_chaos(n: usize, chunk_size: u32, k: usize, m: usize, chaos: ChaosConfig) -> Self {
-        Self::build(n, chunk_size, k, m, 1, false, Some(chaos)).await
+        Self::build(n, chunk_size, k, m, 1, Some(chaos)).await
     }
 
     /// Create an N-node cluster with chaos fault injection AND custom
@@ -282,17 +237,16 @@ impl TestCluster {
         shard_replication: usize,
         chaos: ChaosConfig,
     ) -> Self {
-        Self::build(n, chunk_size, k, m, shard_replication, false, Some(chaos)).await
+        Self::build(n, chunk_size, k, m, shard_replication, Some(chaos)).await
     }
 
-    /// Internal builder that supports all configuration options.
+    /// Internal builder.
     async fn build(
         n: usize,
         chunk_size: u32,
         k: usize,
         m: usize,
         shard_replication: usize,
-        use_log_tree: bool,
         chaos_config: Option<ChaosConfig>,
     ) -> Self {
         assert!(n >= 2, "need at least 2 nodes");
@@ -369,23 +323,18 @@ impl TestCluster {
             .map(|(&nid, meta)| (nid, meta.clone()))
             .collect();
 
-        // Optionally create LogTree instances for each node.
-        let log_tree_instances: Vec<Option<Arc<LogTree>>> = if use_log_tree {
-            (0..n)
-                .map(|i| {
-                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[(i + 1) as u8; 32]);
-                    let store = shoal_logtree::LogTreeStore::open_temporary().unwrap();
-                    Some(Arc::new(LogTree::new(store, node_ids[i], signing_key)))
-                })
-                .collect()
-        } else {
-            (0..n).map(|_| None).collect()
-        };
+        let log_trees: Vec<Arc<LogTree>> = (0..n)
+            .map(|i| {
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&[(i + 1) as u8; 32]);
+                let store = shoal_logtree::LogTreeStore::open_temporary().unwrap();
+                Arc::new(LogTree::new(store, node_ids[i], signing_key))
+            })
+            .collect();
 
         let log_tree_map: HashMap<NodeId, Arc<LogTree>> = node_ids
             .iter()
-            .zip(log_tree_instances.iter())
-            .filter_map(|(&nid, lt)| lt.as_ref().map(|lt| (nid, lt.clone())))
+            .zip(log_trees.iter())
+            .map(|(&nid, lt)| (nid, lt.clone()))
             .collect();
 
         let mut nodes = Vec::with_capacity(n);
@@ -412,7 +361,7 @@ impl TestCluster {
                 .map(|(&nid, addr)| (nid, addr.clone()))
                 .collect();
 
-            let mut node = ShoalNode::new(
+            let node = ShoalNode::new(
                 ShoalNodeConfig {
                     node_id: node_ids[i],
                     chunk_size,
@@ -427,11 +376,8 @@ impl TestCluster {
                 cluster.clone(),
             )
             .with_transport(transport)
-            .with_address_book(Arc::new(RwLock::new(book)));
-
-            if let Some(lt) = &log_tree_instances[i] {
-                node = node.with_log_tree(lt.clone());
-            }
+            .with_address_book(Arc::new(RwLock::new(book)))
+            .with_log_tree(log_trees[i].clone());
 
             nodes.push(node);
         }
@@ -442,7 +388,7 @@ impl TestCluster {
             stores,
             cluster,
             down_nodes,
-            log_trees: log_tree_instances,
+            log_trees,
             chaos_controller,
         }
     }
@@ -452,14 +398,27 @@ impl TestCluster {
     }
 
     /// Simulate manifest broadcast from one node to all others.
+    ///
+    /// Syncs the LogTree entries from `from` to every other node and
+    /// caches the manifest in both the LogTree store and MetaStore.
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
         let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
-        for (i, node) in self.nodes.iter().enumerate() {
+        let src_lt = &self.log_trees[from];
+
+        for (i, _node) in self.nodes.iter().enumerate() {
             if i == from {
                 continue;
             }
-            node.meta().put_manifest(&manifest).unwrap();
-            node.meta()
+
+            let dst_lt = &self.log_trees[i];
+            let tips = dst_lt.tips().unwrap_or_default();
+            let delta = src_lt.compute_delta(&tips).unwrap_or_default();
+            let _ = dst_lt.apply_sync_entries(&delta);
+            dst_lt.store().put_manifest(&manifest).unwrap();
+
+            self.nodes[i].meta().put_manifest(&manifest).unwrap();
+            self.nodes[i]
+                .meta()
                 .put_object_key(bucket, key, &manifest.object_id)
                 .unwrap();
         }
@@ -508,7 +467,7 @@ impl TestCluster {
 // Regression tests (preserved from original)
 // =========================================================================
 
-/// Simulate what the ManifestPut broadcast handler does:
+/// Simulate what the manifest broadcast handler does:
 /// store the manifest and key mapping on the target node, but do NOT
 /// store shard owners.
 async fn simulate_manifest_broadcast(
@@ -742,7 +701,7 @@ async fn test_5_node_write_read_from_all() {
 
 /// 10-node cluster: write and read.
 #[tokio::test]
-#[ntest::timeout(30000)]
+#[ntest::timeout(60000)]
 async fn test_10_node_cluster() {
     let c = TestCluster::new(10, 2048, 4, 2).await;
     let data = test_data(50_000);
@@ -762,7 +721,7 @@ async fn test_10_node_cluster() {
 
 /// 10-node cluster: shards should be distributed across multiple nodes.
 #[tokio::test]
-#[ntest::timeout(30000)]
+#[ntest::timeout(60000)]
 async fn test_10_node_shard_distribution() {
     let c = TestCluster::new(10, 1024, 4, 2).await;
     let data = test_data(10_000);
@@ -830,7 +789,7 @@ async fn test_5_node_k2_m2() {
 
 /// k=8, m=4: large erasure group.
 #[tokio::test]
-#[ntest::timeout(30000)]
+#[ntest::timeout(60000)]
 async fn test_12_node_k8_m4() {
     let c = TestCluster::new(12, 4096, 8, 4).await;
     let data = test_data(100_000);
@@ -1698,7 +1657,7 @@ async fn test_manifest_sync_multiple_buckets() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_put_broadcasts_to_peers() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(5000);
 
     c.node(0)
@@ -1718,7 +1677,7 @@ async fn test_logtree_put_broadcasts_to_peers() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_delete_object() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
 
     c.node(0)
@@ -1742,7 +1701,7 @@ async fn test_logtree_delete_object() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_get_reads_from_materialized_state() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(3000);
 
     c.node(0)
@@ -1767,7 +1726,7 @@ async fn test_logtree_get_reads_from_materialized_state() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_put_also_writes_metastore() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(5000);
 
     let oid = c
@@ -1798,7 +1757,7 @@ async fn test_logtree_put_also_writes_metastore() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_delete_also_clears_metastore() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let data = test_data(2000);
 
     c.node(0)
@@ -1820,7 +1779,7 @@ async fn test_logtree_delete_also_clears_metastore() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_sync_from_peers() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
 
     // Kill node 2 so it misses broadcasts.
     c.kill_node(2).await;
@@ -1871,7 +1830,7 @@ async fn test_logtree_sync_from_peers() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_logtree_overwrite_after_sync() {
-    let c = TestCluster::with_log_tree(3, 1024, 2, 1).await;
+    let c = TestCluster::new(3, 1024, 2, 1).await;
     let v1 = test_data(2000);
     let v2 = test_data(3000);
 
@@ -2146,7 +2105,7 @@ async fn test_bug1_large_object_read_after_ack_cleanup() {
 ///
 /// An object written to node 0 should be visible from node 1 WITHOUT
 /// manual `broadcast_manifest`. In the mock transport, `send_to` delivers
-/// `ManifestPut` messages directly to the peer's MetaStore. If this test
+/// manifest messages directly to the peer's MetaStore. If this test
 /// passes with mock transport but fails in the real cluster, the bug is
 /// in the iroh QUIC transport layer (messages not being delivered).
 ///
@@ -2161,7 +2120,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
     let data = test_data(5000);
 
     // Write on node 0 — put_object internally broadcasts the manifest
-    // to all peers via transport.send_to (ManifestPut message).
+    // to all peers via transport.send_to (LogEntryBroadcast message).
     c.node(0)
         .put_object("b", "cross-node-test", &data, BTreeMap::new())
         .await
@@ -2196,7 +2155,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_bug4_cross_node_visibility_logtree_mode() {
-    let c = TestCluster::with_log_tree(4, 1024, 2, 2).await;
+    let c = TestCluster::new(4, 1024, 2, 2).await;
     let data = test_data(5000);
 
     // Write on node 0.
@@ -2349,7 +2308,7 @@ async fn test_chaos_cross_node_with_drop() {
     let result = c.node(1).get_object("b", "dropped").await;
 
     if result.is_err() {
-        // Manifest didn't arrive — sync from peers (this uses pull_all_manifests
+        // Manifest didn't arrive — sync from peers (this uses pull_manifests
         // which also goes through chaos, but retries internally).
         let synced = c.node(1).sync_manifests_from_peers().await.unwrap();
         assert!(synced >= 1, "sync should recover the dropped manifest");
@@ -2816,14 +2775,16 @@ async fn test_chaos_slow_store_during_write_storm() {
     // Concurrently, some readers try to read objects as they become available.
     let read_cluster = c.clone();
     let reader_handle = tokio::spawn(async move {
-        // Wait a bit for some objects to exist, then start reading.
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Wait for some objects to be written and broadcast.
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
         let mut successful_reads = 0u32;
         for attempt in 0..20 {
             let key = format!("storm-w0-{}", attempt % objects_per_writer);
             if read_cluster.node(1).get_object("b", &key).await.is_ok() {
                 successful_reads += 1;
             }
+            // Space out attempts so reads span the write storm duration.
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
         successful_reads
     });

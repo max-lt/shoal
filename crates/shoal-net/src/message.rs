@@ -68,49 +68,25 @@ pub enum ShoalMessage {
     /// Raw SWIM protocol data routed between foca membership services.
     SwimData(Vec<u8>),
 
-    /// Broadcast a manifest and its object key mapping to other nodes.
-    ManifestPut {
-        /// Bucket name.
-        bucket: String,
-        /// Object key.
-        key: String,
-        /// Postcard-serialized [`Manifest`](shoal_types::Manifest).
-        manifest_bytes: Vec<u8>,
-    },
-
-    /// Request a manifest by bucket/key (bi-directional, expects ManifestResponse).
+    /// Batch request for manifests by ObjectId.
     ManifestRequest {
-        /// Bucket name.
-        bucket: String,
-        /// Object key.
-        key: String,
+        /// The manifest ObjectIds to fetch.
+        manifest_ids: Vec<ObjectId>,
     },
 
     /// Response to a [`ShoalMessage::ManifestRequest`].
     ManifestResponse {
-        /// Bucket name (echoed back).
-        bucket: String,
-        /// Object key (echoed back).
-        key: String,
-        /// Postcard-serialized [`Manifest`](shoal_types::Manifest), or `None` if not found.
-        manifest_bytes: Option<Vec<u8>>,
+        /// Pairs of (ObjectId, postcard-serialized Manifest) for found manifests.
+        manifests: Vec<(ObjectId, Vec<u8>)>,
     },
 
-    /// Request all manifests from a peer (used for catch-up on join).
-    ManifestSyncRequest,
-
-    /// Response containing all manifests the peer has.
-    ManifestSyncResponse {
-        /// Each entry is (bucket, key, postcard-serialized Manifest).
-        entries: Vec<ManifestSyncEntry>,
-    },
-
-    /// Broadcast a new log entry (+ optional manifest for Put actions).
+    /// Broadcast a new log entry to other nodes (unicast fallback).
+    ///
+    /// Manifests and secrets referenced by the entry are pulled via QUIC
+    /// on-demand by the receiver.
     LogEntryBroadcast {
         /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
         entry_bytes: Vec<u8>,
-        /// Postcard-serialized [`Manifest`](shoal_types::Manifest) for Put actions.
-        manifest_bytes: Option<Vec<u8>>,
     },
 
     /// Request missing log entries. Sender provides their tip hashes.
@@ -119,22 +95,19 @@ pub enum ShoalMessage {
         tips: Vec<[u8; 32]>,
     },
 
-    /// Response with missing entries and their associated manifests.
+    /// Response with missing log entries (manifests pulled separately).
     LogSyncResponse {
         /// Each entry is a postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
         entries: Vec<Vec<u8>>,
-        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
-        manifests: Vec<(ObjectId, Vec<u8>)>,
     },
 
     /// Push specific log entries to a node (unicast response to gossip WantEntries).
     ///
     /// Sent as a uni-stream message — no response expected.
+    /// Manifests are pulled separately via batch ManifestRequest.
     ProvideLogEntries {
         /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry) payloads.
         entries: Vec<Vec<u8>>,
-        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
-        manifests: Vec<(ObjectId, Vec<u8>)>,
     },
 
     /// Targeted pull: request specific entries and their ancestor chain.
@@ -155,18 +128,17 @@ pub enum ShoalMessage {
     LogSyncPullResponse {
         /// Entries in topological order (parents before children).
         entries: Vec<Vec<u8>>,
-        /// Associated manifests: (ObjectId, postcard-serialized Manifest).
-        manifests: Vec<(ObjectId, Vec<u8>)>,
     },
-}
 
-/// A single manifest entry in a [`ShoalMessage::ManifestSyncResponse`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestSyncEntry {
-    /// Bucket name.
-    pub bucket: String,
-    /// Object key.
-    pub key: String,
-    /// Postcard-serialized [`Manifest`](shoal_types::Manifest).
-    pub manifest_bytes: Vec<u8>,
+    /// Batch request for API key secrets by access_key_id.
+    ApiKeyRequest {
+        /// The access key IDs to look up.
+        access_key_ids: Vec<String>,
+    },
+
+    /// Response with (access_key_id, secret_access_key) pairs.
+    ApiKeyResponse {
+        /// Found keys: (access_key_id, secret_access_key).
+        keys: Vec<(String, String)>,
+    },
 }

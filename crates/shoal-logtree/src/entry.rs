@@ -54,10 +54,10 @@ pub enum Action {
         state_hash: [u8; 32],
     },
     /// Create an API key.
-    CreateApiKey {
-        access_key_id: String,
-        secret_access_key: String,
-    },
+    ///
+    /// Only the access key ID is stored in the DAG for auditability.
+    /// The secret is pulled via QUIC point-to-point.
+    CreateApiKey { access_key_id: String },
     /// Delete an API key.
     DeleteApiKey { access_key_id: String },
 }

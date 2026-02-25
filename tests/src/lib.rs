@@ -12,7 +12,7 @@ use bytes::Bytes;
 use shoal_cluster::ClusterState;
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_meta::MetaStore;
-use shoal_net::{ManifestSyncEntry, NetError, ShoalMessage, Transport};
+use shoal_net::{NetError, ShoalMessage, Transport};
 use shoal_store::{MemoryStore, ShardStore};
 use shoal_types::*;
 use tokio::sync::RwLock;
@@ -77,67 +77,39 @@ impl Transport for MockTransport {
         if self.down_nodes.read().await.contains(&node_id) {
             return Err(NetError::Endpoint("node is down".into()));
         }
-        // Deliver ManifestPut messages to the peer's MetaStore.
-        if let ShoalMessage::ManifestPut {
-            bucket,
-            key,
-            manifest_bytes,
-        } = msg
-            && let Some(meta) = self.metas.get(&node_id)
-            && let Ok(manifest) = postcard::from_bytes::<Manifest>(manifest_bytes)
-        {
-            let _ = meta.put_manifest(&manifest);
-            let _ = meta.put_object_key(bucket, key, &manifest.object_id);
+
+        // Deliver LogEntryBroadcast messages to the peer's MetaStore.
+        if let ShoalMessage::LogEntryBroadcast { entry_bytes } = msg {
+            let _ = entry_bytes; // no-op in mock: integration tests use MetaStore mode
         }
+
         Ok(())
     }
 
-    async fn pull_manifest(
+    async fn pull_manifests(
         &self,
         addr: iroh::EndpointAddr,
-        bucket: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, NetError> {
+        manifest_ids: &[ObjectId],
+    ) -> Result<Vec<(ObjectId, Vec<u8>)>, NetError> {
         let node_id = NodeId::from(*addr.id.as_bytes());
         if self.down_nodes.read().await.contains(&node_id) {
             return Err(NetError::Endpoint("node is down".into()));
         }
-        if let Some(meta) = self.metas.get(&node_id)
-            && let Ok(Some(oid)) = meta.get_object_key(bucket, key)
-            && let Ok(Some(manifest)) = meta.get_manifest(&oid)
-            && let Ok(bytes) = postcard::to_allocvec(&manifest)
-        {
-            return Ok(Some(bytes));
-        }
-        Ok(None)
-    }
 
-    async fn pull_all_manifests(
-        &self,
-        addr: iroh::EndpointAddr,
-    ) -> Result<Vec<ManifestSyncEntry>, NetError> {
-        let node_id = NodeId::from(*addr.id.as_bytes());
-        if self.down_nodes.read().await.contains(&node_id) {
-            return Err(NetError::Endpoint("node is down".into()));
-        }
         let Some(meta) = self.metas.get(&node_id) else {
             return Ok(vec![]);
         };
-        let entries = meta
-            .list_all_object_entries()
-            .map_err(|e| NetError::Endpoint(e.to_string()))?;
+
         let mut result = Vec::new();
-        for (bucket, key, oid) in entries {
-            if let Ok(Some(manifest)) = meta.get_manifest(&oid)
+
+        for oid in manifest_ids {
+            if let Ok(Some(manifest)) = meta.get_manifest(oid)
                 && let Ok(bytes) = postcard::to_allocvec(&manifest)
             {
-                result.push(ManifestSyncEntry {
-                    bucket,
-                    key,
-                    manifest_bytes: bytes,
-                });
+                result.push((*oid, bytes));
             }
         }
+
         Ok(result)
     }
 
@@ -145,9 +117,9 @@ impl Transport for MockTransport {
         &self,
         _addr: iroh::EndpointAddr,
         _my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
+    ) -> Result<Vec<Vec<u8>>, NetError> {
         // Integration tests use MetaStore mode, not LogTree.
-        Ok((vec![], vec![]))
+        Ok(vec![])
     }
 
     async fn pull_log_sync(
@@ -155,8 +127,16 @@ impl Transport for MockTransport {
         _addr: iroh::EndpointAddr,
         _entry_hashes: &[[u8; 32]],
         _my_tips: &[[u8; 32]],
-    ) -> Result<(Vec<Vec<u8>>, Vec<(ObjectId, Vec<u8>)>), NetError> {
-        Ok((vec![], vec![]))
+    ) -> Result<Vec<Vec<u8>>, NetError> {
+        Ok(vec![])
+    }
+
+    async fn pull_api_keys(
+        &self,
+        _addr: iroh::EndpointAddr,
+        _access_key_ids: &[String],
+    ) -> Result<Vec<(String, String)>, NetError> {
+        Ok(vec![])
     }
 }
 

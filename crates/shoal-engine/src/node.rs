@@ -112,7 +112,7 @@ pub struct ShoalNode {
     /// Optional LogTree for DAG-based mutation tracking.
     ///
     /// When present, replaces MetaStore for object metadata (resolve, list,
-    /// manifest cache) and replaces ManifestPut broadcasts with LogEntry
+    /// manifest cache) and uses LogEntry gossip for metadata dissemination.  LogEntry
     /// broadcasts.
     log_tree: Option<Arc<LogTree>>,
     /// Gossip handle for epidemic broadcast (manifests, log entries).
@@ -546,53 +546,21 @@ impl ShoalNode {
         self.meta.put_object_key(bucket, key, &object_id)?;
 
         if let Some(log_tree) = &self.log_tree {
-            // LogTree mode: append log entry + broadcast LogEntryBroadcast.
+            // LogTree mode: append log entry + broadcast (metadata only).
+            // Manifest is already in MetaStore above; peers pull it via QUIC.
             let log_entry = log_tree.append_put(bucket, key, object_id, &manifest)?;
-
             let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
-            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
-                // Gossip broadcast — epidemic dissemination to all peers.
-                let payload = GossipPayload::LogEntry {
-                    entry_bytes,
-                    manifest_bytes: Some(manifest_bytes),
-                };
+                let payload = GossipPayload::LogEntry { entry_bytes };
 
                 if let Err(e) = gossip.broadcast_payload(&payload).await {
                     warn!(%e, "failed to broadcast log entry via gossip");
                 }
             } else {
                 // Unicast fallback (tests without gossip).
-                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast {
-                    entry_bytes,
-                    manifest_bytes: Some(manifest_bytes),
-                })
-                .await;
-            }
-        } else {
-            // MetaStore mode: broadcast ManifestPut.
-            let manifest_bytes = postcard::to_allocvec(&manifest).unwrap_or_default();
-
-            if let Some(gossip) = &self.gossip {
-                // Gossip broadcast — epidemic dissemination to all peers.
-                let payload = GossipPayload::ManifestPut {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    manifest_bytes,
-                };
-
-                if let Err(e) = gossip.broadcast_payload(&payload).await {
-                    warn!(%e, "failed to broadcast manifest via gossip");
-                }
-            } else {
-                // Unicast fallback (tests without gossip).
-                self.unicast_to_peers(&ShoalMessage::ManifestPut {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    manifest_bytes,
-                })
-                .await;
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
             }
         }
 
@@ -834,20 +802,14 @@ impl ShoalNode {
             let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
-                let payload = GossipPayload::LogEntry {
-                    entry_bytes,
-                    manifest_bytes: None,
-                };
+                let payload = GossipPayload::LogEntry { entry_bytes };
 
                 if let Err(e) = gossip.broadcast_payload(&payload).await {
                     warn!(%e, "failed to broadcast delete log entry via gossip");
                 }
             } else {
-                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast {
-                    entry_bytes,
-                    manifest_bytes: None,
-                })
-                .await;
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
             }
 
             info!(bucket, key, "delete_object: delete entry appended");
@@ -973,89 +935,18 @@ impl ShoalNode {
 
     /// Sync manifests from cluster peers.
     ///
-    /// When a node joins (or restarts), it may have missed manifest
-    /// broadcasts for objects stored before it was part of the cluster.
-    /// This method pulls all manifests from each peer and stores them
-    /// locally, ensuring `list_objects` returns a complete view.
+    /// In the DAG architecture, manifests are synced as part of
+    /// `sync_log_from_peers`. This method delegates to it when a LogTree
+    /// is available, ensuring backward compatibility with callers.
     ///
-    /// Returns the total number of new manifests synced.
+    /// Returns the total number of new entries/manifests synced.
     pub async fn sync_manifests_from_peers(&self) -> Result<usize, EngineError> {
-        use rand::seq::SliceRandom;
-
-        let Some(transport) = &self.transport else {
-            return Ok(0);
-        };
-
-        let mut peers: Vec<_> = self
-            .cluster
-            .members()
-            .await
-            .into_iter()
-            .filter(|p| p.node_id != self.node_id)
-            .collect();
-        peers.shuffle(&mut rand::rng());
-
-        let mut total_synced = 0usize;
-
-        // Try up to 3 random peers; stop after first successful sync.
-        for peer in peers.iter().take(3) {
-            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
-                continue;
-            };
-
-            match transport.pull_all_manifests(addr).await {
-                Ok(entries) => {
-                    for entry in entries {
-                        match postcard::from_bytes::<Manifest>(&entry.manifest_bytes) {
-                            Ok(manifest) => {
-                                let local_oid =
-                                    self.meta.get_object_key(&entry.bucket, &entry.key)?;
-                                let dominated = match local_oid {
-                                    None => true,
-                                    Some(oid) => oid != manifest.object_id,
-                                };
-
-                                if dominated {
-                                    self.meta.put_manifest(&manifest)?;
-                                    self.meta.put_object_key(
-                                        &entry.bucket,
-                                        &entry.key,
-                                        &manifest.object_id,
-                                    )?;
-                                    total_synced += 1;
-                                    debug!(
-                                        bucket = %entry.bucket,
-                                        key = %entry.key,
-                                        object_id = %manifest.object_id,
-                                        from = %peer.node_id,
-                                        "synced manifest from peer"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                warn!(
-                                    from = %peer.node_id,
-                                    %e,
-                                    "failed to deserialize synced manifest"
-                                );
-                            }
-                        }
-                    }
-
-                    // Got a successful response — no need to ask more peers.
-                    break;
-                }
-                Err(e) => {
-                    warn!(from = %peer.node_id, %e, "failed to sync manifests from peer");
-                }
-            }
+        if self.log_tree.is_some() {
+            return self.sync_log_from_peers().await;
         }
 
-        if total_synced > 0 {
-            info!(total_synced, "manifest sync complete");
-        }
-
-        Ok(total_synced)
+        // Without LogTree, no manifest sync is possible in the new architecture.
+        Ok(0)
     }
 
     // ------------------------------------------------------------------
@@ -1098,8 +989,8 @@ impl ShoalNode {
             // previous peer advance the tips, reducing the delta size.
             let tip_refs = log_tree.tips()?;
 
-            match transport.pull_log_entries(addr, &tip_refs).await {
-                Ok((entry_bytes_list, manifest_pairs)) => {
+            match transport.pull_log_entries(addr.clone(), &tip_refs).await {
+                Ok(entry_bytes_list) => {
                     let mut entries = Vec::new();
 
                     for eb in &entry_bytes_list {
@@ -1115,22 +1006,7 @@ impl ShoalNode {
                         }
                     }
 
-                    let mut manifests = Vec::new();
-
-                    for (oid, mb) in &manifest_pairs {
-                        match postcard::from_bytes::<Manifest>(mb) {
-                            Ok(manifest) => manifests.push((*oid, manifest)),
-                            Err(e) => {
-                                warn!(
-                                    from = %peer.node_id,
-                                    %e,
-                                    "failed to deserialize manifest from peer"
-                                );
-                            }
-                        }
-                    }
-
-                    match log_tree.apply_sync_entries(&entries, &manifests) {
+                    match log_tree.apply_sync_entries(&entries) {
                         Ok(applied) => {
                             if applied > 0 {
                                 debug!(
@@ -1139,21 +1015,115 @@ impl ShoalNode {
                                     "applied log entries from peer"
                                 );
 
-                                // Apply API key actions from synced entries to MetaStore.
-                                for entry in &entries {
-                                    match &entry.action {
-                                        shoal_logtree::Action::CreateApiKey {
-                                            access_key_id,
-                                            secret_access_key,
-                                        } => {
-                                            let _ = self
+                                // Batch-pull missing manifests from this peer.
+                                let missing_manifest_ids: Vec<ObjectId> = entries
+                                    .iter()
+                                    .filter_map(|e| match &e.action {
+                                        shoal_logtree::Action::Put { manifest_id, .. } => {
+                                            if log_tree
+                                                .get_manifest(manifest_id)
+                                                .ok()
+                                                .flatten()
+                                                .is_none()
+                                                && self
+                                                    .meta
+                                                    .get_manifest(manifest_id)
+                                                    .ok()
+                                                    .flatten()
+                                                    .is_none()
+                                            {
+                                                Some(*manifest_id)
+                                            } else {
+                                                None
+                                            }
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect();
+
+                                if !missing_manifest_ids.is_empty() {
+                                    match transport
+                                        .pull_manifests(addr.clone(), &missing_manifest_ids)
+                                        .await
+                                    {
+                                        Ok(manifest_pairs) => {
+                                            for (oid, mb) in &manifest_pairs {
+                                                if let Ok(manifest) =
+                                                    postcard::from_bytes::<Manifest>(mb)
+                                                {
+                                                    let _ = self.meta.put_manifest(&manifest);
+                                                    let _ =
+                                                        log_tree.store().put_manifest(&manifest);
+
+                                                    // Cache the key mapping from entries.
+                                                    for entry in &entries {
+                                                        if let shoal_logtree::Action::Put {
+                                                            bucket,
+                                                            key,
+                                                            manifest_id,
+                                                        } = &entry.action
+                                                        {
+                                                            if manifest_id == oid {
+                                                                let _ = self.meta.put_object_key(
+                                                                    bucket,
+                                                                    key,
+                                                                    &manifest.object_id,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!(from = %peer.node_id, %e, "manifest batch pull failed during sync");
+                                        }
+                                    }
+                                }
+
+                                // Batch-pull missing API key secrets from this peer.
+                                let missing_key_ids: Vec<String> = entries
+                                    .iter()
+                                    .filter_map(|e| match &e.action {
+                                        shoal_logtree::Action::CreateApiKey { access_key_id } => {
+                                            if self
                                                 .meta
-                                                .put_api_key(access_key_id, secret_access_key);
+                                                .get_api_key(access_key_id)
+                                                .ok()
+                                                .flatten()
+                                                .is_none()
+                                            {
+                                                Some(access_key_id.clone())
+                                            } else {
+                                                None
+                                            }
                                         }
-                                        shoal_logtree::Action::DeleteApiKey { access_key_id } => {
-                                            let _ = self.meta.delete_api_key(access_key_id);
+                                        _ => None,
+                                    })
+                                    .collect();
+
+                                if !missing_key_ids.is_empty() {
+                                    match transport
+                                        .pull_api_keys(addr.clone(), &missing_key_ids)
+                                        .await
+                                    {
+                                        Ok(key_pairs) => {
+                                            for (kid, secret) in &key_pairs {
+                                                let _ = self.meta.put_api_key(kid, secret);
+                                            }
                                         }
-                                        _ => {}
+                                        Err(e) => {
+                                            debug!(from = %peer.node_id, %e, "api key batch pull failed during sync");
+                                        }
+                                    }
+                                }
+
+                                // Apply DeleteApiKey actions to MetaStore.
+                                for entry in &entries {
+                                    if let shoal_logtree::Action::DeleteApiKey { access_key_id } =
+                                        &entry.action
+                                    {
+                                        let _ = self.meta.delete_api_key(access_key_id);
                                     }
                                 }
                             }
@@ -1232,8 +1202,11 @@ impl ShoalNode {
         let my_tips = log_tree.tips()?;
 
         // Pull the transitive closure of missing entries.
-        match transport.pull_log_sync(addr, &missing, &my_tips).await {
-            Ok((entry_bytes_list, manifest_pairs)) => {
+        match transport
+            .pull_log_sync(addr.clone(), &missing, &my_tips)
+            .await
+        {
+            Ok(entry_bytes_list) => {
                 let mut entries = Vec::new();
 
                 for eb in &entry_bytes_list {
@@ -1249,23 +1222,38 @@ impl ShoalNode {
                     }
                 }
 
-                let mut manifests = Vec::new();
-
-                for (oid, mb) in &manifest_pairs {
-                    match postcard::from_bytes::<Manifest>(mb) {
-                        Ok(manifest) => manifests.push((*oid, manifest)),
-                        Err(e) => {
-                            warn!(
-                                from = %author,
-                                %e,
-                                "failed to deserialize manifest from targeted pull"
-                            );
-                        }
-                    }
+                if let Err(e) = log_tree.apply_sync_entries(&entries) {
+                    warn!(from = %author, %e, "failed to apply targeted pull entries");
                 }
 
-                if let Err(e) = log_tree.apply_sync_entries(&entries, &manifests) {
-                    warn!(from = %author, %e, "failed to apply targeted pull entries");
+                // Batch-pull missing manifests.
+                let missing_manifest_ids: Vec<ObjectId> = entries
+                    .iter()
+                    .filter_map(|e| match &e.action {
+                        shoal_logtree::Action::Put { manifest_id, .. } => {
+                            if log_tree.get_manifest(manifest_id).ok().flatten().is_none()
+                                && self.meta.get_manifest(manifest_id).ok().flatten().is_none()
+                            {
+                                Some(*manifest_id)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                if !missing_manifest_ids.is_empty() {
+                    if let Ok(manifest_pairs) =
+                        transport.pull_manifests(addr, &missing_manifest_ids).await
+                    {
+                        for (_oid, mb) in &manifest_pairs {
+                            if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                let _ = self.meta.put_manifest(&manifest);
+                                let _ = log_tree.store().put_manifest(&manifest);
+                            }
+                        }
+                    }
                 }
 
                 // Drain pending — the pull should have unblocked buffered entries.
@@ -1279,7 +1267,7 @@ impl ShoalNode {
         Ok(true)
     }
 
-    /// Look up a manifest locally, falling back to asking peers.
+    /// Look up a manifest locally, falling back to QUIC peer pull by ObjectId.
     ///
     /// If found remotely, the manifest and key mapping are cached locally.
     async fn lookup_manifest(
@@ -1287,24 +1275,30 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Manifest>, EngineError> {
-        // LogTree mode: resolve from the DAG's materialized state,
-        // falling back to MetaStore cache if the DAG is incomplete
-        // (e.g. entries received via gossip before parents arrived).
-        if let Some(log_tree) = &self.log_tree
-            && let Some(object_id) = log_tree.resolve(bucket, key)?
-            && let Some(m) = log_tree.get_manifest(&object_id)?
+        // Subscribe early so we don't miss events emitted during local lookups.
+        let mut rx = self.event_bus.subscribe::<ManifestReceived>();
+
+        // LogTree mode: resolve from the DAG's materialized state.
+        let object_id_from_dag = if let Some(log_tree) = &self.log_tree {
+            log_tree.resolve(bucket, key)?
+        } else {
+            None
+        };
+
+        // Check LogTree manifest cache.
+        if let Some(oid) = &object_id_from_dag
+            && let Some(log_tree) = &self.log_tree
+            && let Some(m) = log_tree.get_manifest(oid)?
         {
             return Ok(Some(m));
         }
 
         // Fallback: check MetaStore cache (populated by gossip receiver
         // even when LogTree entries can't be applied yet).
+        let object_id_from_meta = self.meta.get_object_key(bucket, key)?;
 
-        // Fallback: MetaStore + peer pull.
-
-        // Try local first.
-        if let Some(object_id) = self.meta.get_object_key(bucket, key)?
-            && let Some(manifest) = self.meta.get_manifest(&object_id)?
+        if let Some(oid) = &object_id_from_meta
+            && let Some(manifest) = self.meta.get_manifest(oid)?
         {
             return Ok(Some(manifest));
         }
@@ -1319,54 +1313,90 @@ impl ShoalNode {
             return Ok(None);
         }
 
-        // Ask peers if transport is available.
+        // If we know the ObjectId (from DAG or MetaStore), pull by ID from peers.
+        let object_id = object_id_from_dag.or(object_id_from_meta);
+
         let Some(transport) = &self.transport else {
             return Ok(None);
         };
 
-        let peers = self.cluster.members().await;
-        for peer in &peers {
-            if peer.node_id == self.node_id {
-                continue;
-            }
-            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
-                continue;
-            };
-            match transport.pull_manifest(addr, bucket, key).await {
-                Ok(Some(manifest_bytes)) => {
-                    match postcard::from_bytes::<Manifest>(&manifest_bytes) {
-                        Ok(manifest) => {
-                            debug!(
-                                %bucket, %key,
-                                object_id = %manifest.object_id,
-                                from = %peer.node_id,
-                                "fetched manifest from peer"
-                            );
-                            // Cache locally.
-                            let _ = self.meta.put_manifest(&manifest);
-                            let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
-                            // Also cache shard owners from the manifest.
-                            for chunk in &manifest.chunks {
-                                for shard_meta in &chunk.shards {
-                                    // The shard owners aren't in the manifest, but
-                                    // we know the writer's node stored them all.
-                                    // Just record the peer as an owner for now.
-                                    let _ = self
-                                        .meta
-                                        .put_shard_owners(&shard_meta.shard_id, &[peer.node_id]);
+        if let Some(oid) = object_id {
+            let peers = self.cluster.members().await;
+
+            for peer in &peers {
+                if peer.node_id == self.node_id {
+                    continue;
+                }
+
+                let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                    continue;
+                };
+
+                match transport.pull_manifests(addr, &[oid]).await {
+                    Ok(manifest_pairs) => {
+                        for (_id, mb) in &manifest_pairs {
+                            if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                debug!(
+                                    %bucket, %key,
+                                    object_id = %manifest.object_id,
+                                    from = %peer.node_id,
+                                    "fetched manifest from peer"
+                                );
+                                // Cache locally.
+                                let _ = self.meta.put_manifest(&manifest);
+                                let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+
+                                if let Some(log_tree) = &self.log_tree {
+                                    let _ = log_tree.store().put_manifest(&manifest);
                                 }
+
+                                // Cache shard owners.
+                                for chunk in &manifest.chunks {
+                                    for shard_meta in &chunk.shards {
+                                        let _ = self.meta.put_shard_owners(
+                                            &shard_meta.shard_id,
+                                            &[peer.node_id],
+                                        );
+                                    }
+                                }
+
+                                return Ok(Some(manifest));
                             }
-                            return Ok(Some(manifest));
-                        }
-                        Err(e) => {
-                            warn!(from = %peer.node_id, %e, "bad manifest from peer");
                         }
                     }
+                    Err(e) => {
+                        debug!(from = %peer.node_id, %e, "manifest pull failed");
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    debug!(from = %peer.node_id, %e, "manifest pull failed");
+            }
+        }
+
+        // Event-driven wait: the entry might arrive via gossip within a short window.
+        let bucket_owned = bucket.to_string();
+        let key_owned = key.to_string();
+
+        let wait_result = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                match rx.recv().await {
+                    Some(evt) if evt.bucket == bucket_owned && evt.key == key_owned => {
+                        return Some(evt.object_id);
+                    }
+                    Some(_) => continue,
+                    None => return None,
                 }
+            }
+        })
+        .await;
+
+        if let Ok(Some(oid)) = wait_result {
+            if let Some(log_tree) = &self.log_tree {
+                if let Some(m) = log_tree.get_manifest(&oid)? {
+                    return Ok(Some(m));
+                }
+            }
+
+            if let Some(manifest) = self.meta.get_manifest(&oid)? {
+                return Ok(Some(manifest));
             }
         }
 
@@ -1430,20 +1460,20 @@ impl ShoalNode {
     // ------------------------------------------------------------------
 
     /// Create an API key, persist to MetaStore, and replicate via LogTree+gossip.
+    ///
+    /// The secret is stored locally in MetaStore. Only the access_key_id is
+    /// recorded in the DAG — peers pull the secret via QUIC.
     pub async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError> {
         // 1. Persist to MetaStore.
         self.meta.put_api_key(key_id, secret)?;
 
         // 2. Append to LogTree + broadcast (if configured).
         if let Some(log_tree) = &self.log_tree {
-            let entry = log_tree.append_create_api_key(key_id, secret)?;
+            let entry = log_tree.append_create_api_key(key_id)?;
             let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
-                let payload = GossipPayload::LogEntry {
-                    entry_bytes,
-                    manifest_bytes: None,
-                };
+                let payload = GossipPayload::LogEntry { entry_bytes };
 
                 if let Err(e) = gossip.broadcast_payload(&payload).await {
                     warn!(%e, "failed to broadcast api key creation via gossip");
@@ -1465,10 +1495,7 @@ impl ShoalNode {
             let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
-                let payload = GossipPayload::LogEntry {
-                    entry_bytes,
-                    manifest_bytes: None,
-                };
+                let payload = GossipPayload::LogEntry { entry_bytes };
 
                 if let Err(e) = gossip.broadcast_payload(&payload).await {
                     warn!(%e, "failed to broadcast api key deletion via gossip");
@@ -1477,6 +1504,51 @@ impl ShoalNode {
         }
 
         Ok(())
+    }
+
+    /// Look up an API key secret locally, falling back to QUIC peer pull.
+    pub async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
+        // Check MetaStore first.
+        if let Some(secret) = self.meta.get_api_key(access_key_id)? {
+            return Ok(Some(secret));
+        }
+
+        // Ask peers if transport is available.
+        let Some(transport) = &self.transport else {
+            return Ok(None);
+        };
+
+        let peers = self.cluster.members().await;
+
+        for peer in &peers {
+            if peer.node_id == self.node_id {
+                continue;
+            }
+
+            let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                continue;
+            };
+
+            match transport
+                .pull_api_keys(addr, &[access_key_id.to_string()])
+                .await
+            {
+                Ok(key_pairs) => {
+                    for (kid, secret) in &key_pairs {
+                        let _ = self.meta.put_api_key(kid, secret);
+
+                        if kid == access_key_id {
+                            return Ok(Some(secret.clone()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(from = %peer.node_id, %e, "api key pull failed");
+                }
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -1522,6 +1594,10 @@ impl ShoalEngine for ShoalNode {
 
     async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError> {
         ShoalNode::delete_api_key(self, key_id).await
+    }
+
+    async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
+        ShoalNode::lookup_api_key(self, access_key_id).await
     }
 
     fn meta(&self) -> &Arc<MetaStore> {

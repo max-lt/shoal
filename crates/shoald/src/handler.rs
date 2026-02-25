@@ -16,7 +16,7 @@ use shoal_cluster::membership::MembershipHandle;
 use shoal_engine::pending::{self, PendingBuffer, PendingEntry};
 use shoal_logtree::{LogEntry, LogTree, LogTreeError};
 use shoal_meta::MetaStore;
-use shoal_net::{ManifestSyncEntry, ShoalMessage, ShoalTransport, Transport};
+use shoal_net::{ShoalMessage, ShoalTransport, Transport};
 use shoal_store::ShardStore;
 use shoal_types::events::{EventBus, ShardSource, ShardStored};
 use shoal_types::{Manifest, NodeId, ObjectId};
@@ -95,15 +95,13 @@ impl ShoalProtocol {
 
 /// Process a `ProvideLogEntries` message received via unicast.
 ///
-/// Applies entries to the LogTree and caches manifests in MetaStore.
-/// Then drains the pending buffer in case newly arrived entries unblock
-/// previously buffered ones.
+/// Applies entries to the LogTree. Manifests and API key secrets are
+/// pulled separately via QUIC batch requests.
 ///
 /// On `MissingParents`, buffers the entry and (if transport is available)
 /// spawns a background targeted pull from the entry's author.
 fn handle_provide_log_entries(
     entry_bytes_list: Vec<Vec<u8>>,
-    manifest_pairs: Vec<(ObjectId, Vec<u8>)>,
     log_tree: Option<&Arc<LogTree>>,
     meta: &Arc<MetaStore>,
     pending_buf: &PendingBuffer,
@@ -113,12 +111,6 @@ fn handle_provide_log_entries(
     let Some(log_tree) = log_tree else {
         return;
     };
-
-    // Build a manifest lookup table.
-    let manifests: HashMap<ObjectId, Manifest> = manifest_pairs
-        .iter()
-        .filter_map(|(oid, mb)| postcard::from_bytes::<Manifest>(mb).ok().map(|m| (*oid, m)))
-        .collect();
 
     let mut applied = 0usize;
     let mut missing_authors: Vec<(NodeId, Vec<[u8; 32]>)> = Vec::new();
@@ -132,35 +124,11 @@ fn handle_provide_log_entries(
             }
         };
 
-        // Find the associated manifest (if any) for this entry.
-        let manifest = match &entry.action {
-            shoal_logtree::Action::Put { manifest_id, .. } => manifests.get(manifest_id),
-            _ => None,
-        };
-
-        // Cache manifest in MetaStore regardless of DAG state.
-        if let Some(m) = manifest {
-            let _ = meta.put_manifest(m);
-
-            if let shoal_logtree::Action::Put { bucket, key, .. } = &entry.action {
-                let _ = meta.put_object_key(bucket, key, &m.object_id);
-            }
-        }
-
-        match log_tree.receive_entry(&entry, manifest) {
+        match log_tree.receive_entry(&entry, None) {
             Ok(true) => {
-                // Apply API key actions to MetaStore.
-                match &entry.action {
-                    shoal_logtree::Action::CreateApiKey {
-                        access_key_id,
-                        secret_access_key,
-                    } => {
-                        let _ = meta.put_api_key(access_key_id, secret_access_key);
-                    }
-                    shoal_logtree::Action::DeleteApiKey { access_key_id } => {
-                        let _ = meta.delete_api_key(access_key_id);
-                    }
-                    _ => {}
+                // Apply DeleteApiKey actions to MetaStore.
+                if let shoal_logtree::Action::DeleteApiKey { access_key_id } = &entry.action {
+                    let _ = meta.delete_api_key(access_key_id);
                 }
 
                 applied += 1;
@@ -168,12 +136,11 @@ fn handle_provide_log_entries(
             Ok(false) => {} // already known
             Err(LogTreeError::MissingParents(parents)) => {
                 // Buffer for later.
-                let mb = manifest.and_then(|m| postcard::to_allocvec(m).ok());
                 let author = entry.node_id;
                 pending_buf
                     .lock()
                     .expect("pending lock poisoned")
-                    .push(PendingEntry::new(entry, mb));
+                    .push(PendingEntry::new(entry, None));
 
                 // Track for eager pull.
                 missing_authors.push((author, parents));
@@ -203,6 +170,7 @@ fn handle_provide_log_entries(
         tokio::spawn(async move {
             // Deduplicate by author.
             let mut seen_authors = std::collections::HashSet::new();
+
             for (author, missing_hashes) in &missing_authors {
                 if !seen_authors.insert(*author) {
                     continue;
@@ -222,35 +190,101 @@ fn handle_provide_log_entries(
                     Err(_) => continue,
                 };
 
-                match transport.pull_log_sync(addr, missing_hashes, &tips).await {
-                    Ok((entry_bytes, manifest_pairs)) => {
+                match transport
+                    .pull_log_sync(addr.clone(), missing_hashes, &tips)
+                    .await
+                {
+                    Ok(entry_bytes) => {
                         let mut entries = Vec::new();
+
                         for eb in &entry_bytes {
                             if let Ok(e) = postcard::from_bytes::<LogEntry>(eb) {
                                 entries.push(e);
                             }
                         }
-                        let mut mans = Vec::new();
-                        for (oid, mb) in &manifest_pairs {
-                            if let Ok(m) = postcard::from_bytes::<Manifest>(mb) {
-                                mans.push((*oid, m));
+
+                        let _ = log_tree.apply_sync_entries(&entries);
+
+                        // Batch-pull missing manifests.
+                        let missing_manifest_ids: Vec<ObjectId> = entries
+                            .iter()
+                            .filter_map(|e| match &e.action {
+                                shoal_logtree::Action::Put { manifest_id, .. } => {
+                                    if log_tree.get_manifest(manifest_id).ok().flatten().is_none()
+                                        && meta.get_manifest(manifest_id).ok().flatten().is_none()
+                                    {
+                                        Some(*manifest_id)
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+
+                        if !missing_manifest_ids.is_empty() {
+                            if let Ok(manifest_pairs) = transport
+                                .pull_manifests(addr.clone(), &missing_manifest_ids)
+                                .await
+                            {
+                                for (oid, mb) in &manifest_pairs {
+                                    if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                        let _ = meta.put_manifest(&manifest);
+                                        let _ = log_tree.store().put_manifest(&manifest);
+
+                                        // Cache key mappings.
+                                        for entry in &entries {
+                                            if let shoal_logtree::Action::Put {
+                                                bucket,
+                                                key,
+                                                manifest_id,
+                                            } = &entry.action
+                                            {
+                                                if manifest_id == oid {
+                                                    let _ = meta.put_object_key(
+                                                        bucket,
+                                                        key,
+                                                        &manifest.object_id,
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
-                        let _ = log_tree.apply_sync_entries(&entries, &mans);
 
-                        // Apply API key actions from synced entries to MetaStore.
+                        // Batch-pull missing API key secrets.
+                        let missing_key_ids: Vec<String> = entries
+                            .iter()
+                            .filter_map(|e| match &e.action {
+                                shoal_logtree::Action::CreateApiKey { access_key_id } => {
+                                    if meta.get_api_key(access_key_id).ok().flatten().is_none() {
+                                        Some(access_key_id.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect();
+
+                        if !missing_key_ids.is_empty() {
+                            if let Ok(key_pairs) =
+                                transport.pull_api_keys(addr, &missing_key_ids).await
+                            {
+                                for (kid, secret) in &key_pairs {
+                                    let _ = meta.put_api_key(kid, secret);
+                                }
+                            }
+                        }
+
+                        // Apply DeleteApiKey actions.
                         for entry in &entries {
-                            match &entry.action {
-                                shoal_logtree::Action::CreateApiKey {
-                                    access_key_id,
-                                    secret_access_key,
-                                } => {
-                                    let _ = meta.put_api_key(access_key_id, secret_access_key);
-                                }
-                                shoal_logtree::Action::DeleteApiKey { access_key_id } => {
-                                    let _ = meta.delete_api_key(access_key_id);
-                                }
-                                _ => {}
+                            if let shoal_logtree::Action::DeleteApiKey { access_key_id } =
+                                &entry.action
+                            {
+                                let _ = meta.delete_api_key(access_key_id);
                             }
                         }
 
@@ -300,10 +334,9 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 warn!(%e, "failed to feed SWIM data");
                             }
                         }
-                        ShoalMessage::ProvideLogEntries { entries, manifests } => {
+                        ShoalMessage::ProvideLogEntries { entries } => {
                             handle_provide_log_entries(
                                 entries,
-                                manifests,
                                 log_tree.as_ref(),
                                 &meta,
                                 &pending,
@@ -320,7 +353,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .await;
         });
 
-        // Handle bi-directional streams (shard pull, manifest pull, log sync).
+        // Handle bi-directional streams (shard pull, manifest pull, log sync, api keys).
         let store = self.store.clone();
         let meta = self.meta.clone();
         let log_tree_bi = self.log_tree.clone();
@@ -353,41 +386,21 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 data: data.map(|b| b.to_vec()),
                             })
                         }
-                        ShoalMessage::ManifestRequest { bucket, key } => {
-                            // LOCAL-ONLY: no recursive peer pull.
-                            let manifest_bytes = meta
-                                .get_object_key(&bucket, &key)
-                                .ok()
-                                .flatten()
-                                .and_then(|oid| meta.get_manifest(&oid).ok().flatten())
-                                .or_else(|| {
-                                    let lt = log_tree.as_ref()?;
-                                    let oid = lt.resolve(&bucket, &key).ok()??;
-                                    lt.get_manifest(&oid).ok()?
-                                })
-                                .and_then(|m| postcard::to_allocvec(&m).ok());
-                            Some(ShoalMessage::ManifestResponse {
-                                bucket,
-                                key,
-                                manifest_bytes,
-                            })
-                        }
-                        ShoalMessage::ManifestSyncRequest => {
-                            let entries = meta
-                                .list_all_object_entries()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter_map(|(bucket, key, oid)| {
-                                    let manifest = meta.get_manifest(&oid).ok().flatten()?;
+                        ShoalMessage::ManifestRequest { manifest_ids } => {
+                            // Batch lookup: check MetaStore and LogTree for each ID.
+                            let manifests: Vec<(ObjectId, Vec<u8>)> = manifest_ids
+                                .iter()
+                                .filter_map(|oid| {
+                                    let manifest =
+                                        meta.get_manifest(oid).ok().flatten().or_else(|| {
+                                            let lt = log_tree.as_ref()?;
+                                            lt.get_manifest(oid).ok()?
+                                        })?;
                                     let bytes = postcard::to_allocvec(&manifest).ok()?;
-                                    Some(ManifestSyncEntry {
-                                        bucket,
-                                        key,
-                                        manifest_bytes: bytes,
-                                    })
+                                    Some((*oid, bytes))
                                 })
                                 .collect();
-                            Some(ShoalMessage::ManifestSyncResponse { entries })
+                            Some(ShoalMessage::ManifestResponse { manifests })
                         }
                         ShoalMessage::LogSyncRequest { tips } => {
                             // LOCAL-ONLY: compute delta from local store.
@@ -397,22 +410,9 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                     .iter()
                                     .filter_map(|e| postcard::to_allocvec(e).ok())
                                     .collect();
-                                let manifests: Vec<(ObjectId, Vec<u8>)> = delta
-                                    .iter()
-                                    .filter_map(|e| match &e.action {
-                                        shoal_logtree::Action::Put { manifest_id, .. } => {
-                                            let m = log_tree.get_manifest(manifest_id).ok()??;
-                                            Some((*manifest_id, postcard::to_allocvec(&m).ok()?))
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect();
-                                Some(ShoalMessage::LogSyncResponse { entries, manifests })
+                                Some(ShoalMessage::LogSyncResponse { entries })
                             } else {
-                                Some(ShoalMessage::LogSyncResponse {
-                                    entries: vec![],
-                                    manifests: vec![],
-                                })
+                                Some(ShoalMessage::LogSyncResponse { entries: vec![] })
                             }
                         }
                         ShoalMessage::LogSyncPull {
@@ -429,23 +429,23 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                     .iter()
                                     .filter_map(|e| postcard::to_allocvec(e).ok())
                                     .collect();
-                                let manifests: Vec<(ObjectId, Vec<u8>)> = delta
-                                    .iter()
-                                    .filter_map(|e| match &e.action {
-                                        shoal_logtree::Action::Put { manifest_id, .. } => {
-                                            let m = log_tree.get_manifest(manifest_id).ok()??;
-                                            Some((*manifest_id, postcard::to_allocvec(&m).ok()?))
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect();
-                                Some(ShoalMessage::LogSyncPullResponse { entries, manifests })
+                                Some(ShoalMessage::LogSyncPullResponse { entries })
                             } else {
-                                Some(ShoalMessage::LogSyncPullResponse {
-                                    entries: vec![],
-                                    manifests: vec![],
-                                })
+                                Some(ShoalMessage::LogSyncPullResponse { entries: vec![] })
                             }
+                        }
+                        ShoalMessage::ApiKeyRequest { access_key_ids } => {
+                            // Batch lookup of API key secrets from MetaStore.
+                            let keys: Vec<(String, String)> = access_key_ids
+                                .iter()
+                                .filter_map(|kid| {
+                                    meta.get_api_key(kid)
+                                        .ok()
+                                        .flatten()
+                                        .map(|s| (kid.clone(), s))
+                                })
+                                .collect();
+                            Some(ShoalMessage::ApiKeyResponse { keys })
                         }
                         _ => None,
                     }

@@ -113,9 +113,9 @@ fn test_new_node_bootstrap_from_snapshot_plus_delta() {
     // New node bootstraps by receiving just the snapshot + delta.
     let tree_new = test_tree(3);
     let delta = tree_a.compute_delta(&[]).unwrap();
-    let manifests = vec![(oid, manifest), (oid2, m2)];
+    let _manifests = vec![(oid, manifest), (oid2, m2)];
 
-    let applied = tree_new.apply_sync_entries(&delta, &manifests).unwrap();
+    let applied = tree_new.apply_sync_entries(&delta).unwrap();
     assert!(applied >= 3); // snapshot + 2 new entries
 
     // New node should see all non-pruned keys.

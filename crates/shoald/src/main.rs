@@ -603,126 +603,157 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     };
 
     // --- Gossip data payload receiver ---
-    // Processes ManifestPut, LogEntry, and WantEntries payloads received via
-    // gossip from other nodes.
+    // Processes LogEntry payloads received via gossip from other nodes.
+    // Manifests and API key secrets are pulled via QUIC on demand.
     if let Some(mut payload_rx) = gossip_payload_rx {
         let meta_gossip = meta.clone();
         let log_tree_gossip = log_tree.clone();
         let pending_gossip = pending_entries.clone();
         let bus_gossip = event_bus.clone();
+        let transport_gossip: Arc<dyn shoal_net::Transport> = transport.clone();
+        let address_book_gossip = address_book.clone();
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
 
             while let Some(payload) = payload_rx.recv().await {
                 match payload {
-                    GossipPayload::ManifestPut {
-                        bucket,
-                        key,
-                        manifest_bytes,
-                    } => match postcard::from_bytes::<Manifest>(&manifest_bytes) {
-                        Ok(manifest) => {
-                            debug!(
-                                %bucket, %key,
-                                object_id = %manifest.object_id,
-                                "received manifest via gossip"
-                            );
-
-                            if let Err(e) = meta_gossip.put_manifest(&manifest) {
-                                warn!(%e, "failed to store gossip manifest");
-                            }
-
-                            if let Err(e) =
-                                meta_gossip.put_object_key(&bucket, &key, &manifest.object_id)
-                            {
-                                warn!(%e, "failed to store gossip object key");
-                            }
-
-                            bus_gossip.emit(ManifestReceived {
-                                bucket,
-                                key,
-                                object_id: manifest.object_id,
-                            });
-                        }
-                        Err(e) => {
-                            warn!(%e, "failed to deserialize gossip manifest");
-                        }
-                    },
-                    GossipPayload::LogEntry {
-                        entry_bytes,
-                        manifest_bytes,
-                    } => {
+                    GossipPayload::LogEntry { entry_bytes } => {
                         match postcard::from_bytes::<shoal_logtree::LogEntry>(&entry_bytes) {
                             Ok(entry) => {
-                                let manifest = manifest_bytes
-                                    .as_ref()
-                                    .and_then(|b| postcard::from_bytes::<Manifest>(b).ok());
-
-                                // Always cache the manifest in MetaStore so reads
-                                // work even before the DAG converges (missing parents).
-                                if let Some(m) = &manifest {
-                                    if let Err(e) = meta_gossip.put_manifest(m) {
-                                        warn!(%e, "failed to cache gossip log manifest");
-                                    }
-
-                                    if let shoal_logtree::Action::Put { bucket, key, .. } =
-                                        &entry.action
-                                        && let Err(e) =
-                                            meta_gossip.put_object_key(bucket, key, &m.object_id)
-                                    {
-                                        warn!(%e, "failed to cache gossip object key");
-                                    }
-                                }
-
-                                match log_tree_gossip.receive_entry(&entry, manifest.as_ref()) {
+                                match log_tree_gossip.receive_entry(&entry, None) {
                                     Ok(true) => {
                                         debug!("stored log entry from gossip");
 
-                                        // Emit LogEntryApplied + ManifestReceived.
-                                        match &entry.action {
-                                            shoal_logtree::Action::Put {
-                                                bucket,
-                                                key,
-                                                manifest_id,
-                                            } => {
-                                                bus_gossip.emit(LogEntryApplied {
-                                                    hash: entry.hash,
-                                                    bucket: bucket.clone(),
-                                                    key: key.clone(),
-                                                });
-                                                bus_gossip.emit(ManifestReceived {
-                                                    bucket: bucket.clone(),
-                                                    key: key.clone(),
-                                                    object_id: *manifest_id,
-                                                });
-                                            }
-                                            shoal_logtree::Action::Delete { bucket, key } => {
-                                                bus_gossip.emit(LogEntryApplied {
-                                                    hash: entry.hash,
-                                                    bucket: bucket.clone(),
-                                                    key: key.clone(),
-                                                });
-                                            }
-                                            shoal_logtree::Action::CreateApiKey {
-                                                access_key_id,
-                                                secret_access_key,
-                                            } => {
-                                                if let Err(e) = meta_gossip
-                                                    .put_api_key(access_key_id, secret_access_key)
-                                                {
-                                                    warn!(%e, "failed to apply gossiped api key creation");
+                                        // Pull missing data via QUIC in background.
+                                        let meta_bg = meta_gossip.clone();
+                                        let log_tree_bg = log_tree_gossip.clone();
+                                        let transport_bg = transport_gossip.clone();
+                                        let address_book_bg = address_book_gossip.clone();
+                                        let entry_bg = entry.clone();
+                                        let bus_bg = bus_gossip.clone();
+
+                                        tokio::spawn(async move {
+                                            // Resolve the author's address for QUIC pulls.
+                                            let addr = {
+                                                let book = address_book_bg.read().await;
+                                                book.get(&entry_bg.node_id).cloned()
+                                            };
+
+                                            match &entry_bg.action {
+                                                shoal_logtree::Action::Put {
+                                                    bucket,
+                                                    key,
+                                                    manifest_id,
+                                                } => {
+                                                    bus_bg.emit(LogEntryApplied {
+                                                        hash: entry_bg.hash,
+                                                        bucket: bucket.clone(),
+                                                        key: key.clone(),
+                                                    });
+                                                    bus_bg.emit(ManifestReceived {
+                                                        bucket: bucket.clone(),
+                                                        key: key.clone(),
+                                                        object_id: *manifest_id,
+                                                    });
+
+                                                    // Pull manifest if not cached locally.
+                                                    if log_tree_bg
+                                                        .get_manifest(manifest_id)
+                                                        .ok()
+                                                        .flatten()
+                                                        .is_none()
+                                                        && meta_bg
+                                                            .get_manifest(manifest_id)
+                                                            .ok()
+                                                            .flatten()
+                                                            .is_none()
+                                                    {
+                                                        if let Some(addr) = addr.clone() {
+                                                            match transport_bg
+                                                                .pull_manifests(
+                                                                    addr,
+                                                                    &[*manifest_id],
+                                                                )
+                                                                .await
+                                                            {
+                                                                Ok(pairs) => {
+                                                                    for (_oid, mb) in &pairs {
+                                                                        if let Ok(manifest) =
+                                                                            postcard::from_bytes::<
+                                                                                Manifest,
+                                                                            >(
+                                                                                mb
+                                                                            )
+                                                                        {
+                                                                            let _ = meta_bg
+                                                                                .put_manifest(
+                                                                                    &manifest,
+                                                                                );
+                                                                            let _ = meta_bg
+                                                                                .put_object_key(
+                                                                                    bucket,
+                                                                                    key,
+                                                                                    &manifest
+                                                                                        .object_id,
+                                                                                );
+                                                                            let _ = log_tree_bg
+                                                                                .store()
+                                                                                .put_manifest(
+                                                                                    &manifest,
+                                                                                );
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    debug!(%e, "failed to pull manifest after gossip entry");
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                 }
-                                            }
-                                            shoal_logtree::Action::DeleteApiKey {
-                                                access_key_id,
-                                            } => {
-                                                if let Err(e) =
-                                                    meta_gossip.delete_api_key(access_key_id)
-                                                {
-                                                    warn!(%e, "failed to apply gossiped api key deletion");
+                                                shoal_logtree::Action::Delete { bucket, key } => {
+                                                    bus_bg.emit(LogEntryApplied {
+                                                        hash: entry_bg.hash,
+                                                        bucket: bucket.clone(),
+                                                        key: key.clone(),
+                                                    });
                                                 }
+                                                shoal_logtree::Action::CreateApiKey {
+                                                    access_key_id,
+                                                } => {
+                                                    // Pull the secret via QUIC.
+                                                    if let Some(addr) = addr {
+                                                        match transport_bg
+                                                            .pull_api_keys(
+                                                                addr,
+                                                                &[access_key_id.clone()],
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(key_pairs) => {
+                                                                for (kid, secret) in &key_pairs {
+                                                                    let _ = meta_bg
+                                                                        .put_api_key(kid, secret);
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                debug!(%e, "failed to pull api key secret after gossip entry");
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                shoal_logtree::Action::DeleteApiKey {
+                                                    access_key_id,
+                                                } => {
+                                                    if let Err(e) =
+                                                        meta_bg.delete_api_key(access_key_id)
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped api key deletion");
+                                                    }
+                                                }
+                                                _ => {} // Merge, Snapshot — no key-level event
                                             }
-                                            _ => {} // Merge, Snapshot — no key-level event
-                                        }
+                                        });
 
                                         shoal_engine::drain_pending(
                                             &log_tree_gossip,
@@ -744,10 +775,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                             buf.swap_remove(0);
                                         }
 
-                                        buf.push(shoal_engine::PendingEntry::new(
-                                            entry,
-                                            manifest_bytes,
-                                        ));
+                                        buf.push(shoal_engine::PendingEntry::new(entry, None));
                                         trace!(
                                             pending = buf.len(),
                                             "buffered log entry with missing parents (gossip)"

@@ -69,10 +69,10 @@ fn test_apply_sync_entries_stores_and_updates() {
 
     // Get delta for tree_b (empty tips).
     let delta = tree_a.compute_delta(&[]).unwrap();
-    let manifests = vec![(oid1, m1), (oid2, m2)];
+    let _manifests = vec![(oid1, m1), (oid2, m2)];
 
     // Apply to tree_b.
-    let applied = tree_b.apply_sync_entries(&delta, &manifests).unwrap();
+    let applied = tree_b.apply_sync_entries(&delta).unwrap();
     assert_eq!(applied, 2);
 
     // tree_b should resolve both keys.
@@ -97,8 +97,8 @@ fn test_new_node_syncs_from_scratch() {
     let tree_new = test_tree(3);
 
     let delta = tree_a.compute_delta(&[]).unwrap();
-    let manifests = vec![(oid, manifest)];
-    let applied = tree_new.apply_sync_entries(&delta, &manifests).unwrap();
+    let _manifests = vec![(oid, manifest)];
+    let applied = tree_new.apply_sync_entries(&delta).unwrap();
 
     assert_eq!(applied, 5);
 
@@ -126,9 +126,7 @@ fn test_delayed_node_syncs_and_gets_correct_state() {
     let e1 = tree_a.append_put("b", "k", oid1, &m1).unwrap();
 
     // tree_b receives e1.
-    tree_b
-        .apply_sync_entries(&[e1.clone()], &[(oid1, m1.clone())])
-        .unwrap();
+    tree_b.apply_sync_entries(&[e1.clone()]).unwrap();
     assert_eq!(tree_b.resolve("b", "k").unwrap(), Some(oid1));
 
     // tree_a overwrites with v2.
@@ -136,7 +134,7 @@ fn test_delayed_node_syncs_and_gets_correct_state() {
 
     // tree_b syncs delta.
     let delta = tree_a.compute_delta(&tree_b.tips().unwrap()).unwrap();
-    let applied = tree_b.apply_sync_entries(&delta, &[(oid2, m2)]).unwrap();
+    let applied = tree_b.apply_sync_entries(&delta).unwrap();
     assert!(applied >= 1);
 
     // tree_b should now resolve to v2.

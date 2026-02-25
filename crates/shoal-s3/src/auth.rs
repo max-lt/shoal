@@ -199,6 +199,21 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Extract the access_key_id from the Authorization header, if present.
+///
+/// Used by the auth middleware to determine which key to pull from peers
+/// when the key is not found locally.
+pub(crate) fn extract_access_key_id(request: &Request) -> Option<String> {
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())?;
+
+    parse_authorization(auth_header)
+        .ok()
+        .map(|a| a.access_key_id)
+}
+
 /// Verify an incoming request against stored API keys using AWS Signature V4.
 ///
 /// Accepts `UNSIGNED-PAYLOAD` for the payload hash (matching MinIO / most

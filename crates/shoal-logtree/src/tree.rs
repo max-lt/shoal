@@ -63,10 +63,12 @@ impl LogTree {
     }
 
     /// Append a CreateApiKey action. Returns the new LogEntry.
-    pub fn append_create_api_key(&self, access_key_id: &str, secret: &str) -> Result<LogEntry> {
+    ///
+    /// Only the access key ID is recorded in the DAG. The secret is
+    /// persisted in MetaStore locally and pulled via QUIC by peers.
+    pub fn append_create_api_key(&self, access_key_id: &str) -> Result<LogEntry> {
         let action = Action::CreateApiKey {
             access_key_id: access_key_id.to_string(),
-            secret_access_key: secret.to_string(),
         };
 
         self.append(action)
@@ -509,16 +511,11 @@ impl LogTree {
 
     /// Apply received entries (from sync). Verifies each, updates state.
     ///
+    /// Manifests are pulled separately via QUIC — this method only applies
+    /// the DAG entries themselves.
+    ///
     /// Returns the number of new entries applied.
-    pub fn apply_sync_entries(
-        &self,
-        entries: &[LogEntry],
-        manifests: &[(ObjectId, Manifest)],
-    ) -> Result<usize> {
-        // Pre-load manifests.
-        let manifest_map: std::collections::HashMap<ObjectId, &Manifest> =
-            manifests.iter().map(|(id, m)| (*id, m)).collect();
-
+    pub fn apply_sync_entries(&self, entries: &[LogEntry]) -> Result<usize> {
         // Set of hashes in this sync batch — used for parent validation.
         let delta_hashes: HashSet<[u8; 32]> = entries.iter().map(|e| e.hash).collect();
 
@@ -570,19 +567,8 @@ impl LogTree {
                 continue;
             }
 
-            // Find manifest if this is a Put action.
-            let manifest = match &entry.action {
-                Action::Put { manifest_id, .. } => manifest_map.get(manifest_id).copied(),
-                _ => None,
-            };
-
             // Witness the HLC.
             self.clock.witness(entry.hlc);
-
-            // Store manifest if provided.
-            if let Some(m) = manifest {
-                self.store.put_manifest(m)?;
-            }
 
             // Update tips: remove parents from tips, add this entry.
             for parent in &entry.parents {

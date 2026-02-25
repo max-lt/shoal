@@ -266,25 +266,21 @@ pub enum ClusterEvent {
 /// All cluster-wide dissemination goes through gossip (epidemic broadcast).
 /// Point-to-point request/response (shard pull, manifest sync) stays on
 /// direct QUIC streams.
+///
+/// The gossip layer is **metadata-only**: it carries log entry pointers,
+/// not bulk data. Manifests and API key secrets are pulled via QUIC
+/// point-to-point when needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GossipPayload {
     /// A cluster membership event.
     Event(ClusterEvent),
-    /// A manifest broadcast (object stored/updated).
-    ManifestPut {
-        /// Target bucket.
-        bucket: String,
-        /// Object key within the bucket.
-        key: String,
-        /// Postcard-serialized [`Manifest`].
-        manifest_bytes: Vec<u8>,
-    },
     /// A log tree entry broadcast (DAG-based mutation tracking).
+    ///
+    /// Manifests and secrets referenced by the entry are pulled via QUIC
+    /// on-demand, not included in the gossip payload.
     LogEntry {
         /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
         entry_bytes: Vec<u8>,
-        /// Optional postcard-serialized [`Manifest`] referenced by the entry.
-        manifest_bytes: Option<Vec<u8>>,
     },
 }
 

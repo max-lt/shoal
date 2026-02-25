@@ -143,8 +143,8 @@ fn test_apply_sync_entries_diamond_dag() {
 
     // Apply to a fresh tree.
     let target = test_tree(2);
-    let manifests = vec![(oid1, m1), (oid2, m2), (oid3, m3)];
-    let applied = target.apply_sync_entries(&delta, &manifests).unwrap();
+    let _manifests = vec![(oid1, m1), (oid2, m2), (oid3, m3)];
+    let applied = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(applied, 4, "all 4 diamond entries should apply");
 
     // Target should have all keys.
@@ -267,9 +267,7 @@ fn test_apply_sync_entries_deep_chain() {
 
     let delta = source.compute_delta(&[]).unwrap();
     let target = test_tree(2);
-    let applied = target
-        .apply_sync_entries(&delta, &[(oid, manifest)])
-        .unwrap();
+    let applied = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(applied, 100);
 
     let keys = target.list_keys("b", "").unwrap();
@@ -403,9 +401,7 @@ fn test_apply_sync_entries_wide_merge() {
 
     let delta = source.compute_delta(&[]).unwrap();
     let target = test_tree(2);
-    let applied = target
-        .apply_sync_entries(&delta, &[(oid, manifest)])
-        .unwrap();
+    let applied = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(applied, 11);
 }
 
@@ -457,8 +453,8 @@ fn test_apply_sync_entries_out_of_order_skips_children() {
 
     let oid1 = ObjectId::from([1u8; 32]);
     let oid2 = ObjectId::from([2u8; 32]);
-    let m1 = test_manifest(oid1);
-    let m2 = test_manifest(oid2);
+    let _m1 = test_manifest(oid1);
+    let _m2 = test_manifest(oid2);
 
     // A → B (linear chain).
     let a = make_entry(1, node_id, &signing_key, "b", "k1", oid1, vec![]);
@@ -466,9 +462,7 @@ fn test_apply_sync_entries_out_of_order_skips_children() {
 
     // Apply in WRONG order: B first, then A.
     let target = test_tree(2);
-    let applied = target
-        .apply_sync_entries(&[b.clone(), a.clone()], &[(oid1, m1), (oid2, m2)])
-        .unwrap();
+    let applied = target.apply_sync_entries(&[b.clone(), a.clone()]).unwrap();
 
     // B should be skipped because its in-delta parent A hasn't been applied yet.
     // A should be applied.
@@ -487,14 +481,12 @@ fn test_apply_sync_entries_duplicate_in_batch() {
     let (node_id, signing_key) = test_identity(1);
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
+    let _manifest = test_manifest(oid);
 
     let a = make_entry(1, node_id, &signing_key, "b", "k1", oid, vec![]);
 
     let target = test_tree(2);
-    let applied = target
-        .apply_sync_entries(&[a.clone(), a.clone()], &[(oid, manifest)])
-        .unwrap();
+    let applied = target.apply_sync_entries(&[a.clone(), a.clone()]).unwrap();
 
     // First instance applies, second is skipped (already in store).
     assert_eq!(applied, 1);
@@ -624,9 +616,7 @@ fn test_apply_sync_entries_double_diamond() {
 
     let delta = source.compute_delta(&[]).unwrap();
     let target = test_tree(2);
-    let applied = target
-        .apply_sync_entries(&delta, &[(oid, manifest)])
-        .unwrap();
+    let applied = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(applied, 7);
 }
 
@@ -659,9 +649,7 @@ fn test_cross_node_fork_then_sync() {
 
     // Both start with a shared root (sync root from A to B).
     let root = tree_a.append_put("b", "shared", oid_a, &m_a).unwrap();
-    tree_b
-        .apply_sync_entries(&[root.clone()], &[(oid_a, m_a.clone())])
-        .unwrap();
+    tree_b.apply_sync_entries(&[root.clone()]).unwrap();
 
     // A writes two more entries independently.
     let _a1 = tree_a.append_put("b", "a1", oid_a, &m_a).unwrap();
@@ -684,9 +672,7 @@ fn test_cross_node_fork_then_sync() {
         "A sends root+a1+a2 (B's tip b2 is unknown to A)"
     );
 
-    let applied = tree_b
-        .apply_sync_entries(&delta_from_a, &[(oid_a, m_a.clone())])
-        .unwrap();
+    let applied = tree_b.apply_sync_entries(&delta_from_a).unwrap();
     // root already exists in B → skipped. a1+a2 applied.
     assert_eq!(applied, 2);
 
@@ -731,16 +717,12 @@ fn test_bidirectional_sync_convergence() {
     // Sync A → B.
     let tips_b = tree_b.tips().unwrap();
     let delta_a_to_b = tree_a.compute_delta(&tips_b).unwrap();
-    tree_b
-        .apply_sync_entries(&delta_a_to_b, &[(oid, manifest.clone())])
-        .unwrap();
+    tree_b.apply_sync_entries(&delta_a_to_b).unwrap();
 
     // Sync B → A.
     let tips_a = tree_a.tips().unwrap();
     let delta_b_to_a = tree_b.compute_delta(&tips_a).unwrap();
-    tree_a
-        .apply_sync_entries(&delta_b_to_a, &[(oid, manifest)])
-        .unwrap();
+    tree_a.apply_sync_entries(&delta_b_to_a).unwrap();
 
     // Both should now have 6 keys.
     let keys_a = tree_a.list_keys("b", "").unwrap();
@@ -772,7 +754,7 @@ fn test_apply_sync_entries_missing_manifest() {
 
     let target = test_tree(2);
     // Empty manifest list — no manifest provided for oid.
-    let applied = target.apply_sync_entries(&[a], &[]).unwrap();
+    let applied = target.apply_sync_entries(&[a]).unwrap();
     assert_eq!(applied, 1, "entry should apply even without manifest");
 
     // Key should resolve (versions are tracked), but manifest isn't cached.
@@ -796,14 +778,14 @@ fn test_apply_sync_entries_idempotent() {
     tree_a.append_put("b", "k2", oid, &manifest).unwrap();
 
     let delta = tree_a.compute_delta(&[]).unwrap();
-    let manifests = vec![(oid, manifest)];
+    let _manifests = vec![(oid, manifest)];
 
     let target = test_tree(2);
 
-    let first = target.apply_sync_entries(&delta, &manifests).unwrap();
+    let first = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(first, 2);
 
-    let second = target.apply_sync_entries(&delta, &manifests).unwrap();
+    let second = target.apply_sync_entries(&delta).unwrap();
     assert_eq!(second, 0, "no new entries on second apply");
 
     let keys = target.list_keys("b", "").unwrap();
@@ -832,6 +814,6 @@ fn test_compute_delta_same_tips_empty() {
 #[test]
 fn test_apply_sync_entries_empty() {
     let target = test_tree(1);
-    let applied = target.apply_sync_entries(&[], &[]).unwrap();
+    let applied = target.apply_sync_entries(&[]).unwrap();
     assert_eq!(applied, 0);
 }
