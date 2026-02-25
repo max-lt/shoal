@@ -131,9 +131,9 @@ pub struct ShoalNode {
     pending_entries: Option<PendingBuffer>,
     /// Typed event bus for intra-node pub/sub.
     ///
-    /// When set, the engine emits events during write/read/delete paths
+    /// The engine emits events during write/read/delete paths
     /// (e.g. [`ShardStored`], [`ManifestReceived`], [`ObjectComplete`]).
-    event_bus: Option<EventBus>,
+    event_bus: EventBus,
 }
 
 impl ShoalNode {
@@ -162,7 +162,7 @@ impl ShoalNode {
             gossip: None,
             pending_pushes: Mutex::new(Vec::new()),
             pending_entries: None,
-            event_bus: None,
+            event_bus: EventBus::new(),
         }
     }
 
@@ -204,11 +204,12 @@ impl ShoalNode {
         self
     }
 
-    /// Set the typed event bus for intra-node pub/sub.
+    /// Set a shared event bus for intra-node pub/sub.
     ///
-    /// When set, the engine emits events during write/read/delete paths.
+    /// By default each node gets its own bus. Use this to share a
+    /// single bus across all components in the same process.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
-        self.event_bus = Some(bus);
+        self.event_bus = bus;
         self
     }
 
@@ -237,9 +238,9 @@ impl ShoalNode {
         &self.shard_cache
     }
 
-    /// Return a reference to the typed event bus, if configured.
-    pub fn event_bus(&self) -> Option<&EventBus> {
-        self.event_bus.as_ref()
+    /// Return a reference to the typed event bus.
+    pub fn event_bus(&self) -> &EventBus {
+        &self.event_bus
     }
 
     // ------------------------------------------------------------------
@@ -424,12 +425,10 @@ impl ShoalNode {
                         size = shard.data.len(),
                         "new shard stored locally"
                     );
-                    if let Some(bus) = &self.event_bus {
-                        bus.emit(ShardStored {
-                            shard_id: shard.id,
-                            source: ShardSource::Local,
-                        });
-                    }
+                    self.event_bus.emit(ShardStored {
+                        shard_id: shard.id,
+                        source: ShardSource::Local,
+                    });
                 }
 
                 // Push to remote owners (spawned in parallel).
@@ -596,18 +595,16 @@ impl ShoalNode {
         }
 
         // Emit events on the bus.
-        if let Some(bus) = &self.event_bus {
-            bus.emit(ManifestReceived {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                object_id,
-            });
-            bus.emit(ObjectComplete {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                object_id,
-            });
-        }
+        self.event_bus.emit(ManifestReceived {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            object_id,
+        });
+        self.event_bus.emit(ObjectComplete {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            object_id,
+        });
 
         info!(
             bucket, key, %object_id,
@@ -713,12 +710,10 @@ impl ShoalNode {
                                     // Cache in bounded LRU (not the main store).
                                     self.shard_cache.put(shard_meta.shard_id, data.clone());
                                     collected.push((shard_meta.index, data.to_vec()));
-                                    if let Some(bus) = &self.event_bus {
-                                        bus.emit(ShardStored {
-                                            shard_id: shard_meta.shard_id,
-                                            source: ShardSource::PeerPull,
-                                        });
-                                    }
+                                    self.event_bus.emit(ShardStored {
+                                        shard_id: shard_meta.shard_id,
+                                        source: ShardSource::PeerPull,
+                                    });
                                     found = true;
                                     break;
                                 }

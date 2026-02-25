@@ -40,7 +40,7 @@ pub struct ShoalProtocol {
     /// Transport for outgoing targeted pulls (eager pull on MissingParents).
     transport: Option<Arc<dyn Transport>>,
     /// Typed event bus for emitting events on incoming operations.
-    event_bus: Option<EventBus>,
+    event_bus: EventBus,
 }
 
 impl fmt::Debug for ShoalProtocol {
@@ -65,7 +65,7 @@ impl ShoalProtocol {
             log_tree: None,
             pending_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
             transport: None,
-            event_bus: None,
+            event_bus: EventBus::new(),
         }
     }
 
@@ -81,9 +81,9 @@ impl ShoalProtocol {
         self
     }
 
-    /// Set the typed event bus for emitting events.
+    /// Set a shared event bus for emitting events.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
-        self.event_bus = Some(bus);
+        self.event_bus = bus;
         self
     }
 
@@ -304,8 +304,8 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             let ok = store.put(shard_id, bytes::Bytes::from(data)).await.is_ok();
                             if !ok {
                                 warn!(%shard_id, "failed to store pushed shard");
-                            } else if let Some(bus) = &event_bus {
-                                bus.emit(ShardStored {
+                            } else {
+                                event_bus.emit(ShardStored {
                                     shard_id,
                                     source: ShardSource::PeerPush,
                                 });

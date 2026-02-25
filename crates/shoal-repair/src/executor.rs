@@ -49,7 +49,7 @@ pub struct RepairExecutor {
     replication_factor: usize,
     erasure_k: usize,
     erasure_m: usize,
-    event_bus: Option<EventBus>,
+    event_bus: EventBus,
 }
 
 impl RepairExecutor {
@@ -74,14 +74,12 @@ impl RepairExecutor {
             replication_factor,
             erasure_k,
             erasure_m,
-            event_bus: None,
+            event_bus: EventBus::new(),
         })
     }
 
-    /// Set the typed event bus for repair event emissions.
+    /// Set a shared event bus for repair event emissions.
     pub fn with_event_bus(self: Arc<Self>, bus: EventBus) -> Arc<Self> {
-        // We need to reconstruct since Arc doesn't allow mutation.
-        // Instead, we'll use a simple approach: create a new Arc.
         Arc::new(Self {
             cluster: self.cluster.clone(),
             meta: self.meta.clone(),
@@ -91,7 +89,7 @@ impl RepairExecutor {
             replication_factor: self.replication_factor,
             erasure_k: self.erasure_k,
             erasure_m: self.erasure_m,
-            event_bus: Some(bus),
+            event_bus: bus,
         })
     }
 
@@ -107,9 +105,7 @@ impl RepairExecutor {
         shard_id: ShardId,
         throttle: &Throttle,
     ) -> Result<(), RepairError> {
-        if let Some(bus) = &self.event_bus {
-            bus.emit(RepairStarted { shard_id });
-        }
+        self.event_bus.emit(RepairStarted { shard_id });
 
         let ring = self.cluster.ring().await;
         let target_owners = ring.owners(&shard_id, self.replication_factor);
@@ -161,13 +157,11 @@ impl RepairExecutor {
         // Update shard map.
         self.meta.put_shard_owners(&shard_id, &target_owners)?;
 
-        if let Some(bus) = &self.event_bus {
-            bus.emit(ShardStored {
-                shard_id,
-                source: ShardSource::Repair,
-            });
-            bus.emit(RepairCompleted { shard_id });
-        }
+        self.event_bus.emit(ShardStored {
+            shard_id,
+            source: ShardSource::Repair,
+        });
+        self.event_bus.emit(RepairCompleted { shard_id });
 
         debug!(%shard_id, size = shard_size, "shard repair complete");
         Ok(())

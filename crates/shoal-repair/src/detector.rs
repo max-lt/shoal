@@ -31,7 +31,7 @@ pub struct RepairDetector {
     /// if foca emits the same notification more than once.
     processed_dead: Mutex<HashSet<NodeId>>,
     /// Typed event bus for emitting repair-related events.
-    event_bus: Option<EventBus>,
+    event_bus: EventBus,
 }
 
 impl RepairDetector {
@@ -48,13 +48,13 @@ impl RepairDetector {
             store,
             replication_factor,
             processed_dead: Mutex::new(HashSet::new()),
-            event_bus: None,
+            event_bus: EventBus::new(),
         }
     }
 
-    /// Set the typed event bus for emitting events.
+    /// Set a shared event bus for emitting events.
     pub fn with_event_bus(mut self, bus: EventBus) -> Self {
-        self.event_bus = Some(bus);
+        self.event_bus = bus;
         self
     }
 
@@ -172,11 +172,9 @@ impl RepairDetector {
                 Ok(false) => {
                     warn!(%shard_id, "local shard failed integrity check — enqueuing for repair");
                     self.meta.enqueue_repair(shard_id, 0)?; // Priority 0 = most urgent
-                    if let Some(bus) = &self.event_bus {
-                        bus.emit(shoal_types::events::ShardCorrupted {
-                            shard_id: *shard_id,
-                        });
-                    }
+                    self.event_bus.emit(shoal_types::events::ShardCorrupted {
+                        shard_id: *shard_id,
+                    });
                     result.corrupt += 1;
                 }
                 Err(e) => {
