@@ -1,15 +1,13 @@
-//! Cluster membership (foca SWIM) and gossip (iroh-gossip).
+//! Cluster membership (QUIC ping/pong) and gossip (iroh-gossip).
 //!
 //! This crate provides:
 //!
-//! - [`ClusterIdentity`] — node identity implementing foca's [`Identity`](foca::Identity) trait.
 //! - [`ClusterState`] — shared cluster state with membership and placement ring.
-//! - [`membership`] — SWIM-based membership service powered by foca.
+//! - [`membership`] — peer management with QUIC-based health checking.
 //! - [`gossip`] — event broadcast layer using iroh-gossip.
 
 mod error;
 pub mod gossip;
-mod identity;
 pub mod membership;
 mod state;
 
@@ -18,6 +16,5 @@ mod tests;
 
 pub use error::ClusterError;
 pub use gossip::{GossipHandle, GossipService};
-pub use identity::ClusterIdentity;
-pub use membership::AddressBook;
+pub use membership::{AddressBook, PeerHandle, PeerManagerConfig};
 pub use state::ClusterState;

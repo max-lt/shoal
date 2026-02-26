@@ -295,6 +295,19 @@ impl Transport for QuinnTransport {
         // Not needed for these tests.
         Ok(None)
     }
+
+    async fn request_response(
+        &self,
+        _addr: iroh::EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError> {
+        match msg {
+            ShoalMessage::Ping { timestamp } => Ok(ShoalMessage::Pong {
+                timestamp: *timestamp,
+            }),
+            _ => Err(NetError::Serialization("unexpected message".into())),
+        }
+    }
 }
 
 // =========================================================================

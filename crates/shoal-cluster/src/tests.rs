@@ -11,215 +11,27 @@ mod tests {
     use tokio::sync::RwLock;
     use tokio::time;
 
-    use crate::identity::ClusterIdentity;
-    use crate::membership;
-    use crate::membership::MembershipHandle;
     use crate::state::ClusterState;
 
     // -----------------------------------------------------------------------
-    // Test helpers
+    // ClusterState tests (independent of membership implementation)
     // -----------------------------------------------------------------------
 
-    /// Create a test identity for node `n`.
-    fn test_identity(n: u8) -> ClusterIdentity {
-        ClusterIdentity::new(
-            NodeId::from([n; 32]),
-            1,
-            1_000_000_000,
-            NodeTopology::default(),
-        )
-    }
-
-    /// Shared routing table used by the test network.
-    type RoutingTable = Arc<RwLock<HashMap<NodeId, Arc<MembershipHandle>>>>;
-
-    /// A simulated network that routes foca messages between nodes.
-    ///
-    /// Uses a shared routing table so that new nodes added later are
-    /// visible to all existing routing tasks.
-    struct TestNetwork {
-        handles: RoutingTable,
-        router_tasks: Arc<tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
-    }
-
-    impl TestNetwork {
-        /// Create a test cluster with `n` nodes and wire them together.
-        async fn create(n: usize) -> (Self, Vec<ClusterIdentity>) {
-            let identities: Vec<ClusterIdentity> = (1..=n as u8).map(test_identity).collect();
-            let routing_table: RoutingTable = Arc::new(RwLock::new(HashMap::new()));
-
-            // Start membership services.
-            for id in &identities {
-                let state = ClusterState::new(id.node_id, 64);
-                let handle = membership::start(id.clone(), membership::test_config(), state, None);
-                routing_table
-                    .write()
-                    .await
-                    .insert(id.node_id, Arc::new(handle));
-            }
-
-            // Create routing tasks for each node.
-            let mut router_tasks = Vec::new();
-            for id in &identities {
-                let task = spawn_router(id.node_id, routing_table.clone());
-                router_tasks.push(task);
-            }
-
-            let network = TestNetwork {
-                handles: routing_table,
-                router_tasks: Arc::new(tokio::sync::Mutex::new(router_tasks)),
-            };
-
-            (network, identities)
-        }
-
-        /// Get the handle for a specific node.
-        async fn handle(&self, node_id: &NodeId) -> Arc<MembershipHandle> {
-            self.handles.read().await[node_id].clone()
-        }
-
-        /// Get the cluster state for a specific node.
-        async fn state(&self, node_id: &NodeId) -> Arc<ClusterState> {
-            self.handles.read().await[node_id].state().clone()
-        }
-
-        /// Add a new node to the network.
-        async fn add_node(&self, identity: ClusterIdentity) {
-            let state = ClusterState::new(identity.node_id, 64);
-            let handle =
-                membership::start(identity.clone(), membership::test_config(), state, None);
-            self.handles
-                .write()
-                .await
-                .insert(identity.node_id, Arc::new(handle));
-
-            let task = spawn_router(identity.node_id, self.handles.clone());
-            self.router_tasks.lock().await.push(task);
-        }
-
-        /// Shut down the network (abort all routing tasks).
-        async fn shutdown(&self) {
-            for task in self.router_tasks.lock().await.iter() {
-                task.abort();
-            }
-            for handle in self.handles.read().await.values() {
-                handle.abort();
-            }
-        }
-    }
-
-    /// Spawn a routing task for a given node that reads outgoing messages
-    /// and delivers them to the target via the shared routing table.
-    fn spawn_router(node_id: NodeId, routing_table: RoutingTable) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            loop {
-                let handle = {
-                    let table = routing_table.read().await;
-                    match table.get(&node_id) {
-                        Some(h) => h.clone(),
-                        None => break,
-                    }
-                };
-
-                match handle.next_outgoing().await {
-                    Some((target, data)) => {
-                        let table = routing_table.read().await;
-                        if let Some(target_handle) = table.get(&target.node_id) {
-                            let _ = target_handle.feed_data(data);
-                        }
-                    }
-                    None => break,
-                }
-            }
-        })
-    }
-
-    /// Wait for a condition to become true within a timeout.
-    async fn wait_for<F, Fut>(timeout: Duration, poll_interval: Duration, condition: F)
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let deadline = time::Instant::now() + timeout;
-        loop {
-            if condition().await {
-                return;
-            }
-            if time::Instant::now() >= deadline {
-                panic!("condition not met within {timeout:?}");
-            }
-            time::sleep(poll_interval).await;
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Identity tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_cluster_identity_foca_traits() {
-        use foca::Identity;
-
-        let id = test_identity(1);
-        assert_eq!(id.addr(), NodeId::from([1; 32]));
-
-        // Renewal bumps generation.
-        let renewed = id.renew().expect("should renew");
-        assert_eq!(renewed.generation, 2);
-        assert_eq!(renewed.node_id, id.node_id);
-
-        // Renewed identity wins conflict.
-        assert!(renewed.win_addr_conflict(&id));
-        assert!(!id.win_addr_conflict(&renewed));
-    }
-
-    #[test]
-    fn test_cluster_identity_to_member_conversion() {
-        use shoal_types::Member;
-
-        let id = test_identity(1);
-        let member: Member = id.clone().into();
-
-        assert_eq!(member.node_id, id.node_id);
-        assert_eq!(member.generation, id.generation);
-        assert_eq!(member.capacity, id.capacity);
-        assert_eq!(member.state, MemberState::Alive);
-    }
-
-    #[test]
-    fn test_member_to_cluster_identity_conversion() {
-        use shoal_types::Member;
-
-        let member = Member {
-            node_id: NodeId::from([5; 32]),
-            capacity: 999,
-            state: MemberState::Dead,
-            generation: 42,
+    /// Create a test member.
+    fn test_member(n: u8) -> shoal_types::Member {
+        shoal_types::Member {
+            node_id: NodeId::from([n; 32]),
+            capacity: 1_000_000_000,
+            state: MemberState::Alive,
+            generation: 1,
             topology: NodeTopology::default(),
-        };
-
-        let id: ClusterIdentity = member.into();
-        assert_eq!(id.node_id, NodeId::from([5; 32]));
-        assert_eq!(id.generation, 42);
-        assert_eq!(id.capacity, 999);
+        }
     }
-
-    #[test]
-    fn test_cluster_identity_postcard_roundtrip() {
-        let id = test_identity(1);
-        let encoded = postcard::to_allocvec(&id).expect("encode");
-        let decoded: ClusterIdentity = postcard::from_bytes(&encoded).expect("decode");
-        assert_eq!(id, decoded);
-    }
-
-    // -----------------------------------------------------------------------
-    // ClusterState tests
-    // -----------------------------------------------------------------------
 
     #[tokio::test]
     async fn test_cluster_state_add_member() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
-        let member: shoal_types::Member = test_identity(1).into();
+        let member = test_member(1);
 
         state.add_member(member.clone()).await;
 
@@ -231,7 +43,7 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_state_remove_member() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
-        let member: shoal_types::Member = test_identity(1).into();
+        let member = test_member(1);
 
         state.add_member(member.clone()).await;
         assert_eq!(state.member_count().await, 1);
@@ -244,7 +56,7 @@ mod tests {
     #[tokio::test]
     async fn test_cluster_state_mark_dead() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
-        let member: shoal_types::Member = test_identity(1).into();
+        let member = test_member(1);
 
         state.add_member(member.clone()).await;
         state.mark_dead(&member.node_id).await;
@@ -264,8 +76,8 @@ mod tests {
     async fn test_cluster_state_ring_recomputed_on_add() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
 
-        let m1: shoal_types::Member = test_identity(1).into();
-        let m2: shoal_types::Member = test_identity(2).into();
+        let m1 = test_member(1);
+        let m2 = test_member(2);
 
         state.add_member(m1).await;
         assert_eq!(state.ring().await.node_count(), 1);
@@ -278,8 +90,8 @@ mod tests {
     async fn test_cluster_state_ring_recomputed_on_remove() {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
 
-        let m1: shoal_types::Member = test_identity(1).into();
-        let m2: shoal_types::Member = test_identity(2).into();
+        let m1 = test_member(1);
+        let m2 = test_member(2);
 
         state.add_member(m1.clone()).await;
         state.add_member(m2).await;
@@ -294,7 +106,7 @@ mod tests {
         let state = ClusterState::new(NodeId::from([0; 32]), 64);
         let mut rx = state.event_bus().subscribe::<MembershipReady>();
 
-        let member: shoal_types::Member = test_identity(1).into();
+        let member = test_member(1);
         state.add_member(member.clone()).await;
 
         let event = rx.recv().await.expect("should receive event");
@@ -307,7 +119,7 @@ mod tests {
         let mut rx_ready = state.event_bus().subscribe::<MembershipReady>();
         let mut rx_dead = state.event_bus().subscribe::<MembershipDead>();
 
-        let member: shoal_types::Member = test_identity(1).into();
+        let member = test_member(1);
         state.add_member(member.clone()).await;
         let _ = rx_ready.recv().await; // consume MembershipReady
 
@@ -318,233 +130,199 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // MembershipService tests — cluster via simulated network
+    // PeerHandle unit tests (mock transport)
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_three_nodes_discover_each_other() {
-        let (network, identities) = TestNetwork::create(3).await;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use shoal_net::{NetError, ShoalMessage, Transport};
+    use shoal_types::ShardId;
 
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed.clone())
-            .expect("join");
-        network
-            .handle(&identities[2].node_id)
-            .await
-            .join(seed)
-            .expect("join");
+    use crate::membership::{self, AddressBook, PeerManagerConfig};
 
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                let mut ok = true;
-                for id in ids {
-                    if net.state(&id.node_id).await.member_count().await < 2 {
-                        ok = false;
-                    }
-                }
-                ok
-            },
-        )
-        .await;
+    /// A mock transport that responds to pings with pongs and records sends.
+    struct MockTransport {
+        /// If true, pings succeed (return Pong). If false, they fail.
+        pings_succeed: Arc<std::sync::atomic::AtomicBool>,
+    }
 
-        for id in &identities {
-            let members = network.state(&id.node_id).await.members().await;
-            assert_eq!(
-                members.len(),
-                2,
-                "node {} should see 2 other members, sees {}",
-                id.node_id,
-                members.len()
-            );
+    impl MockTransport {
+        fn new(succeed: bool) -> Self {
+            Self {
+                pings_succeed: Arc::new(std::sync::atomic::AtomicBool::new(succeed)),
+            }
         }
 
-        network.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_kill_node_others_detect_dead() {
-        let (network, identities) = TestNetwork::create(3).await;
-
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed.clone())
-            .expect("join");
-        network
-            .handle(&identities[2].node_id)
-            .await
-            .join(seed)
-            .expect("join");
-
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                for id in ids {
-                    if net.state(&id.node_id).await.member_count().await < 2 {
-                        return false;
-                    }
-                }
-                true
-            },
-        )
-        .await;
-
-        let killed_id = identities[2].node_id;
-        network.handle(&killed_id).await.abort();
-
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                let s1 = net
-                    .state(&identities[0].node_id)
-                    .await
-                    .get_member(&killed_id)
-                    .await;
-                let s2 = net
-                    .state(&identities[1].node_id)
-                    .await
-                    .get_member(&killed_id)
-                    .await;
-                let d1 = s1.as_ref().is_some_and(|m| m.state == MemberState::Dead);
-                let d2 = s2.as_ref().is_some_and(|m| m.state == MemberState::Dead);
-                d1 && d2
-            },
-        )
-        .await;
-
-        network.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn test_new_node_joins_existing_cluster() {
-        let (network, identities) = TestNetwork::create(2).await;
-
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed.clone())
-            .expect("join");
-
-        // Wait for initial convergence.
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                let c1 = net.state(&ids[0].node_id).await.member_count().await;
-                let c2 = net.state(&ids[1].node_id).await.member_count().await;
-                c1 >= 1 && c2 >= 1
-            },
-        )
-        .await;
-
-        // Add node 3.
-        let new_id = test_identity(3);
-        network.add_node(new_id.clone()).await;
-        network
-            .handle(&new_id.node_id)
-            .await
-            .join(seed)
-            .expect("join");
-
-        // Wait for all 3 to converge.
-        let new_node_id = new_id.node_id;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                let c1 = net.state(&ids[0].node_id).await.member_count().await;
-                let c2 = net.state(&ids[1].node_id).await.member_count().await;
-                let c3 = net.state(&new_node_id).await.member_count().await;
-                c1 >= 2 && c2 >= 2 && c3 >= 2
-            },
-        )
-        .await;
-
-        for id in &identities {
-            let has_new = network
-                .state(&id.node_id)
-                .await
-                .get_member(&new_id.node_id)
-                .await;
-            assert!(
-                has_new.is_some(),
-                "node {} should know about new node {}",
-                id.node_id,
-                new_id.node_id
-            );
+        fn set_pings_succeed(&self, succeed: bool) {
+            self.pings_succeed
+                .store(succeed, std::sync::atomic::Ordering::Relaxed);
         }
+    }
 
-        network.shutdown().await;
+    #[async_trait]
+    impl Transport for MockTransport {
+        async fn push_shard(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _shard_id: ShardId,
+            _data: Bytes,
+        ) -> Result<(), NetError> {
+            Ok(())
+        }
+        async fn pull_shard(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _shard_id: ShardId,
+        ) -> Result<Option<Bytes>, NetError> {
+            Ok(None)
+        }
+        async fn send_to(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _msg: &ShoalMessage,
+        ) -> Result<(), NetError> {
+            Ok(())
+        }
+        async fn pull_manifests(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _manifest_ids: &[shoal_types::ObjectId],
+        ) -> Result<Vec<(shoal_types::ObjectId, Vec<u8>)>, NetError> {
+            Ok(vec![])
+        }
+        async fn pull_log_entries(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _my_tips: &[[u8; 32]],
+        ) -> Result<Vec<Vec<u8>>, NetError> {
+            Ok(vec![])
+        }
+        async fn pull_log_sync(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _entry_hashes: &[[u8; 32]],
+            _my_tips: &[[u8; 32]],
+        ) -> Result<Vec<Vec<u8>>, NetError> {
+            Ok(vec![])
+        }
+        async fn pull_api_keys(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _access_key_ids: &[String],
+        ) -> Result<Vec<(String, String)>, NetError> {
+            Ok(vec![])
+        }
+        async fn lookup_key(
+            &self,
+            _addr: iroh::EndpointAddr,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<Option<Vec<u8>>, NetError> {
+            Ok(None)
+        }
+        async fn request_response(
+            &self,
+            _addr: iroh::EndpointAddr,
+            msg: &ShoalMessage,
+        ) -> Result<ShoalMessage, NetError> {
+            if self
+                .pings_succeed
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                match msg {
+                    ShoalMessage::Ping { timestamp } => Ok(ShoalMessage::Pong {
+                        timestamp: *timestamp,
+                    }),
+                    ShoalMessage::JoinRequest { .. } => {
+                        Ok(ShoalMessage::JoinResponse { members: vec![] })
+                    }
+                    _ => Err(NetError::Serialization("unexpected message".into())),
+                }
+            } else {
+                Err(NetError::Connect("mock: ping failed".into()))
+            }
+        }
+    }
+
+    /// Create a test EndpointAddr from a node number using a valid keypair.
+    fn test_addr(n: u8) -> iroh::EndpointAddr {
+        let secret = iroh::SecretKey::from([n; 32]);
+        let public = secret.public();
+        iroh::EndpointAddr::new(public)
     }
 
     #[tokio::test]
-    async fn test_ring_recomputed_on_membership_change() {
-        let (network, identities) = TestNetwork::create(3).await;
+    async fn test_ping_pong_alive() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(true));
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed.clone())
-            .expect("join");
-        network
-            .handle(&identities[2].node_id)
-            .await
-            .join(seed)
-            .expect("join");
+        let handle = membership::start(
+            node_id,
+            PeerManagerConfig::test_config(),
+            cluster.clone(),
+            transport,
+            None,
+            address_book,
+        );
 
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async { net.state(&ids[0].node_id).await.member_count().await >= 2 },
-        )
-        .await;
+        // Add a peer.
+        let peer_id = NodeId::from([1u8; 32]);
+        handle
+            .add_peer(peer_id, test_addr(1), 1, 1_000_000, NodeTopology::default())
+            .await;
 
-        let ring = network.state(&identities[0].node_id).await.ring().await;
-        assert_eq!(ring.node_count(), 2);
+        // Wait for a few ping rounds.
+        time::sleep(Duration::from_millis(500)).await;
 
-        network.shutdown().await;
+        // Peer should still be alive in cluster state.
+        let member = cluster.get_member(&peer_id).await;
+        assert!(member.is_some(), "peer should be in cluster state");
+        assert_eq!(member.unwrap().state, MemberState::Alive);
+
+        handle.leave();
+        time::sleep(Duration::from_millis(100)).await;
     }
 
     #[tokio::test]
-    async fn test_events_received_by_subscribers() {
-        let (network, identities) = TestNetwork::create(2).await;
-        let mut rx = network
-            .state(&identities[0].node_id)
-            .await
-            .event_bus()
-            .subscribe::<MembershipReady>();
+    async fn test_no_pong_marks_suspect_then_dead() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(false)); // Pings fail
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(identities[0].clone())
-            .expect("join");
+        let config = PeerManagerConfig {
+            ping_interval: Duration::from_millis(50),
+            suspect_timeout: Duration::from_millis(200),
+            dead_timeout: Duration::from_millis(500),
+            max_failures_before_suspect: 2,
+        };
 
-        let deadline = time::Instant::now() + Duration::from_secs(5);
-        let mut received_join = false;
+        let handle = membership::start(
+            node_id,
+            config,
+            cluster.clone(),
+            transport,
+            None,
+            address_book,
+        );
+
+        let peer_id = NodeId::from([1u8; 32]);
+        handle
+            .add_peer(peer_id, test_addr(1), 1, 1_000_000, NodeTopology::default())
+            .await;
+
+        // Wait for enough failures to trigger suspect, then dead.
+        let mut rx_dead = cluster.event_bus().subscribe::<MembershipDead>();
+
+        let deadline = time::Instant::now() + Duration::from_secs(3);
+        let mut got_dead = false;
         loop {
             tokio::select! {
-                Some(event) = rx.recv() => {
-                    if event.node_id == identities[1].node_id {
-                        received_join = true;
+                Some(event) = rx_dead.recv() => {
+                    if event.node_id == peer_id {
+                        got_dead = true;
                         break;
                     }
                 }
@@ -556,217 +334,201 @@ mod tests {
             }
         }
 
-        assert!(received_join, "should have received MembershipReady event");
+        assert!(got_dead, "peer should have been declared dead");
 
-        network.shutdown().await;
+        let member = cluster.get_member(&peer_id).await.expect("should exist");
+        assert_eq!(member.state, MemberState::Dead);
+
+        handle.leave();
+        time::sleep(Duration::from_millis(100)).await;
     }
 
-    // -----------------------------------------------------------------------
-    // Foca member_buf panic reproduction (foca 0.17.2 bug)
-    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_recovery_after_suspect() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(false)); // Start with failures
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-    /// Encode a foca SWIM message using PostcardCodec.
-    ///
-    /// This crafts raw bytes that can be fed to a foca instance via handle_data.
-    fn encode_swim_message(
-        header: foca::Header<ClusterIdentity>,
-        updates: &[foca::Member<ClusterIdentity>],
-    ) -> Vec<u8> {
-        use bytes::BufMut;
-        use foca::Codec;
+        let config = PeerManagerConfig {
+            ping_interval: Duration::from_millis(50),
+            suspect_timeout: Duration::from_millis(200),
+            dead_timeout: Duration::from_secs(10), // Long dead timeout
+            max_failures_before_suspect: 2,
+        };
 
-        let mut codec = foca::PostcardCodec;
-        let mut buf = bytes::BytesMut::new();
+        let handle = membership::start(
+            node_id,
+            config,
+            cluster.clone(),
+            transport.clone(),
+            None,
+            address_book,
+        );
 
-        codec
-            .encode_header(&header, &mut buf)
-            .expect("encode header");
+        let peer_id = NodeId::from([1u8; 32]);
+        handle
+            .add_peer(peer_id, test_addr(1), 1, 1_000_000, NodeTopology::default())
+            .await;
 
-        if !updates.is_empty() {
-            buf.put_u16(updates.len() as u16);
-            for member in updates {
-                codec
-                    .encode_member(member, &mut buf)
-                    .expect("encode member");
+        // Wait for suspect.
+        time::sleep(Duration::from_millis(400)).await;
+
+        // Now make pings succeed — peer should recover.
+        transport.set_pings_succeed(true);
+        time::sleep(Duration::from_millis(300)).await;
+
+        // Peer should be alive again.
+        let member = cluster.get_member(&peer_id).await.expect("should exist");
+        assert_eq!(
+            member.state,
+            MemberState::Alive,
+            "peer should have recovered to alive"
+        );
+
+        handle.leave();
+        time::sleep(Duration::from_millis(100)).await;
+    }
+
+    #[tokio::test]
+    async fn test_handle_join_request() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(true));
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
+
+        let handle = membership::start(
+            node_id,
+            PeerManagerConfig::test_config(),
+            cluster.clone(),
+            transport,
+            None,
+            address_book,
+        );
+
+        // Add an existing peer.
+        let existing_id = NodeId::from([1u8; 32]);
+        handle
+            .add_peer(
+                existing_id,
+                test_addr(1),
+                1,
+                1_000_000,
+                NodeTopology::default(),
+            )
+            .await;
+
+        // Handle a join request from a new node.
+        let new_id = NodeId::from([2u8; 32]);
+        let response = handle
+            .handle_join_request(new_id, 1, 2_000_000, NodeTopology::default(), test_addr(2))
+            .await;
+
+        // Response should contain both the local node and the existing peer.
+        match response {
+            ShoalMessage::JoinResponse { members } => {
+                assert!(
+                    members.len() >= 2,
+                    "response should contain at least 2 members, got {}",
+                    members.len()
+                );
+                let node_ids: Vec<NodeId> = members.iter().map(|m| m.node_id).collect();
+                assert!(node_ids.contains(&node_id), "should include local node");
+                assert!(
+                    node_ids.contains(&existing_id),
+                    "should include existing peer"
+                );
             }
+            other => panic!("expected JoinResponse, got: {other:?}"),
         }
 
-        buf.to_vec()
+        // The new node should now be in the cluster state.
+        let member = cluster.get_member(&new_id).await;
+        assert!(member.is_some(), "new node should be in cluster state");
+
+        handle.leave();
+        time::sleep(Duration::from_millis(100)).await;
     }
 
-    /// Verify that foca 1.0 handles suspect-self correctly without panicking.
-    ///
-    /// foca 0.17.2 had a bug where receiving a Suspect update about the local
-    /// node triggered a debug_assert panic (member_buf modified while taken).
-    /// foca 1.0 fixes this — handle_data should succeed.
     #[tokio::test]
-    async fn test_foca_handles_suspect_self_without_panic() {
-        use foca::{AccumulatingRuntime, PostcardCodec};
-        use rand::SeedableRng;
-        use rand::rngs::SmallRng;
+    async fn test_peer_manager_with_multiple_nodes() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(true));
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-        let id_a = test_identity(1);
-        let id_b = test_identity(2);
-        let id_c = test_identity(3);
-
-        // Create a foca instance for Node B.
-        let rng = SmallRng::from_os_rng();
-        let codec = PostcardCodec;
-        let config = membership::test_config();
-        let mut foca = foca::Foca::new(id_b.clone(), config, rng, codec);
-        let mut runtime = AccumulatingRuntime::new();
-
-        // Add two peers so gossip() has targets to send to.
-        foca.apply_many(
-            [
-                foca::Member::alive(id_a.clone()),
-                foca::Member::alive(id_c.clone()),
-            ]
-            .into_iter(),
-            true,
-            &mut runtime,
-        )
-        .expect("apply");
-        // Drain runtime to clear accumulated events.
-        while runtime.to_send().is_some() {}
-        while runtime.to_schedule().is_some() {}
-        while runtime.to_notify().is_some() {}
-
-        // Craft a SWIM message from Node A to Node B that contains
-        // a piggybacked Suspect update about Node B itself.
-        let msg = encode_swim_message(
-            foca::Header {
-                src: id_a.clone(),
-                src_incarnation: 0,
-                dst: id_b.clone(),
-                message: foca::Message::Gossip,
-            },
-            &[foca::Member::new(
-                id_b.clone(),
-                0, // incarnation
-                foca::State::Suspect,
-            )],
+        let handle = membership::start(
+            node_id,
+            PeerManagerConfig::test_config(),
+            cluster.clone(),
+            transport,
+            None,
+            address_book,
         );
 
-        // In foca 1.0, this should succeed without panic.
-        foca.handle_data(&msg, &mut runtime)
-            .expect("handle_data should succeed for suspect-self in foca 1.0");
+        // Add 5 peers.
+        for i in 1..=5u8 {
+            handle
+                .add_peer(
+                    NodeId::from([i; 32]),
+                    test_addr(i),
+                    1,
+                    1_000_000_000,
+                    NodeTopology::default(),
+                )
+                .await;
+        }
+
+        // Wait for some ping rounds.
+        time::sleep(Duration::from_millis(500)).await;
+
+        // All peers should be alive.
+        assert_eq!(cluster.member_count().await, 5);
+        assert_eq!(cluster.alive_count().await, 5);
+
+        // Ring should have 5 nodes.
+        let ring = cluster.ring().await;
+        assert_eq!(ring.node_count(), 5);
+
+        handle.leave();
+        time::sleep(Duration::from_millis(100)).await;
     }
 
-    /// Verify the membership service handles suspect-self messages correctly.
-    ///
-    /// In foca 1.0, this is handled cleanly (no panic). The service should
-    /// remain running and functional after processing the message.
     #[tokio::test]
-    async fn test_membership_handles_suspect_self() {
-        // Set up a 3-node network.
-        let (network, identities) = TestNetwork::create(3).await;
+    async fn test_leave_gracefully() {
+        let node_id = NodeId::from([0u8; 32]);
+        let cluster = ClusterState::new(node_id, 64);
+        let transport = Arc::new(MockTransport::new(true));
+        let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed.clone())
-            .expect("join");
-        network
-            .handle(&identities[2].node_id)
-            .await
-            .join(seed)
-            .expect("join");
-
-        // Wait for convergence.
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async {
-                for id in ids {
-                    if net.state(&id.node_id).await.member_count().await < 2 {
-                        return false;
-                    }
-                }
-                true
-            },
-        )
-        .await;
-
-        // Craft a Suspect message about Node 1 and feed it to Node 1.
-        // This triggers the foca member_buf bug, but our workaround
-        // should keep the service alive.
-        let suspect_msg = encode_swim_message(
-            foca::Header {
-                src: identities[1].clone(),
-                src_incarnation: 0,
-                dst: identities[0].clone(),
-                message: foca::Message::Gossip,
-            },
-            &[foca::Member::new(
-                identities[0].clone(),
-                0,
-                foca::State::Suspect,
-            )],
+        let handle = membership::start(
+            node_id,
+            PeerManagerConfig::test_config(),
+            cluster,
+            transport,
+            None,
+            address_book,
         );
 
-        let handle = network.handle(&identities[0].node_id).await;
-        // Feed the suspect message — foca 1.0 handles this cleanly.
-        handle.feed_data(suspect_msg).expect("feed_data");
-
-        // Give it time to process.
-        time::sleep(Duration::from_millis(200)).await;
-
-        // The service should still be running.
-        assert!(
-            handle.is_running(),
-            "membership service should survive the foca bug"
-        );
-
-        // The node should still respond to SWIM messages (cluster is still functional).
-        let count = network
-            .state(&identities[0].node_id)
-            .await
-            .member_count()
+        // Add a peer.
+        handle
+            .add_peer(
+                NodeId::from([1u8; 32]),
+                test_addr(1),
+                1,
+                1_000_000,
+                NodeTopology::default(),
+            )
             .await;
-        assert!(
-            count >= 1,
-            "node should still have members after processing suspect-self"
-        );
 
-        network.shutdown().await;
-    }
+        assert!(handle.is_running(), "should be running");
 
-    #[tokio::test]
-    async fn test_membership_service_leave() {
-        let (network, identities) = TestNetwork::create(2).await;
+        handle.leave();
 
-        let seed = identities[0].clone();
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .join(seed)
-            .expect("join");
-
-        let net = &network;
-        let ids = &identities;
-        wait_for(
-            Duration::from_secs(5),
-            Duration::from_millis(50),
-            || async { net.state(&ids[0].node_id).await.member_count().await >= 1 },
-        )
-        .await;
-
-        network
-            .handle(&identities[1].node_id)
-            .await
-            .leave()
-            .expect("leave");
-
-        time::sleep(Duration::from_millis(200)).await;
-
-        let h = network.handle(&identities[1].node_id).await;
+        // Wait for it to shut down.
         let deadline = time::Instant::now() + Duration::from_secs(3);
         loop {
-            if !h.is_running() {
+            if !handle.is_running() {
                 break;
             }
             if time::Instant::now() >= deadline {
@@ -775,6 +537,6 @@ mod tests {
             time::sleep(Duration::from_millis(50)).await;
         }
 
-        network.shutdown().await;
+        assert!(!handle.is_running(), "should have stopped after leave");
     }
 }

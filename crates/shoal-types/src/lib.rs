@@ -253,7 +253,7 @@ pub enum ClusterEvent {
     ShardStored(ShardId, NodeId),
     /// A shard needs repair (under-replicated or corrupted).
     RepairNeeded(ShardId),
-    /// The local node is now active in the cluster (foca considers it joined).
+    /// The local node is now active in the cluster.
     ///
     /// Emitted once the SWIM protocol has confirmed this node's membership.
     /// Components can wait for this event before starting work that depends

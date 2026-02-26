@@ -63,7 +63,7 @@ pub enum EventOrigin {
     Gossip,
 }
 
-/// A node has been declared active in the cluster by foca SWIM.
+/// A node has been declared active in the cluster.
 #[derive(Clone, Debug)]
 pub struct MembershipReady {
     /// The node that became ready.

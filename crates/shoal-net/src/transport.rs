@@ -642,6 +642,26 @@ impl ShoalTransport {
         }
     }
 
+    /// Send a request on a bi-directional stream and return the response.
+    ///
+    /// Opens a bi-stream, sends `msg`, reads one response, and returns it.
+    /// Used for Ping/Pong and JoinRequest/JoinResponse exchanges.
+    pub async fn request_response(
+        &self,
+        addr: EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError> {
+        let conn = self.get_connection(addr).await?;
+
+        let (mut send, mut recv) = conn
+            .open_bi()
+            .await
+            .map_err(|e| NetError::StreamOpen(e.to_string()))?;
+
+        Self::send_on_stream(&mut send, msg).await?;
+        Self::recv_message(&mut recv).await
+    }
+
     /// Gracefully close the transport.
     pub async fn close(&self) {
         self.endpoint.close().await;
@@ -715,5 +735,13 @@ impl crate::Transport for ShoalTransport {
         key: &str,
     ) -> Result<Option<Vec<u8>>, crate::NetError> {
         self.lookup_key(addr, bucket, key).await
+    }
+
+    async fn request_response(
+        &self,
+        addr: EndpointAddr,
+        msg: &crate::ShoalMessage,
+    ) -> Result<crate::ShoalMessage, crate::NetError> {
+        self.request_response(addr, msg).await
     }
 }

@@ -255,4 +255,13 @@ impl Transport for ChaosTransport {
         self.apply_chaos(&addr).await?;
         self.inner.lookup_key(addr, bucket, key).await
     }
+
+    async fn request_response(
+        &self,
+        addr: iroh::EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError> {
+        self.apply_chaos(&addr).await?;
+        self.inner.request_response(addr, msg).await
+    }
 }

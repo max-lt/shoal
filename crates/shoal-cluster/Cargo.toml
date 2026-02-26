@@ -8,7 +8,6 @@ shoal-types = { workspace = true }
 shoal-meta = { workspace = true }
 shoal-placement = { workspace = true }
 shoal-net = { workspace = true }
-foca = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 postcard = { workspace = true }

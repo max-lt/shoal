@@ -31,11 +31,12 @@ use clap::{Parser, Subcommand};
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
-use shoal_cluster::{ClusterIdentity, ClusterState, GossipService, membership};
+use shoal_cluster::membership::AddressBook;
+use shoal_cluster::{ClusterState, GossipService, PeerManagerConfig};
 use shoal_engine::{ShoalNode, ShoalNodeConfig};
 use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
-use shoal_net::{ShoalMessage, ShoalTransport};
+use shoal_net::ShoalTransport;
 use shoal_repair::executor::ShardTransfer;
 use shoal_repair::{CircuitBreaker, RepairDetector, RepairExecutor, RepairScheduler, Throttle};
 use shoal_s3::{S3Server, S3ServerConfig};
@@ -303,7 +304,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
 
     // Create the iroh endpoint directly. The Router will manage the accept
     // loop for incoming connections; the ShoalTransport is used only for
-    // outgoing connections (push/pull shards, SWIM routing).
+    // outgoing connections (push/pull shards, peer pings).
     let endpoint = Endpoint::builder()
         .secret_key(secret_key)
         .alpns(vec![cluster_alpn.clone()])
@@ -352,8 +353,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let cluster = ClusterState::new(node_id, 128);
 
     // Add self to the ring immediately so shard placement includes this node
-    // from the first write. Without this, the local node wouldn't appear in
-    // the ring until foca considers it "active" (after a peer exchange).
+    // from the first write.
     cluster
         .add_member(Member {
             node_id,
@@ -368,39 +368,16 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let event_bus = EventBus::new();
 
     // --- Address book: NodeId → EndpointAddr for routing ---
-    let address_book: Arc<RwLock<HashMap<NodeId, EndpointAddr>>> =
-        Arc::new(RwLock::new(HashMap::new()));
+    let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
-    // --- Membership service (foca SWIM) ---
-    // Replace wildcard (0.0.0.0 / [::]) addresses with localhost so that
-    // peers can actually connect. When the user binds to a specific IP,
-    // it is kept as-is.
-    let listen_addrs: Vec<SocketAddr> = endpoint
-        .bound_sockets()
-        .into_iter()
-        .map(|addr| {
-            if addr.ip().is_unspecified() {
-                SocketAddr::new(
-                    if addr.ip().is_ipv4() {
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-                    } else {
-                        std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-                    },
-                    addr.port(),
-                )
-            } else {
-                addr
-            }
-        })
-        .collect();
-    let identity = ClusterIdentity::new(node_id, 1, u64::MAX, NodeTopology::default())
-        .with_listen_addrs(listen_addrs);
-    let membership_handle = Arc::new(membership::start_with_address_book(
-        identity.clone(),
-        membership::default_config(100),
+    // --- Peer manager (QUIC ping/pong health checking) ---
+    let peer_handle = Arc::new(shoal_cluster::membership::start(
+        node_id,
+        PeerManagerConfig::default_config(),
         cluster.clone(),
+        transport.clone() as Arc<dyn shoal_net::Transport>,
         Some(meta.clone()),
-        Some(address_book.clone()),
+        address_book.clone(),
     ));
 
     // --- Load persisted peers from previous runs ---
@@ -420,15 +397,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                         addr = addr.with_ip_addr(*socket_addr);
                     }
 
-                    address_book.write().await.insert(*peer_node_id, addr);
-
-                    let peer_identity =
-                        ClusterIdentity::new(*peer_node_id, 1, u64::MAX, NodeTopology::default())
-                            .with_listen_addrs(addrs.clone());
-
-                    if let Err(e) = membership_handle.join(peer_identity) {
-                        debug!(node_id = %peer_node_id, %e, "failed to announce to persisted peer");
-                    }
+                    peer_handle
+                        .add_peer(*peer_node_id, addr, 1, u64::MAX, NodeTopology::default())
+                        .await;
                 }
             }
         }
@@ -446,62 +417,16 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                 address_book
                     .write()
                     .await
-                    .insert(peer_node_id, peer_endpoint_addr);
-                let peer_identity =
-                    ClusterIdentity::new(peer_node_id, 1, u64::MAX, NodeTopology::default());
+                    .insert(peer_node_id, peer_endpoint_addr.clone());
                 info!(peer = %peer_str, "joining cluster via peer");
-                if let Err(e) = membership_handle.join(peer_identity) {
-                    warn!(peer = %peer_str, %e, "failed to announce to peer");
+                if let Err(e) = peer_handle.join_via_seed(peer_endpoint_addr).await {
+                    warn!(peer = %peer_str, %e, "failed to join via peer");
                 }
             }
             Err(e) => {
                 warn!(peer = %peer_str, %e, "invalid peer format, skipping");
             }
         }
-    }
-
-    // --- Outgoing SWIM routing loop ---
-    // Reads foca's outgoing messages and sends them to target nodes via iroh.
-    {
-        let transport = transport.clone();
-        let handle = membership_handle.clone();
-        let book = address_book.clone();
-        tokio::spawn(async move {
-            loop {
-                match handle.next_outgoing().await {
-                    Some((target, data)) => {
-                        // Resolve target address: check book first, then fall back to relay.
-                        let addr = {
-                            let book = book.read().await;
-                            book.get(&target.node_id).cloned()
-                        };
-                        let addr = match addr {
-                            Some(a) => a,
-                            None => {
-                                // No known direct address — construct from public key.
-                                // iroh will attempt relay-based connection.
-                                match iroh::EndpointId::from_bytes(target.node_id.as_bytes()) {
-                                    Ok(eid) => EndpointAddr::new(eid),
-                                    Err(_) => {
-                                        warn!(target = %target.node_id, "invalid endpoint ID");
-                                        continue;
-                                    }
-                                }
-                            }
-                        };
-
-                        let msg = ShoalMessage::SwimData(data);
-                        if let Err(e) = transport.send_to(addr, &msg).await {
-                            debug!(target = %target.node_id, %e, "failed to route SWIM message");
-                        }
-                    }
-                    None => {
-                        info!("membership service stopped, exiting routing loop");
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     // --- Gossip service (iroh-gossip) ---
@@ -541,7 +466,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let protocol = ShoalProtocol::new(
         store.clone(),
         meta.clone(),
-        membership_handle.clone(),
+        peer_handle.clone(),
         address_book.clone(),
     )
     .with_log_tree(log_tree.clone())
@@ -667,46 +592,44 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                                             .ok()
                                                             .flatten()
                                                             .is_none()
+                                                        && let Some(addr) = addr.clone()
                                                     {
-                                                        if let Some(addr) = addr.clone() {
-                                                            match transport_bg
-                                                                .pull_manifests(
-                                                                    addr,
-                                                                    &[*manifest_id],
-                                                                )
-                                                                .await
-                                                            {
-                                                                Ok(pairs) => {
-                                                                    for (_oid, mb) in &pairs {
-                                                                        if let Ok(manifest) =
-                                                                            postcard::from_bytes::<
-                                                                                Manifest,
-                                                                            >(
-                                                                                mb
-                                                                            )
-                                                                        {
-                                                                            let _ = meta_bg
-                                                                                .put_manifest(
-                                                                                    &manifest,
-                                                                                );
-                                                                            let _ = meta_bg
-                                                                                .put_object_key(
-                                                                                    bucket,
-                                                                                    key,
-                                                                                    &manifest
-                                                                                        .object_id,
-                                                                                );
-                                                                            let _ = log_tree_bg
-                                                                                .store()
-                                                                                .put_manifest(
-                                                                                    &manifest,
-                                                                                );
-                                                                        }
+                                                        match transport_bg
+                                                            .pull_manifests(
+                                                                addr,
+                                                                std::slice::from_ref(manifest_id),
+                                                            )
+                                                            .await
+                                                        {
+                                                            Ok(pairs) => {
+                                                                for (_oid, mb) in &pairs {
+                                                                    if let Ok(manifest) =
+                                                                        postcard::from_bytes::<
+                                                                            Manifest,
+                                                                        >(
+                                                                            mb
+                                                                        )
+                                                                    {
+                                                                        let _ = meta_bg
+                                                                            .put_manifest(
+                                                                                &manifest,
+                                                                            );
+                                                                        let _ = meta_bg
+                                                                            .put_object_key(
+                                                                                bucket,
+                                                                                key,
+                                                                                &manifest.object_id,
+                                                                            );
+                                                                        let _ = log_tree_bg
+                                                                            .store()
+                                                                            .put_manifest(
+                                                                                &manifest,
+                                                                            );
                                                                     }
                                                                 }
-                                                                Err(e) => {
-                                                                    debug!(%e, "failed to pull manifest after gossip entry");
-                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                debug!(%e, "failed to pull manifest after gossip entry");
                                                             }
                                                         }
                                                     }
@@ -726,7 +649,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                                         match transport_bg
                                                             .pull_api_keys(
                                                                 addr,
-                                                                &[access_key_id.clone()],
+                                                                std::slice::from_ref(access_key_id),
                                                             )
                                                             .await
                                                         {
@@ -792,7 +715,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                         }
                     }
                     GossipPayload::Event(_) => {
-                        // Membership events propagate via foca SWIM, not gossip.
+                        // Membership events propagate via QUIC ping/pong, not gossip.
                     }
                 }
             }
@@ -975,7 +898,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         let log_tree_sync = log_tree.clone();
         let pending_sync = pending_entries.clone();
         tokio::spawn(async move {
-            // Initial delay: let SWIM handshake establish connections.
+            // Initial delay: let peer manager establish connections.
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             loop {
@@ -1022,14 +945,9 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     // 1. Signal background tasks (anti-entropy, etc.) to stop.
     let _ = shutdown_tx.send(true);
 
-    // 2. Notify the cluster we're leaving so peers update immediately
-    //    instead of waiting for the foca SWIM timeout.
-    info!("notifying cluster of departure");
-    if let Err(e) = membership_handle.leave() {
-        warn!(%e, "failed to send leave notification");
-    }
-    // Give foca a moment to disseminate the leave message.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // 2. Stop the peer manager (stops pinging peers).
+    info!("stopping peer manager");
+    peer_handle.leave();
 
     // 3. Shut down the iroh router (stops accepting new connections,
     //    waits for in-flight handlers, then closes the endpoint).

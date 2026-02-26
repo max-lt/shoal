@@ -199,6 +199,23 @@ impl Transport for FailableMockTransport {
 
         Ok(manifest.and_then(|m| postcard::to_allocvec(&m).ok()))
     }
+
+    async fn request_response(
+        &self,
+        addr: iroh::EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        match msg {
+            ShoalMessage::Ping { timestamp } => Ok(ShoalMessage::Pong {
+                timestamp: *timestamp,
+            }),
+            _ => Err(NetError::Serialization("unexpected message".into())),
+        }
+    }
 }
 
 /// Derive a valid (NodeId, EndpointAddr) pair from a seed byte.

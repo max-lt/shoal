@@ -28,7 +28,7 @@ pub struct RepairDetector {
     store: Arc<dyn ShardStore>,
     replication_factor: usize,
     /// Nodes already processed as dead/left — prevents duplicate repair enqueues
-    /// if foca emits the same notification more than once.
+    /// if the same notification fires more than once.
     processed_dead: Mutex<HashSet<NodeId>>,
     /// Typed event bus for emitting repair-related events.
     event_bus: EventBus,

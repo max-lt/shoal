@@ -466,8 +466,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_message_roundtrip_swim_data() {
-        let msg = ShoalMessage::SwimData(vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    async fn test_message_roundtrip_join_request() {
+        let msg = ShoalMessage::JoinRequest {
+            node_id: NodeId::from([42u8; 32]),
+            generation: 5,
+            capacity: 1_000_000_000,
+            topology: NodeTopology {
+                region: "us-east".to_string(),
+                datacenter: "dc1".to_string(),
+                machine: "m1".to_string(),
+            },
+        };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_message_roundtrip_join_response() {
+        let members = vec![
+            Member {
+                node_id: NodeId::from([1u8; 32]),
+                capacity: 1_000_000,
+                state: MemberState::Alive,
+                generation: 1,
+                topology: NodeTopology::default(),
+            },
+            Member {
+                node_id: NodeId::from([2u8; 32]),
+                capacity: 2_000_000,
+                state: MemberState::Alive,
+                generation: 3,
+                topology: NodeTopology {
+                    region: "eu".to_string(),
+                    datacenter: "dc2".to_string(),
+                    machine: "m3".to_string(),
+                },
+            },
+        ];
+        let msg = ShoalMessage::JoinResponse { members };
+        let encoded = postcard::to_allocvec(&msg).unwrap();
+        let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[tokio::test]
+    async fn test_message_roundtrip_join_response_empty() {
+        let msg = ShoalMessage::JoinResponse { members: vec![] };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -489,8 +534,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_message_empty_swim_data() {
-        let msg = ShoalMessage::SwimData(vec![]);
+    async fn test_message_roundtrip_join_request_default_topology() {
+        let msg = ShoalMessage::JoinRequest {
+            node_id: NodeId::from([7u8; 32]),
+            generation: 1,
+            capacity: u64::MAX,
+            topology: NodeTopology::default(),
+        };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(msg, decoded);

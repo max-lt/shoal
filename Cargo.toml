@@ -49,9 +49,6 @@ reed-solomon-simd = "3"
 iroh = "0.96"
 iroh-gossip = { version = "0.96", features = ["net"] }
 
-# Membership
-foca = { version = "1", features = ["postcard-codec", "std", "tracing"] }
-
 # Random
 rand = "0.9"
 

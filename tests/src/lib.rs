@@ -163,6 +163,24 @@ impl Transport for MockTransport {
 
         Ok(manifest.and_then(|m| postcard::to_allocvec(&m).ok()))
     }
+
+    async fn request_response(
+        &self,
+        addr: iroh::EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError> {
+        let node_id = NodeId::from(*addr.id.as_bytes());
+        if self.down_nodes.read().await.contains(&node_id) {
+            return Err(NetError::Endpoint("node is down".into()));
+        }
+        // Mock: respond to pings with pongs.
+        match msg {
+            ShoalMessage::Ping { timestamp } => Ok(ShoalMessage::Pong {
+                timestamp: *timestamp,
+            }),
+            _ => Err(NetError::Serialization("unexpected message".into())),
+        }
+    }
 }
 
 // =========================================================================

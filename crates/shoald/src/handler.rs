@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use iroh::endpoint::Connection;
 use iroh::protocol::AcceptError;
-use shoal_cluster::membership::MembershipHandle;
+use shoal_cluster::PeerHandle;
 use shoal_engine::pending::{self, PendingBuffer, PendingEntry};
 use shoal_logtree::{LogEntry, LogTree, LogTreeError};
 use shoal_meta::MetaStore;
@@ -28,11 +28,11 @@ use tracing::{debug, warn};
 /// Registered with an iroh [`Router`](iroh::protocol::Router) to process
 /// incoming QUIC connections from other Shoal nodes. Dispatches messages
 /// to the appropriate subsystems: shard store, metadata store, and
-/// membership service.
+/// peer manager.
 pub struct ShoalProtocol {
     store: Arc<dyn ShardStore>,
     meta: Arc<MetaStore>,
-    membership: Arc<MembershipHandle>,
+    peer_handle: Arc<PeerHandle>,
     address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
     log_tree: Option<Arc<LogTree>>,
     /// Buffer for log entries that arrived before their parents.
@@ -54,13 +54,13 @@ impl ShoalProtocol {
     pub fn new(
         store: Arc<dyn ShardStore>,
         meta: Arc<MetaStore>,
-        membership: Arc<MembershipHandle>,
+        peer_handle: Arc<PeerHandle>,
         address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
     ) -> Self {
         Self {
             store,
             meta,
-            membership,
+            peer_handle,
             address_book,
             log_tree: None,
             pending_entries: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -222,32 +222,30 @@ fn handle_provide_log_entries(
                             })
                             .collect();
 
-                        if !missing_manifest_ids.is_empty() {
-                            if let Ok(manifest_pairs) = transport
+                        if !missing_manifest_ids.is_empty()
+                            && let Ok(manifest_pairs) = transport
                                 .pull_manifests(addr.clone(), &missing_manifest_ids)
                                 .await
-                            {
-                                for (oid, mb) in &manifest_pairs {
-                                    if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
-                                        let _ = meta.put_manifest(&manifest);
-                                        let _ = log_tree.store().put_manifest(&manifest);
+                        {
+                            for (oid, mb) in &manifest_pairs {
+                                if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                    let _ = meta.put_manifest(&manifest);
+                                    let _ = log_tree.store().put_manifest(&manifest);
 
-                                        // Cache key mappings.
-                                        for entry in &entries {
-                                            if let shoal_logtree::Action::Put {
+                                    // Cache key mappings.
+                                    for entry in &entries {
+                                        if let shoal_logtree::Action::Put {
+                                            bucket,
+                                            key,
+                                            manifest_id,
+                                        } = &entry.action
+                                            && manifest_id == oid
+                                        {
+                                            let _ = meta.put_object_key(
                                                 bucket,
                                                 key,
-                                                manifest_id,
-                                            } = &entry.action
-                                            {
-                                                if manifest_id == oid {
-                                                    let _ = meta.put_object_key(
-                                                        bucket,
-                                                        key,
-                                                        &manifest.object_id,
-                                                    );
-                                                }
-                                            }
+                                                &manifest.object_id,
+                                            );
                                         }
                                     }
                                 }
@@ -269,13 +267,12 @@ fn handle_provide_log_entries(
                             })
                             .collect();
 
-                        if !missing_key_ids.is_empty() {
-                            if let Ok(key_pairs) =
+                        if !missing_key_ids.is_empty()
+                            && let Ok(key_pairs) =
                                 transport.pull_api_keys(addr, &missing_key_ids).await
-                            {
-                                for (kid, secret) in &key_pairs {
-                                    let _ = meta.put_api_key(kid, secret);
-                                }
+                        {
+                            for (kid, secret) in &key_pairs {
+                                let _ = meta.put_api_key(kid, secret);
                             }
                         }
 
@@ -311,9 +308,8 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .entry(remote_node_id)
             .or_insert(remote_addr);
 
-        // Spawn a handler for uni-directional streams (SWIM data + log entry provides).
+        // Spawn a handler for uni-directional streams (log entry provides).
         let conn_uni = conn.clone();
-        let membership = self.membership.clone();
         let log_tree_uni = self.log_tree.clone();
         let meta_uni = self.meta.clone();
         let pending_uni = self.pending_entries.clone();
@@ -321,7 +317,6 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         let address_book_uni = self.address_book.clone();
         tokio::spawn(async move {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
-                let membership = membership.clone();
                 let log_tree = log_tree_uni.clone();
                 let meta = meta_uni.clone();
                 let pending = pending_uni.clone();
@@ -329,11 +324,6 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                 let address_book = address_book_uni.clone();
                 async move {
                     match msg {
-                        ShoalMessage::SwimData(data) => {
-                            if let Err(e) = membership.feed_data(data) {
-                                warn!(%e, "failed to feed SWIM data");
-                            }
-                        }
                         ShoalMessage::ProvideLogEntries { entries } => {
                             handle_provide_log_entries(
                                 entries,
@@ -353,19 +343,42 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .await;
         });
 
-        // Handle bi-directional streams (shard pull, manifest pull, log sync, api keys).
+        // Handle bi-directional streams (shard pull, manifest pull, log sync,
+        // api keys, ping/pong, join request/response).
         let store = self.store.clone();
         let meta = self.meta.clone();
         let log_tree_bi = self.log_tree.clone();
         let event_bus_bi = self.event_bus.clone();
+        let peer_handle_bi = self.peer_handle.clone();
+        let remote_addr_bi = iroh::EndpointAddr::new(remote_id);
         tokio::spawn(async move {
             ShoalTransport::handle_bi_streams(conn, move |msg| {
                 let store = store.clone();
                 let meta = meta.clone();
                 let log_tree = log_tree_bi.clone();
                 let event_bus = event_bus_bi.clone();
+                let peer_handle = peer_handle_bi.clone();
+                let remote_addr = remote_addr_bi.clone();
                 async move {
                     match msg {
+                        ShoalMessage::Ping { timestamp } => Some(ShoalMessage::Pong { timestamp }),
+                        ShoalMessage::JoinRequest {
+                            node_id,
+                            generation,
+                            capacity,
+                            topology,
+                        } => {
+                            let response = peer_handle
+                                .handle_join_request(
+                                    node_id,
+                                    generation,
+                                    capacity,
+                                    topology,
+                                    remote_addr,
+                                )
+                                .await;
+                            Some(response)
+                        }
                         ShoalMessage::ShardPush { shard_id, data } => {
                             debug!(%shard_id, len = data.len(), "received shard push (bi-stream)");
                             let ok = store.put(shard_id, bytes::Bytes::from(data)).await.is_ok();

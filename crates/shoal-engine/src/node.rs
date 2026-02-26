@@ -1062,14 +1062,13 @@ impl ShoalNode {
                                                             key,
                                                             manifest_id,
                                                         } = &entry.action
+                                                            && manifest_id == oid
                                                         {
-                                                            if manifest_id == oid {
-                                                                let _ = self.meta.put_object_key(
-                                                                    bucket,
-                                                                    key,
-                                                                    &manifest.object_id,
-                                                                );
-                                                            }
+                                                            let _ = self.meta.put_object_key(
+                                                                bucket,
+                                                                key,
+                                                                &manifest.object_id,
+                                                            );
                                                         }
                                                     }
                                                 }
@@ -1243,15 +1242,14 @@ impl ShoalNode {
                     })
                     .collect();
 
-                if !missing_manifest_ids.is_empty() {
-                    if let Ok(manifest_pairs) =
+                if !missing_manifest_ids.is_empty()
+                    && let Ok(manifest_pairs) =
                         transport.pull_manifests(addr, &missing_manifest_ids).await
-                    {
-                        for (_oid, mb) in &manifest_pairs {
-                            if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
-                                let _ = self.meta.put_manifest(&manifest);
-                                let _ = log_tree.store().put_manifest(&manifest);
-                            }
+                {
+                    for (_oid, mb) in &manifest_pairs {
+                        if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                            let _ = self.meta.put_manifest(&manifest);
+                            let _ = log_tree.store().put_manifest(&manifest);
                         }
                     }
                 }
@@ -1386,18 +1384,18 @@ impl ShoalNode {
         }
 
         while let Some(result) = tasks.join_next().await {
-            if let Ok(Ok(Some(bytes))) = result {
-                if let Ok(manifest) = postcard::from_bytes::<Manifest>(&bytes) {
-                    // Cache locally.
-                    let _ = self.meta.put_manifest(&manifest);
-                    let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+            if let Ok(Ok(Some(bytes))) = result
+                && let Ok(manifest) = postcard::from_bytes::<Manifest>(&bytes)
+            {
+                // Cache locally.
+                let _ = self.meta.put_manifest(&manifest);
+                let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
 
-                    if let Some(log_tree) = &self.log_tree {
-                        let _ = log_tree.store().put_manifest(&manifest);
-                    }
-
-                    return Ok(Some(manifest));
+                if let Some(log_tree) = &self.log_tree {
+                    let _ = log_tree.store().put_manifest(&manifest);
                 }
+
+                return Ok(Some(manifest));
             }
         }
 

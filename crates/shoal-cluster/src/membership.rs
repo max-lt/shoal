@@ -1,96 +1,415 @@
-//! SWIM-based membership service powered by foca.
+//! Peer management with QUIC-based health checking.
 //!
-//! The [`MembershipService`] wraps a foca SWIM instance in a tokio task
-//! that continuously:
+//! The [`PeerManager`] provides cluster membership via a
+//! simple design built directly on iroh QUIC:
 //!
-//! - Receives incoming SWIM protocol data and feeds it to foca.
-//! - Processes timer events (probe intervals, suspect timeouts, etc.).
-//! - Drains foca's accumulated runtime events:
-//!   - **send**: outgoing SWIM messages routed to other nodes.
-//!   - **schedule**: timer events queued via `tokio::time::sleep`.
-//!   - **notify**: membership changes applied to [`ClusterState`].
+//! - **Ping/pong**: periodic `Ping` messages on bi-streams detect failures.
+//! - **Join/leave**: `JoinRequest`/`JoinResponse` messages bootstrap new nodes.
+//! - **ClusterState**: the shared membership view is updated on state transitions.
+//!
+//! The [`PeerHandle`] is the public API for interacting with a running
+//! `PeerManager` from the daemon handler and other components.
 
 use std::collections::HashMap;
-use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use foca::{AccumulatingRuntime, Config, OwnedNotification, PostcardCodec, Timer};
-use rand::SeedableRng;
-use rand::rngs::SmallRng;
 use shoal_meta::MetaStore;
-use shoal_types::{Member, MemberState, NodeId};
-use tokio::sync::{Mutex, RwLock, mpsc};
+use shoal_net::{ShoalMessage, Transport};
+use shoal_types::{Member, MemberState, NodeId, NodeTopology};
+use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ClusterError;
-use crate::identity::ClusterIdentity;
 use crate::state::ClusterState;
-
-/// Commands sent to the membership service event loop.
-#[derive(Debug)]
-pub enum MembershipCommand {
-    /// Announce ourselves to a seed node to join the cluster.
-    Join(ClusterIdentity),
-    /// Gracefully leave the cluster.
-    Leave,
-}
-
-/// Handle to a running membership service.
-///
-/// Provides channels to feed incoming SWIM data, send commands,
-/// and read outgoing SWIM data destined for other nodes.
-pub struct MembershipHandle {
-    /// Send incoming SWIM protocol bytes (received from the network) here.
-    incoming_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Receive outgoing SWIM protocol bytes to send to other nodes.
-    outgoing_rx: Mutex<mpsc::UnboundedReceiver<(ClusterIdentity, Vec<u8>)>>,
-    /// Send commands (join, leave) to the service.
-    command_tx: mpsc::UnboundedSender<MembershipCommand>,
-    /// Shared cluster state maintained by the service.
-    state: Arc<ClusterState>,
-    /// Background task handle.
-    task: tokio::task::JoinHandle<()>,
-}
 
 /// Shared address book type: maps NodeId → EndpointAddr.
 pub type AddressBook = Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>;
 
-impl MembershipHandle {
-    /// Feed incoming SWIM protocol data from the network.
-    pub fn feed_data(&self, data: Vec<u8>) -> Result<(), ClusterError> {
-        self.incoming_tx
-            .send(data)
-            .map_err(|_| ClusterError::ServiceStopped)
+/// Configuration for the [`PeerManager`].
+#[derive(Debug, Clone)]
+pub struct PeerManagerConfig {
+    /// Interval between ping rounds.
+    pub ping_interval: Duration,
+    /// Duration after last pong before marking a peer suspect.
+    pub suspect_timeout: Duration,
+    /// Duration after last pong before marking a peer dead.
+    pub dead_timeout: Duration,
+    /// Number of consecutive ping failures before marking suspect.
+    pub max_failures_before_suspect: u32,
+}
+
+impl PeerManagerConfig {
+    /// Create a config suitable for fast test execution.
+    pub fn test_config() -> Self {
+        Self {
+            ping_interval: Duration::from_millis(100),
+            suspect_timeout: Duration::from_millis(500),
+            dead_timeout: Duration::from_secs(2),
+            max_failures_before_suspect: 3,
+        }
     }
 
-    /// Send a command to the membership service.
-    pub fn send_command(&self, cmd: MembershipCommand) -> Result<(), ClusterError> {
-        self.command_tx
-            .send(cmd)
-            .map_err(|_| ClusterError::ServiceStopped)
+    /// Create a default config for production use.
+    pub fn default_config() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(1),
+            suspect_timeout: Duration::from_secs(5),
+            dead_timeout: Duration::from_secs(15),
+            max_failures_before_suspect: 3,
+        }
+    }
+}
+
+/// Internal state for a single tracked peer.
+struct PeerState {
+    addr: iroh::EndpointAddr,
+    last_pong: Instant,
+    consecutive_failures: u32,
+    state: MemberState,
+    generation: u64,
+    capacity: u64,
+    topology: NodeTopology,
+}
+
+/// Manages cluster peers with QUIC-based health checking.
+///
+/// Runs a background ping loop that sends `Ping` messages to all known
+/// peers and transitions them through Alive → Suspect → Dead based on
+/// response patterns.
+struct PeerManager {
+    config: PeerManagerConfig,
+    #[allow(dead_code)]
+    node_id: NodeId,
+    peers: Arc<RwLock<HashMap<NodeId, PeerState>>>,
+    cluster: Arc<ClusterState>,
+    transport: Arc<dyn Transport>,
+    meta: Option<Arc<MetaStore>>,
+    #[allow(dead_code)]
+    address_book: AddressBook,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl PeerManager {
+    /// Run the ping loop until shutdown.
+    async fn run(&self) {
+        info!("peer manager started");
+
+        let mut interval = tokio::time::interval(self.config.ping_interval);
+        let mut shutdown_rx = self.shutdown_rx.clone();
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.ping_all_peers().await;
+                    self.check_timeouts().await;
+                }
+                _ = shutdown_rx.changed() => {
+                    info!("peer manager shutting down");
+                    break;
+                }
+            }
+        }
+
+        info!("peer manager stopped");
     }
 
-    /// Join the cluster by announcing to a seed node.
-    pub fn join(&self, seed: ClusterIdentity) -> Result<(), ClusterError> {
-        self.send_command(MembershipCommand::Join(seed))
+    /// Send a ping to every known peer.
+    async fn ping_all_peers(&self) {
+        let peers: Vec<(NodeId, iroh::EndpointAddr)> = {
+            let peers = self.peers.read().await;
+            peers
+                .iter()
+                .filter(|(_, ps)| ps.state != MemberState::Dead)
+                .map(|(id, ps)| (*id, ps.addr.clone()))
+                .collect()
+        };
+
+        for (peer_id, addr) in peers {
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+
+            let ping = ShoalMessage::Ping { timestamp };
+            match self.transport.request_response(addr, &ping).await {
+                Ok(ShoalMessage::Pong { .. }) => {
+                    self.handle_pong_internal(peer_id).await;
+                }
+                Ok(other) => {
+                    debug!(%peer_id, "unexpected ping response: {other:?}");
+                    self.record_failure(peer_id).await;
+                }
+                Err(e) => {
+                    debug!(%peer_id, %e, "ping failed");
+                    self.record_failure(peer_id).await;
+                }
+            }
+        }
+    }
+
+    /// Record a successful pong from a peer.
+    async fn handle_pong_internal(&self, node_id: NodeId) {
+        let mut peers = self.peers.write().await;
+        if let Some(ps) = peers.get_mut(&node_id) {
+            let was_suspect = ps.state == MemberState::Suspect;
+            ps.last_pong = Instant::now();
+            ps.consecutive_failures = 0;
+
+            if was_suspect {
+                ps.state = MemberState::Alive;
+                let member = Member {
+                    node_id,
+                    capacity: ps.capacity,
+                    state: MemberState::Alive,
+                    generation: ps.generation,
+                    topology: ps.topology.clone(),
+                };
+                info!(%node_id, "peer recovered from suspect to alive");
+                drop(peers);
+                self.cluster.add_member(member).await;
+            }
+        }
+    }
+
+    /// Record a ping failure for a peer.
+    async fn record_failure(&self, node_id: NodeId) {
+        let mut peers = self.peers.write().await;
+        if let Some(ps) = peers.get_mut(&node_id) {
+            ps.consecutive_failures += 1;
+        }
+    }
+
+    /// Check all peers for suspect/dead timeouts.
+    async fn check_timeouts(&self) {
+        let now = Instant::now();
+        let mut newly_dead = Vec::new();
+
+        {
+            let mut peers = self.peers.write().await;
+            for (node_id, ps) in peers.iter_mut() {
+                match ps.state {
+                    MemberState::Alive => {
+                        if ps.consecutive_failures >= self.config.max_failures_before_suspect
+                            || now.duration_since(ps.last_pong) >= self.config.suspect_timeout
+                        {
+                            ps.state = MemberState::Suspect;
+                            info!(%node_id, failures = ps.consecutive_failures, "peer is now suspect");
+                        }
+                    }
+                    MemberState::Suspect => {
+                        if now.duration_since(ps.last_pong) >= self.config.dead_timeout {
+                            ps.state = MemberState::Dead;
+                            info!(%node_id, "peer declared dead");
+                            newly_dead.push(*node_id);
+                        }
+                    }
+                    MemberState::Dead => {}
+                }
+            }
+        }
+
+        for node_id in newly_dead {
+            self.cluster.mark_dead(&node_id).await;
+
+            if let Some(meta) = &self.meta
+                && let Some(member) = self.cluster.get_member(&node_id).await
+                && let Err(e) = meta.put_member(&member)
+            {
+                error!(%e, "failed to persist dead member state");
+            }
+        }
+    }
+}
+
+/// Handle to a running [`PeerManager`].
+///
+/// Provides methods for the daemon to interact with the peer manager:
+/// joining seeds, handling incoming join requests and pongs, and
+/// graceful shutdown.
+pub struct PeerHandle {
+    peers: Arc<RwLock<HashMap<NodeId, PeerState>>>,
+    cluster: Arc<ClusterState>,
+    transport: Arc<dyn Transport>,
+    meta: Option<Arc<MetaStore>>,
+    address_book: AddressBook,
+    node_id: NodeId,
+    #[allow(dead_code)]
+    config: PeerManagerConfig,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PeerHandle {
+    /// Return a reference to the shared cluster state.
+    pub fn state(&self) -> &Arc<ClusterState> {
+        &self.cluster
+    }
+
+    /// Add a known peer (e.g. from persisted state or CLI).
+    ///
+    /// The peer is added to the peer map and cluster state, making it
+    /// visible for pinging and shard placement.
+    pub async fn add_peer(
+        &self,
+        node_id: NodeId,
+        addr: iroh::EndpointAddr,
+        generation: u64,
+        capacity: u64,
+        topology: NodeTopology,
+    ) {
+        let member = Member {
+            node_id,
+            capacity,
+            state: MemberState::Alive,
+            generation,
+            topology: topology.clone(),
+        };
+
+        // Update address book.
+        self.address_book
+            .write()
+            .await
+            .insert(node_id, addr.clone());
+
+        // Add to peer tracking.
+        self.peers.write().await.insert(
+            node_id,
+            PeerState {
+                addr,
+                last_pong: Instant::now(),
+                consecutive_failures: 0,
+                state: MemberState::Alive,
+                generation,
+                capacity,
+                topology,
+            },
+        );
+
+        // Persist member.
+        if let Some(meta) = &self.meta
+            && let Err(e) = meta.put_member(&member)
+        {
+            error!(%e, "failed to persist member");
+        }
+
+        // Add to cluster state (updates ring).
+        self.cluster.add_member(member).await;
+    }
+
+    /// Join the cluster via a seed node.
+    ///
+    /// Sends a `JoinRequest` to the seed and processes the `JoinResponse`
+    /// to populate the cluster state and address book.
+    pub async fn join_via_seed(&self, seed_addr: iroh::EndpointAddr) -> Result<(), ClusterError> {
+        let request = ShoalMessage::JoinRequest {
+            node_id: self.node_id,
+            generation: 1,
+            capacity: u64::MAX,
+            topology: NodeTopology::default(),
+        };
+
+        info!("sending join request to seed");
+        let response = self.transport.request_response(seed_addr, &request).await?;
+
+        match response {
+            ShoalMessage::JoinResponse { members } => {
+                info!(count = members.len(), "received join response with members");
+                for member in members {
+                    if member.node_id == self.node_id {
+                        continue;
+                    }
+
+                    let addr = {
+                        let book = self.address_book.read().await;
+                        book.get(&member.node_id).cloned()
+                    }
+                    .unwrap_or_else(|| {
+                        let eid = iroh::EndpointId::from_bytes(member.node_id.as_bytes())
+                            .unwrap_or_else(|_| {
+                                warn!(node_id = %member.node_id, "invalid endpoint ID bytes");
+                                // This shouldn't happen but fall back gracefully.
+                                iroh::EndpointId::from_bytes(&[0u8; 32]).expect("zero ID")
+                            });
+                        iroh::EndpointAddr::new(eid)
+                    });
+
+                    self.add_peer(
+                        member.node_id,
+                        addr,
+                        member.generation,
+                        member.capacity,
+                        member.topology,
+                    )
+                    .await;
+                }
+                Ok(())
+            }
+            other => Err(ClusterError::Net(shoal_net::NetError::Serialization(
+                format!("expected JoinResponse, got: {other:?}"),
+            ))),
+        }
+    }
+
+    /// Handle an incoming join request from a new node.
+    ///
+    /// Adds the joining node to the cluster and returns a `JoinResponse`
+    /// with the current member list.
+    pub async fn handle_join_request(
+        &self,
+        node_id: NodeId,
+        generation: u64,
+        capacity: u64,
+        topology: NodeTopology,
+        remote_addr: iroh::EndpointAddr,
+    ) -> ShoalMessage {
+        self.add_peer(node_id, remote_addr, generation, capacity, topology)
+            .await;
+
+        // Collect all members (including ourselves) for the response.
+        let members = self.cluster.members().await;
+        let mut all_members = vec![Member {
+            node_id: self.node_id,
+            capacity: u64::MAX,
+            state: MemberState::Alive,
+            generation: 1,
+            topology: NodeTopology::default(),
+        }];
+        all_members.extend(members);
+
+        ShoalMessage::JoinResponse {
+            members: all_members,
+        }
+    }
+
+    /// Handle an incoming pong from a peer (out-of-band).
+    pub async fn handle_pong(&self, node_id: NodeId) {
+        let mut peers = self.peers.write().await;
+        if let Some(ps) = peers.get_mut(&node_id) {
+            let was_suspect = ps.state == MemberState::Suspect;
+            ps.last_pong = Instant::now();
+            ps.consecutive_failures = 0;
+
+            if was_suspect {
+                ps.state = MemberState::Alive;
+                let member = Member {
+                    node_id,
+                    capacity: ps.capacity,
+                    state: MemberState::Alive,
+                    generation: ps.generation,
+                    topology: ps.topology.clone(),
+                };
+                info!(%node_id, "peer recovered from suspect to alive (external pong)");
+                drop(peers);
+                self.cluster.add_member(member).await;
+            }
+        }
     }
 
     /// Gracefully leave the cluster.
-    pub fn leave(&self) -> Result<(), ClusterError> {
-        self.send_command(MembershipCommand::Leave)
-    }
-
-    /// Take the next outgoing message (target identity, SWIM data).
-    ///
-    /// Returns `None` if the service has stopped.
-    pub async fn next_outgoing(&self) -> Option<(ClusterIdentity, Vec<u8>)> {
-        self.outgoing_rx.lock().await.recv().await
-    }
-
-    /// Return a reference to the shared cluster state.
-    pub fn state(&self) -> &Arc<ClusterState> {
-        &self.state
+    pub fn leave(&self) {
+        info!("leaving cluster");
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Abort the background task.
@@ -104,297 +423,46 @@ impl MembershipHandle {
     }
 }
 
-/// Start the membership service and return a handle.
+/// Start the peer manager and return a handle.
 ///
-/// The service runs as a background tokio task that drives the foca SWIM
-/// protocol. The caller is responsible for routing outgoing messages to
-/// the network (read from [`MembershipHandle::next_outgoing`]) and feeding
-/// incoming network data (via [`MembershipHandle::feed_data`]).
-///
-/// When `address_book` is provided, the service updates it whenever a
-/// new member is discovered via foca (using the addresses carried in
-/// [`ClusterIdentity::listen_addrs`]).
+/// Spawns a background task that periodically pings all known peers
+/// and transitions them through Alive → Suspect → Dead based on
+/// response patterns.
 pub fn start(
-    identity: ClusterIdentity,
-    foca_config: Config,
-    state: Arc<ClusterState>,
+    node_id: NodeId,
+    config: PeerManagerConfig,
+    cluster: Arc<ClusterState>,
+    transport: Arc<dyn Transport>,
     meta: Option<Arc<MetaStore>>,
-) -> MembershipHandle {
-    start_with_address_book(identity, foca_config, state, meta, None)
-}
+    address_book: AddressBook,
+) -> PeerHandle {
+    let peers: Arc<RwLock<HashMap<NodeId, PeerState>>> = Arc::new(RwLock::new(HashMap::new()));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-/// Start the membership service with an address book for peer discovery.
-///
-/// Same as [`start`], but also updates the given address book when new
-/// members are discovered.
-pub fn start_with_address_book(
-    identity: ClusterIdentity,
-    foca_config: Config,
-    state: Arc<ClusterState>,
-    meta: Option<Arc<MetaStore>>,
-    address_book: Option<AddressBook>,
-) -> MembershipHandle {
-    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
-    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel();
-    let (command_tx, command_rx) = mpsc::unbounded_channel();
+    let manager = PeerManager {
+        config: config.clone(),
+        node_id,
+        peers: peers.clone(),
+        cluster: cluster.clone(),
+        transport: transport.clone(),
+        meta: meta.clone(),
+        address_book: address_book.clone(),
+        shutdown_rx,
+    };
 
-    let task = tokio::spawn(membership_loop(
-        identity,
-        foca_config,
-        state.clone(),
+    let task = tokio::spawn(async move {
+        manager.run().await;
+    });
+
+    PeerHandle {
+        peers,
+        cluster,
+        transport,
         meta,
         address_book,
-        incoming_rx,
-        outgoing_tx,
-        command_rx,
-    ));
-
-    MembershipHandle {
-        incoming_tx,
-        outgoing_rx: Mutex::new(outgoing_rx),
-        command_tx,
-        state,
+        node_id,
+        config,
+        shutdown_tx,
         task,
-    }
-}
-
-/// Create a foca config suitable for fast test execution.
-pub fn test_config() -> Config {
-    let mut config = Config::new_lan(NonZeroU32::new(20).expect("non-zero"));
-    config.probe_period = Duration::from_millis(100);
-    config.probe_rtt = Duration::from_millis(50);
-    config.suspect_to_down_after = Duration::from_millis(500);
-    config.remove_down_after = Duration::from_secs(5);
-
-    // Enable periodic announce so nodes discover each other quickly.
-    config.periodic_announce = Some(foca::PeriodicParams {
-        frequency: Duration::from_millis(200),
-        num_members: std::num::NonZeroUsize::new(3).expect("non-zero"),
-    });
-
-    // Enable periodic gossip for faster state convergence.
-    config.periodic_gossip = Some(foca::PeriodicParams {
-        frequency: Duration::from_millis(150),
-        num_members: std::num::NonZeroUsize::new(3).expect("non-zero"),
-    });
-
-    config
-}
-
-/// Create a default foca config for production use.
-pub fn default_config(max_members: u32) -> Config {
-    Config::new_lan(NonZeroU32::new(max_members.max(2)).expect("non-zero"))
-}
-
-// ---------------------------------------------------------------------------
-// Internal event loop
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn membership_loop(
-    identity: ClusterIdentity,
-    config: Config,
-    state: Arc<ClusterState>,
-    meta: Option<Arc<MetaStore>>,
-    address_book: Option<AddressBook>,
-    mut incoming_rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    outgoing_tx: mpsc::UnboundedSender<(ClusterIdentity, Vec<u8>)>,
-    mut command_rx: mpsc::UnboundedReceiver<MembershipCommand>,
-) {
-    let rng = SmallRng::from_os_rng();
-    let codec = PostcardCodec;
-    let mut foca = foca::Foca::new(identity, config, rng, codec);
-    let mut runtime = AccumulatingRuntime::new();
-
-    // Channel for delivering delayed timer events back to this loop.
-    let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Timer<ClusterIdentity>>();
-
-    info!("membership service started");
-
-    loop {
-        tokio::select! {
-            // --- Incoming SWIM protocol data from the network ---
-            Some(data) = incoming_rx.recv() => {
-                if let Err(e) = foca.handle_data(&data, &mut runtime) {
-                    debug!("foca handle_data error: {e}");
-                }
-                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
-            }
-
-            // --- Scheduled timer events ---
-            Some(timer) = timer_rx.recv() => {
-                if let Err(e) = foca.handle_timer(timer, &mut runtime) {
-                    debug!("foca handle_timer error: {e}");
-                }
-                drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
-            }
-
-            // --- Commands (join, leave) ---
-            Some(cmd) = command_rx.recv() => {
-                match cmd {
-                    MembershipCommand::Join(seed) => {
-                        info!(seed = %seed.node_id, "announcing to seed node");
-                        if let Err(e) = foca.announce(seed, &mut runtime) {
-                            warn!("foca announce error: {e}");
-                        }
-                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
-                    }
-                    MembershipCommand::Leave => {
-                        info!("leaving cluster gracefully");
-                        if let Err(e) = foca.leave_cluster(&mut runtime) {
-                            warn!("foca leave error: {e}");
-                        }
-                        drain_runtime(&mut runtime, &outgoing_tx, &timer_tx, &state, &meta, &address_book).await;
-                        break;
-                    }
-                }
-            }
-
-            // All channels closed — shut down.
-            else => {
-                debug!("all channels closed, membership loop exiting");
-                break;
-            }
-        }
-    }
-
-    info!("membership service stopped");
-}
-
-/// Drain all accumulated events from the foca runtime and dispatch them.
-async fn drain_runtime(
-    runtime: &mut AccumulatingRuntime<ClusterIdentity>,
-    outgoing_tx: &mpsc::UnboundedSender<(ClusterIdentity, Vec<u8>)>,
-    timer_tx: &mpsc::UnboundedSender<Timer<ClusterIdentity>>,
-    state: &Arc<ClusterState>,
-    meta: &Option<Arc<MetaStore>>,
-    address_book: &Option<AddressBook>,
-) {
-    // Send outgoing SWIM messages.
-    while let Some((target, data)) = runtime.to_send() {
-        if outgoing_tx.send((target, data.to_vec())).is_err() {
-            warn!("outgoing channel closed");
-            return;
-        }
-    }
-
-    // Schedule timer events.
-    while let Some((delay, timer)) = runtime.to_schedule() {
-        let tx = timer_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            let _ = tx.send(timer);
-        });
-    }
-
-    // Process membership notifications.
-    while let Some(notification) = runtime.to_notify() {
-        handle_notification(notification, state, meta, address_book).await;
-    }
-}
-
-/// Process a single foca membership notification.
-async fn handle_notification(
-    notification: OwnedNotification<ClusterIdentity>,
-    state: &Arc<ClusterState>,
-    meta: &Option<Arc<MetaStore>>,
-    address_book: &Option<AddressBook>,
-) {
-    match notification {
-        OwnedNotification::MemberUp(identity) => {
-            let member = Member::from(&identity);
-            info!(
-                node_id = %member.node_id,
-                addrs = ?identity.listen_addrs,
-                "foca: member up"
-            );
-
-            // Update address book with the member's listen addresses.
-            if let Some(book) = address_book
-                && !identity.listen_addrs.is_empty()
-                && let Ok(eid) = iroh::EndpointId::from_bytes(identity.node_id.as_bytes())
-            {
-                let mut addr = iroh::EndpointAddr::new(eid);
-
-                for socket_addr in &identity.listen_addrs {
-                    addr = addr.with_ip_addr(*socket_addr);
-                }
-
-                book.write().await.insert(identity.node_id, addr);
-                debug!(
-                    node_id = %identity.node_id,
-                    addrs = ?identity.listen_addrs,
-                    "updated address book from foca membership"
-                );
-            }
-
-            // Persist member and peer addresses to meta store.
-            if let Some(meta) = meta {
-                if let Err(e) = meta.put_member(&member) {
-                    error!("failed to persist member: {e}");
-                }
-
-                if !identity.listen_addrs.is_empty()
-                    && let Err(e) = meta.put_peer_addrs(&identity.node_id, &identity.listen_addrs)
-                {
-                    error!("failed to persist peer addresses: {e}");
-                }
-            }
-
-            state.add_member(member).await;
-        }
-
-        OwnedNotification::MemberDown(identity) => {
-            info!(node_id = %identity.node_id, "foca: member down");
-
-            // Update meta store.
-            if let Some(meta) = meta {
-                let mut member = Member::from(&identity);
-                member.state = MemberState::Dead;
-                if let Err(e) = meta.put_member(&member) {
-                    error!("failed to persist dead member state: {e}");
-                }
-            }
-
-            state.mark_dead(&identity.node_id).await;
-        }
-
-        OwnedNotification::Rename(old, new) => {
-            info!(
-                old_node = %old.node_id,
-                new_gen = new.generation,
-                "foca: member identity renewed"
-            );
-            // Remove old, add new.
-            state.remove_member(&old.node_id).await;
-            let member = Member::from(&new);
-            state.add_member(member).await;
-        }
-
-        OwnedNotification::Active => {
-            info!("foca: this node is now active in the cluster");
-            let local_id = state.local_node_id();
-            state
-                .event_bus()
-                .emit(shoal_types::events::MembershipReady {
-                    node_id: local_id,
-                    origin: shoal_types::events::EventOrigin::Local,
-                });
-        }
-
-        OwnedNotification::Idle => {
-            debug!("foca: this node is now idle (no known peers)");
-        }
-
-        OwnedNotification::Defunct => {
-            warn!("foca: this node has been declared defunct");
-        }
-
-        OwnedNotification::Rejoin(new_identity) => {
-            info!(
-                gen = new_identity.generation,
-                "foca: auto-rejoined with new generation"
-            );
-        }
     }
 }

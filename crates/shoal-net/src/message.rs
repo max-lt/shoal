@@ -3,7 +3,7 @@
 //! All messages are serialized with postcard over QUIC streams.
 
 use serde::{Deserialize, Serialize};
-use shoal_types::{ClusterEvent, Member, ObjectId, ShardId};
+use shoal_types::{ClusterEvent, Member, NodeId, NodeTopology, ObjectId, ShardId};
 
 /// Protocol messages exchanged between Shoal nodes.
 ///
@@ -50,7 +50,7 @@ pub enum ShoalMessage {
     /// A cluster event broadcast via gossip.
     ClusterEvent(ClusterEvent),
 
-    /// Membership state update (piggybacked on foca).
+    /// Membership state update.
     MembershipUpdate(Vec<Member>),
 
     /// Health check ping.
@@ -65,8 +65,26 @@ pub enum ShoalMessage {
         timestamp: u64,
     },
 
-    /// Raw SWIM protocol data routed between foca membership services.
-    SwimData(Vec<u8>),
+    /// Request to join the cluster, sent by a new node to a seed node.
+    ///
+    /// The seed responds with a [`ShoalMessage::JoinResponse`] containing the
+    /// current member list so the joiner can bootstrap its cluster state.
+    JoinRequest {
+        /// Node ID of the joining node.
+        node_id: NodeId,
+        /// Restart generation counter.
+        generation: u64,
+        /// Advertised storage capacity in bytes.
+        capacity: u64,
+        /// Physical location in the infrastructure hierarchy.
+        topology: NodeTopology,
+    },
+
+    /// Response to a [`ShoalMessage::JoinRequest`] with the current member list.
+    JoinResponse {
+        /// All currently known members in the cluster.
+        members: Vec<Member>,
+    },
 
     /// Batch request for manifests by ObjectId.
     ManifestRequest {

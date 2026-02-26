@@ -1198,19 +1198,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
-name = "foca"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f59e967f3f675997e4a4a6b99d2a75148d59d64c46211b78b4f34ebb951b273"
-dependencies = [
- "bytes",
- "postcard",
- "rand",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3954,7 +3941,6 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
- "foca",
  "futures-lite",
  "iroh",
  "iroh-gossip",

@@ -83,16 +83,15 @@ async fn auth_middleware(
     // If SigV4 fails, try pulling the missing key from peers before rejecting.
     if let Err(_e) = auth::verify_sigv4(&request, &keys) {
         // Extract the access_key_id from the Authorization header to try a peer pull.
-        if let Some(access_key_id) = auth::extract_access_key_id(&request) {
-            if !keys.contains_key(&access_key_id) {
-                if let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await {
-                    keys.insert(access_key_id, secret);
+        if let Some(access_key_id) = auth::extract_access_key_id(&request)
+            && !keys.contains_key(&access_key_id)
+            && let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await
+        {
+            keys.insert(access_key_id, secret);
 
-                    // Retry verification with the newly fetched key.
-                    if auth::verify_sigv4(&request, &keys).is_ok() {
-                        return Ok(next.run(request).await);
-                    }
-                }
+            // Retry verification with the newly fetched key.
+            if auth::verify_sigv4(&request, &keys).is_ok() {
+                return Ok(next.run(request).await);
             }
         }
 

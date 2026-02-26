@@ -3,12 +3,12 @@
 //! The [`GossipService`] wraps an iroh-gossip topic to broadcast and receive
 //! [`GossipPayload`]s across all nodes in the cluster. This handles all
 //! cluster-wide dissemination: membership events, manifest broadcasts, and
-//! log entry broadcasts. foca SWIM handles low-level failure detection only.
+//! log entry broadcasts. The peer manager handles low-level failure detection.
 //!
 //! **Note**: This service requires a running iroh [`Endpoint`] and
 //! [`Router`](iroh::protocol::Router). In environments where iroh cannot
 //! bind (e.g. sandboxed CI), the membership service still functions
-//! without gossip — foca provides direct node-to-node communication.
+//! without gossip — the peer manager provides direct node-to-node health checking.
 
 use std::sync::Arc;
 
@@ -200,7 +200,7 @@ impl GossipHandle {
 ///
 /// Data payloads (manifests, log entries, want/have) are forwarded to
 /// `payload_tx` for external processing. Membership events propagate
-/// via foca SWIM, not gossip.
+/// via QUIC ping/pong, not gossip.
 async fn run_receiver_loop(
     mut receiver: GossipReceiver,
     _state: Arc<ClusterState>,

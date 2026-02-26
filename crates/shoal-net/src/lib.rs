@@ -92,6 +92,16 @@ pub trait Transport: Send + Sync {
         bucket: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, NetError>;
+
+    /// Send a request on a bi-directional stream and return the response.
+    ///
+    /// Opens a bi-stream, sends `msg`, reads one response, and returns it.
+    /// Used for Ping/Pong and JoinRequest/JoinResponse exchanges.
+    async fn request_response(
+        &self,
+        addr: iroh::EndpointAddr,
+        msg: &ShoalMessage,
+    ) -> Result<ShoalMessage, NetError>;
 }
 
 /// Default ALPN protocol identifier (no cluster secret).

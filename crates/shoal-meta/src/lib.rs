@@ -7,7 +7,7 @@
 //! - `objects` — user key → [`ObjectId`] mapping (cache, from manifests)
 //! - `manifests` — [`ObjectId`] → serialized [`Manifest`] (cache, manifest is also EC-stored)
 //! - `shardmap` — [`ShardId`] → owners list (cache, derived from placement ring)
-//! - `membership` — [`NodeId`] → serialized [`Member`] (cache, from foca/gossip)
+//! - `membership` — [`NodeId`] → serialized [`Member`] (cache, from peer manager/gossip)
 //! - `repair_queue` — [`ShardId`] → priority (local, transient, rebuilt on restart)
 
 mod error;
