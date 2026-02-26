@@ -3,7 +3,7 @@
 //! All messages are serialized with postcard over QUIC streams.
 
 use serde::{Deserialize, Serialize};
-use shoal_types::{ClusterEvent, Member, NodeId, NodeTopology, ObjectId, ShardId};
+use shoal_types::{Member, NodeId, NodeTopology, ObjectId, ShardId};
 
 /// Protocol messages exchanged between Shoal nodes.
 ///
@@ -46,12 +46,6 @@ pub enum ShoalMessage {
         /// The shard data, or `None` if the node doesn't have it.
         data: Option<Vec<u8>>,
     },
-
-    /// A cluster event broadcast via gossip.
-    ClusterEvent(ClusterEvent),
-
-    /// Membership state update.
-    MembershipUpdate(Vec<Member>),
 
     /// Health check ping.
     Ping {
@@ -98,10 +92,11 @@ pub enum ShoalMessage {
         manifests: Vec<(ObjectId, Vec<u8>)>,
     },
 
-    /// Broadcast a new log entry to other nodes (unicast fallback).
+    /// Broadcast a new log entry to a peer (uni-stream, fire-and-forget).
     ///
-    /// Manifests and secrets referenced by the entry are pulled via QUIC
-    /// on-demand by the receiver.
+    /// Used as a unicast fallback when gossip is not available (tests,
+    /// single-node). Manifests and secrets referenced by the entry are
+    /// pulled separately via QUIC on-demand by the receiver.
     LogEntryBroadcast {
         /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
         entry_bytes: Vec<u8>,
@@ -116,15 +111,6 @@ pub enum ShoalMessage {
     /// Response with missing log entries (manifests pulled separately).
     LogSyncResponse {
         /// Each entry is a postcard-serialized [`LogEntry`](shoal_logtree::LogEntry).
-        entries: Vec<Vec<u8>>,
-    },
-
-    /// Push specific log entries to a node (unicast response to gossip WantEntries).
-    ///
-    /// Sent as a uni-stream message — no response expected.
-    /// Manifests are pulled separately via batch ManifestRequest.
-    ProvideLogEntries {
-        /// Postcard-serialized [`LogEntry`](shoal_logtree::LogEntry) payloads.
         entries: Vec<Vec<u8>>,
     },
 

@@ -93,14 +93,14 @@ impl ShoalProtocol {
     }
 }
 
-/// Process a `ProvideLogEntries` message received via unicast.
+/// Process a `LogEntryBroadcast` message received via unicast.
 ///
 /// Applies entries to the LogTree. Manifests and API key secrets are
 /// pulled separately via QUIC batch requests.
 ///
 /// On `MissingParents`, buffers the entry and (if transport is available)
 /// spawns a background targeted pull from the entry's author.
-fn handle_provide_log_entries(
+fn handle_log_entry_broadcast(
     entry_bytes_list: Vec<Vec<u8>>,
     log_tree: Option<&Arc<LogTree>>,
     meta: &Arc<MetaStore>,
@@ -308,7 +308,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             .entry(remote_node_id)
             .or_insert(remote_addr);
 
-        // Spawn a handler for uni-directional streams (log entry provides).
+        // Spawn a handler for uni-directional streams (log entry broadcasts).
         let conn_uni = conn.clone();
         let log_tree_uni = self.log_tree.clone();
         let meta_uni = self.meta.clone();
@@ -324,9 +324,9 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                 let address_book = address_book_uni.clone();
                 async move {
                     match msg {
-                        ShoalMessage::ProvideLogEntries { entries } => {
-                            handle_provide_log_entries(
-                                entries,
+                        ShoalMessage::LogEntryBroadcast { entry_bytes } => {
+                            handle_log_entry_broadcast(
+                                vec![entry_bytes],
                                 log_tree.as_ref(),
                                 &meta,
                                 &pending,

@@ -8,7 +8,7 @@ mod tests {
     use bytes::Bytes;
     use iroh_quinn::TokioRuntime;
     use rustls_pki_types::PrivateKeyDer;
-    use shoal_types::{ClusterEvent, Member, MemberState, NodeId, NodeTopology, ObjectId, ShardId};
+    use shoal_types::{Member, MemberState, NodeId, NodeTopology, ObjectId, ShardId};
 
     use crate::cluster_alpn;
     use crate::message::ShoalMessage;
@@ -414,52 +414,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_message_roundtrip_cluster_event() {
-        let events = vec![
-            ClusterEvent::NodeJoined(Member {
-                node_id: NodeId::from([1u8; 32]),
-                capacity: 1_000_000,
-                state: MemberState::Alive,
-                generation: 1,
-                topology: NodeTopology::default(),
-            }),
-            ClusterEvent::NodeLeft(NodeId::from([2u8; 32])),
-            ClusterEvent::NodeDead(NodeId::from([3u8; 32])),
-            ClusterEvent::ShardStored(ShardId::from_data(b"shard1"), NodeId::from([4u8; 32])),
-            ClusterEvent::RepairNeeded(ShardId::from_data(b"repair-me")),
-        ];
-
-        for event in events {
-            let msg = ShoalMessage::ClusterEvent(event);
-            let encoded = postcard::to_allocvec(&msg).unwrap();
-            let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
-            assert_eq!(msg, decoded);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_message_roundtrip_membership_update() {
-        let members = vec![
-            Member {
-                node_id: NodeId::from([1u8; 32]),
-                capacity: 1_000_000,
-                state: MemberState::Alive,
-                generation: 1,
-                topology: NodeTopology::default(),
-            },
-            Member {
-                node_id: NodeId::from([2u8; 32]),
-                capacity: 2_000_000,
-                state: MemberState::Suspect,
-                generation: 5,
-                topology: NodeTopology {
-                    region: "eu".to_string(),
-                    datacenter: "dc1".to_string(),
-                    machine: "m1".to_string(),
-                },
-            },
-        ];
-        let msg = ShoalMessage::MembershipUpdate(members);
+    async fn test_message_roundtrip_log_entry_broadcast() {
+        let msg = ShoalMessage::LogEntryBroadcast {
+            entry_bytes: vec![10, 20, 30, 40],
+        };
         let encoded = postcard::to_allocvec(&msg).unwrap();
         let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
         assert_eq!(msg, decoded);
@@ -578,24 +536,6 @@ mod tests {
         } else {
             panic!("wrong variant");
         }
-    }
-
-    #[tokio::test]
-    async fn test_message_large_membership_update() {
-        // 50 members.
-        let members: Vec<Member> = (0..50)
-            .map(|i| Member {
-                node_id: NodeId::from_data(&[i as u8]),
-                capacity: 1_000_000_000,
-                state: MemberState::Alive,
-                generation: i,
-                topology: NodeTopology::default(),
-            })
-            .collect();
-        let msg = ShoalMessage::MembershipUpdate(members);
-        let encoded = postcard::to_allocvec(&msg).unwrap();
-        let decoded: ShoalMessage = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(msg, decoded);
     }
 
     // -----------------------------------------------------------------------
