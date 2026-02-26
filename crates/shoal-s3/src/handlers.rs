@@ -280,12 +280,17 @@ pub(crate) async fn head_bucket_handler(
 // GET /{bucket}?list-type=2&prefix=... — ListObjectsV2
 // -----------------------------------------------------------------------
 
-/// List objects in a bucket, optionally filtered by prefix.
+/// Dispatch GET on a bucket: ListMultipartUploads or ListObjectsV2.
 pub(crate) async fn list_objects(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // GET /{bucket}?uploads → ListMultipartUploads
+    if params.contains_key("uploads") {
+        return list_multipart_uploads(&state, &bucket).await;
+    }
+
     let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
     let max_keys: usize = params
         .get("max-keys")
@@ -298,6 +303,26 @@ pub(crate) async fn list_objects(
     let returned_keys = if truncated { &keys[..max_keys] } else { &keys };
     let body = xml::list_objects_v2(&bucket, prefix, returned_keys, max_keys, truncated);
 
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
+        .unwrap())
+}
+
+/// List in-progress multipart uploads for a bucket.
+async fn list_multipart_uploads(
+    state: &AppState,
+    bucket: &str,
+) -> Result<axum::response::Response, S3Error> {
+    let uploads = state.uploads.read().await;
+    let entries: Vec<(String, String)> = uploads
+        .iter()
+        .filter(|(_, u)| u.bucket == bucket)
+        .map(|(id, u)| (u.key.clone(), id.clone()))
+        .collect();
+
+    let body = xml::list_multipart_uploads(bucket, &entries);
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml")
@@ -319,6 +344,11 @@ pub(crate) async fn put_object_handler(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
+    // PUT /{bucket}/{key}?tagging → PutObjectTagging
+    if params.contains_key("tagging") {
+        return put_object_tagging(&state, &bucket, &key, &body).await;
+    }
+
     // If uploadId and partNumber are present, this is an UploadPart request.
     if let (Some(upload_id), Some(part_number_str)) =
         (params.get("uploadId"), params.get("partNumber"))
@@ -460,12 +490,23 @@ async fn copy_object(
 // GET /{bucket}/{*key} — GetObject
 // -----------------------------------------------------------------------
 
-/// Retrieve an object and return it in the response body.
-#[tracing::instrument(skip(state), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
+/// Dispatch GET on an object: GetObjectTagging, ListParts, or GetObject.
+#[tracing::instrument(skip(state, params), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
 pub(crate) async fn get_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // GET /{bucket}/{key}?tagging → GetObjectTagging
+    if params.contains_key("tagging") {
+        return get_object_tagging(&state, &bucket, &key).await;
+    }
+
+    // GET /{bucket}/{key}?uploadId=... (without partNumber) → ListParts
+    if let Some(upload_id) = params.get("uploadId") {
+        return list_parts(&state, &bucket, &key, upload_id).await;
+    }
+
     let (data, manifest) = state
         .engine
         .get_object(&bucket, &key)
@@ -504,14 +545,20 @@ pub(crate) async fn get_object_handler(
 // DELETE /{bucket}/{*key} — DeleteObject
 // -----------------------------------------------------------------------
 
-/// Delete an object.
+/// Delete an object or its tags.
 ///
 /// S3 spec: DELETE is idempotent — deleting a non-existent key returns 204.
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(skip(state, params))]
 pub(crate) async fn delete_object_handler(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // DELETE /{bucket}/{key}?tagging → DeleteObjectTagging
+    if params.contains_key("tagging") {
+        return delete_object_tagging(&state, &bucket, &key).await;
+    }
+
     match state.engine.delete_object(&bucket, &key).await {
         Ok(()) => {
             info!(bucket = %bucket, key = %key, "delete_object");
@@ -526,6 +573,115 @@ pub(crate) async fn delete_object_handler(
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
         .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// GET /{bucket}/{*key}?tagging — GetObjectTagging
+// -----------------------------------------------------------------------
+
+async fn get_object_tagging(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> Result<axum::response::Response, S3Error> {
+    let tags = state
+        .engine
+        .get_object_tags(bucket, key)
+        .await
+        .map_err(|e| engine_to_s3(e, bucket, key))?;
+
+    let body = xml::tagging_xml(&tags);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// PUT /{bucket}/{*key}?tagging — PutObjectTagging
+// -----------------------------------------------------------------------
+
+async fn put_object_tagging(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+) -> Result<axum::response::Response, S3Error> {
+    let body_str = String::from_utf8_lossy(body);
+    let tags = xml::parse_tagging_request(&body_str);
+
+    state
+        .engine
+        .put_object_tags(bucket, key, tags)
+        .await
+        .map_err(|e| engine_to_s3(e, bucket, key))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// DELETE /{bucket}/{*key}?tagging — DeleteObjectTagging
+// -----------------------------------------------------------------------
+
+async fn delete_object_tagging(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+) -> Result<axum::response::Response, S3Error> {
+    state
+        .engine
+        .delete_object_tags(bucket, key)
+        .await
+        .map_err(|e| engine_to_s3(e, bucket, key))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// GET /{bucket}/{*key}?uploadId=... — ListParts
+// -----------------------------------------------------------------------
+
+async fn list_parts(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<axum::response::Response, S3Error> {
+    let uploads = state.uploads.read().await;
+    let upload = uploads
+        .get(upload_id)
+        .ok_or_else(|| S3Error::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        })?;
+
+    if upload.bucket != bucket || upload.key != key {
+        return Err(S3Error::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        });
+    }
+
+    let parts: Vec<(u16, usize, String)> = upload
+        .parts
+        .iter()
+        .map(|(num, data)| {
+            let etag = format!("\"{}\"", blake3::hash(data));
+            (*num, data.len(), etag)
+        })
+        .collect();
+
+    let body = xml::list_parts(bucket, key, upload_id, &parts);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
         .unwrap())
 }
 

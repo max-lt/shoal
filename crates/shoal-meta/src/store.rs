@@ -26,6 +26,7 @@ enum Backend {
         peers: Keyspace,
         api_keys: Keyspace,
         buckets: Keyspace,
+        tags: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -48,6 +49,8 @@ struct MemoryBackend {
     api_keys: RwLock<HashMap<String, String>>,
     /// Explicitly created bucket names.
     buckets: RwLock<HashSet<String>>,
+    /// `bucket/key` → serialized BTreeMap<String, String> (tags).
+    tags: RwLock<HashMap<String, Vec<u8>>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -88,6 +91,7 @@ impl MetaStore {
                 peers: RwLock::new(HashMap::new()),
                 api_keys: RwLock::new(HashMap::new()),
                 buckets: RwLock::new(HashSet::new()),
+                tags: RwLock::new(HashMap::new()),
             })),
         }
     }
@@ -101,6 +105,7 @@ impl MetaStore {
         let peers = db.keyspace("peers", KeyspaceCreateOptions::default)?;
         let api_keys = db.keyspace("api_keys", KeyspaceCreateOptions::default)?;
         let buckets = db.keyspace("buckets", KeyspaceCreateOptions::default)?;
+        let tags = db.keyspace("tags", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -111,6 +116,7 @@ impl MetaStore {
             peers,
             api_keys,
             buckets,
+            tags,
         })
     }
 
@@ -639,6 +645,64 @@ impl MetaStore {
             }
             Backend::Memory(m) => Ok(m.api_keys.read().unwrap().clone()),
         }
+    }
+
+    // ----- Object tags -----
+
+    /// Set tags on an object, replacing any existing tags.
+    pub fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: &BTreeMap<String, String>,
+    ) -> Result<()> {
+        let storage_key = object_storage_key(bucket, key);
+        let value = postcard::to_allocvec(tags)?;
+
+        match &self.backend {
+            Backend::Fjall { tags: tags_ks, .. } => {
+                tags_ks.insert(storage_key.as_bytes(), value.as_slice())?;
+            }
+            Backend::Memory(m) => {
+                m.tags.write().unwrap().insert(storage_key, value);
+            }
+        }
+
+        debug!(bucket, key, count = tags.len(), "stored object tags");
+        Ok(())
+    }
+
+    /// Retrieve tags for an object. Returns empty map if no tags set.
+    pub fn get_object_tags(&self, bucket: &str, key: &str) -> Result<BTreeMap<String, String>> {
+        let storage_key = object_storage_key(bucket, key);
+
+        match &self.backend {
+            Backend::Fjall { tags: tags_ks, .. } => match tags_ks.get(storage_key.as_bytes())? {
+                Some(bytes) => Ok(postcard::from_bytes(&bytes)?),
+                None => Ok(BTreeMap::new()),
+            },
+            Backend::Memory(m) => match m.tags.read().unwrap().get(&storage_key) {
+                Some(bytes) => Ok(postcard::from_bytes(bytes)?),
+                None => Ok(BTreeMap::new()),
+            },
+        }
+    }
+
+    /// Delete all tags from an object.
+    pub fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<()> {
+        let storage_key = object_storage_key(bucket, key);
+
+        match &self.backend {
+            Backend::Fjall { tags: tags_ks, .. } => {
+                tags_ks.remove(storage_key.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.tags.write().unwrap().remove(&storage_key);
+            }
+        }
+
+        debug!(bucket, key, "deleted object tags");
+        Ok(())
     }
 
     // ----- Repair queue (local, transient) -----

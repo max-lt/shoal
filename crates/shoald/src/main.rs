@@ -674,6 +674,27 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                                                         warn!(%e, "failed to apply gossiped api key deletion");
                                                     }
                                                 }
+                                                shoal_logtree::Action::SetTags {
+                                                    bucket,
+                                                    key,
+                                                    tags,
+                                                } => {
+                                                    if let Err(e) =
+                                                        meta_bg.put_object_tags(bucket, key, tags)
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped set_tags");
+                                                    }
+                                                }
+                                                shoal_logtree::Action::DeleteTags {
+                                                    bucket,
+                                                    key,
+                                                } => {
+                                                    if let Err(e) =
+                                                        meta_bg.delete_object_tags(bucket, key)
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped delete_tags");
+                                                    }
+                                                }
                                                 _ => {} // Merge, Snapshot — no key-level event
                                             }
                                         });

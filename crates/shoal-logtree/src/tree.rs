@@ -83,6 +83,32 @@ impl LogTree {
         self.append(action)
     }
 
+    /// Append a SetTags action. Returns the new LogEntry.
+    pub fn append_set_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: std::collections::BTreeMap<String, String>,
+    ) -> Result<LogEntry> {
+        let action = Action::SetTags {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            tags,
+        };
+
+        self.append(action)
+    }
+
+    /// Append a DeleteTags action. Returns the new LogEntry.
+    pub fn append_delete_tags(&self, bucket: &str, key: &str) -> Result<LogEntry> {
+        let action = Action::DeleteTags {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        };
+
+        self.append(action)
+    }
+
     /// Append a Delete action. Returns the new LogEntry.
     pub fn append_delete(&self, bucket: &str, key: &str) -> Result<LogEntry> {
         let action = Action::Delete {
@@ -649,8 +675,10 @@ impl LogTree {
             Action::Merge
             | Action::Snapshot { .. }
             | Action::CreateApiKey { .. }
-            | Action::DeleteApiKey { .. } => {
-                // No LogTree-internal state change. API key actions are
+            | Action::DeleteApiKey { .. }
+            | Action::SetTags { .. }
+            | Action::DeleteTags { .. } => {
+                // No LogTree-internal state change. API key and tag actions are
                 // applied to MetaStore externally by the engine / gossip receiver.
             }
         }

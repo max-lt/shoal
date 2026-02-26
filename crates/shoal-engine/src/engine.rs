@@ -79,6 +79,24 @@ pub trait ShoalEngine: Send + Sync {
     /// Check if a bucket exists.
     async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError>;
 
+    /// Set tags on an object, persisting and replicating via LogTree+gossip.
+    async fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: BTreeMap<String, String>,
+    ) -> Result<(), EngineError>;
+
+    /// Retrieve tags for an object.
+    async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<BTreeMap<String, String>, EngineError>;
+
+    /// Delete all tags from an object, replicating via LogTree+gossip.
+    async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), EngineError>;
+
     /// Return a reference to the metadata store.
     ///
     /// Protocol adapters use this for admin operations (API key management,

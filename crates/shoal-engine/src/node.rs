@@ -925,6 +925,66 @@ impl ShoalNode {
         Ok(object_id)
     }
 
+    /// Set tags on an object, persisting to MetaStore and replicating via LogTree+gossip.
+    pub async fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: BTreeMap<String, String>,
+    ) -> Result<(), EngineError> {
+        self.meta.put_object_tags(bucket, key, &tags)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let log_entry = log_tree.append_set_tags(bucket, key, tags)?;
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast set_tags log entry via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve tags for an object.
+    pub async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<BTreeMap<String, String>, EngineError> {
+        Ok(self.meta.get_object_tags(bucket, key)?)
+    }
+
+    /// Delete all tags from an object, replicating via LogTree+gossip.
+    pub async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
+        self.meta.delete_object_tags(bucket, key)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let log_entry = log_tree.append_delete_tags(bucket, key)?;
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast delete_tags log entry via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Create a bucket (register the name in MetaStore).
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         self.meta.create_bucket(bucket)?;
@@ -1688,6 +1748,27 @@ impl ShoalEngine for ShoalNode {
         dst_key: &str,
     ) -> Result<ObjectId, EngineError> {
         ShoalNode::copy_object(self, src_bucket, src_key, dst_bucket, dst_key).await
+    }
+
+    async fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        tags: BTreeMap<String, String>,
+    ) -> Result<(), EngineError> {
+        ShoalNode::put_object_tags(self, bucket, key, tags).await
+    }
+
+    async fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<BTreeMap<String, String>, EngineError> {
+        ShoalNode::get_object_tags(self, bucket, key).await
+    }
+
+    async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
+        ShoalNode::delete_object_tags(self, bucket, key).await
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {

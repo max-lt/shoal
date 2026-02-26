@@ -18,6 +18,11 @@
 //! - `POST /{bucket}/{key}?uploads` — InitiateMultipartUpload
 //! - `PUT /{bucket}/{key}?partNumber=N&uploadId=X` — UploadPart
 //! - `POST /{bucket}/{key}?uploadId=X` — CompleteMultipartUpload
+//! - `GET /{bucket}?uploads` — ListMultipartUploads
+//! - `GET /{bucket}/{key}?uploadId=X` — ListParts
+//! - `GET /{bucket}/{key}?tagging` — GetObjectTagging
+//! - `PUT /{bucket}/{key}?tagging` — PutObjectTagging
+//! - `DELETE /{bucket}/{key}?tagging` — DeleteObjectTagging
 //!
 //! ## Authentication
 //!

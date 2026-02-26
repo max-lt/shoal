@@ -1,5 +1,7 @@
 //! XML response types for the S3 API, serialized via `quick-xml` + `serde`.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -209,6 +211,170 @@ struct CompleteMultipartUploadRequest {
 struct PartInfo {
     #[serde(rename = "PartNumber")]
     part_number: u16,
+}
+
+// -----------------------------------------------------------------------
+// Tagging (GetObjectTagging / PutObjectTagging)
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "Tagging")]
+struct TaggingXml {
+    #[serde(rename = "TagSet")]
+    tag_set: TagSet,
+}
+
+#[derive(Serialize)]
+struct TagSet {
+    #[serde(rename = "Tag", default)]
+    tag: Vec<TagXml>,
+}
+
+#[derive(Serialize)]
+struct TagXml {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "Value")]
+    value: String,
+}
+
+pub(crate) fn tagging_xml(tags: &BTreeMap<String, String>) -> String {
+    to_xml(&TaggingXml {
+        tag_set: TagSet {
+            tag: tags
+                .iter()
+                .map(|(k, v)| TagXml {
+                    key: k.clone(),
+                    value: v.clone(),
+                })
+                .collect(),
+        },
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "Tagging")]
+struct TaggingRequest {
+    #[serde(rename = "TagSet")]
+    tag_set: TagSetRequest,
+}
+
+#[derive(Deserialize)]
+struct TagSetRequest {
+    #[serde(rename = "Tag", default)]
+    tag: Vec<TagRequest>,
+}
+
+#[derive(Deserialize)]
+struct TagRequest {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "Value")]
+    value: String,
+}
+
+/// Parse tags from a `PutObjectTagging` XML request body.
+pub(crate) fn parse_tagging_request(body: &str) -> BTreeMap<String, String> {
+    let Ok(req) = quick_xml::de::from_str::<TaggingRequest>(body) else {
+        return BTreeMap::new();
+    };
+
+    req.tag_set
+        .tag
+        .into_iter()
+        .map(|t| (t.key, t.value))
+        .collect()
+}
+
+// -----------------------------------------------------------------------
+// ListMultipartUploadsResult
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "ListMultipartUploadsResult")]
+struct ListMultipartUploadsResultXml {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Upload", default)]
+    upload: Vec<UploadXml>,
+}
+
+#[derive(Serialize)]
+struct UploadXml {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+}
+
+pub(crate) fn list_multipart_uploads(
+    bucket: &str,
+    uploads: &[(String, String)], // (key, upload_id)
+) -> String {
+    to_xml(&ListMultipartUploadsResultXml {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        upload: uploads
+            .iter()
+            .map(|(key, upload_id)| UploadXml {
+                key: key.clone(),
+                upload_id: upload_id.clone(),
+            })
+            .collect(),
+    })
+}
+
+// -----------------------------------------------------------------------
+// ListPartsResult
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "ListPartsResult")]
+struct ListPartsResultXml {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+    #[serde(rename = "Part", default)]
+    part: Vec<PartXml>,
+}
+
+#[derive(Serialize)]
+struct PartXml {
+    #[serde(rename = "PartNumber")]
+    part_number: u16,
+    #[serde(rename = "Size")]
+    size: usize,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
+pub(crate) fn list_parts(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[(u16, usize, String)], // (part_number, size, etag)
+) -> String {
+    to_xml(&ListPartsResultXml {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+        part: parts
+            .iter()
+            .map(|(num, size, etag)| PartXml {
+                part_number: *num,
+                size: *size,
+                etag: etag.clone(),
+            })
+            .collect(),
+    })
 }
 
 /// Parse part numbers from a `CompleteMultipartUpload` XML request body.

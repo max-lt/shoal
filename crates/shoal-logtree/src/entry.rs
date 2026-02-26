@@ -1,6 +1,8 @@
 //! Log entry types for the LogTree DAG.
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use shoal_types::{NodeId, ObjectId};
 
@@ -60,6 +62,22 @@ pub enum Action {
     CreateApiKey { access_key_id: String },
     /// Delete an API key.
     DeleteApiKey { access_key_id: String },
+    /// Set tags on an object (replaces all existing tags).
+    SetTags {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+        /// Tag key-value pairs.
+        tags: BTreeMap<String, String>,
+    },
+    /// Delete all tags from an object.
+    DeleteTags {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+    },
 }
 
 /// A versioned record for a specific `(bucket, key)` pair.
