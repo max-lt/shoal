@@ -484,3 +484,65 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use shoal_logtree::{LogTree, LogTreeStore};
+
+    /// Regression test: `handle_log_entry_broadcast` must correctly
+    /// deserialize and apply a `LogEntryBroadcast` payload to the LogTree.
+    ///
+    /// Before this fix, the production uni-stream handler matched
+    /// `ProvideLogEntries` (never sent) instead of `LogEntryBroadcast`
+    /// (actually sent by the engine), silently dropping all unicast log
+    /// entry broadcasts.
+    #[test]
+    fn test_log_entry_broadcast_applied_to_logtree() {
+        // Set up a LogTree for the "sender" node to produce a signed entry.
+        let sender_key = SigningKey::from_bytes(&[1u8; 32]);
+        let sender_node = NodeId::from(*ed25519_dalek::VerifyingKey::from(&sender_key).as_bytes());
+        let sender_store = LogTreeStore::open_temporary().unwrap();
+        let sender_tree = LogTree::new(sender_store, sender_node, sender_key);
+
+        // Produce a signed Delete entry (simplest action, no manifest needed).
+        let entry = sender_tree.append_delete("bucket", "key").unwrap();
+        let entry_bytes = postcard::to_allocvec(&entry).unwrap();
+
+        // Set up a LogTree for the "receiver" node.
+        let receiver_key = SigningKey::from_bytes(&[2u8; 32]);
+        let receiver_node =
+            NodeId::from(*ed25519_dalek::VerifyingKey::from(&receiver_key).as_bytes());
+        let receiver_store = LogTreeStore::open_temporary().unwrap();
+        let receiver_tree = Arc::new(LogTree::new(receiver_store, receiver_node, receiver_key));
+
+        let meta = Arc::new(MetaStore::open_temporary().unwrap());
+        let pending_buf: PendingBuffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
+        // Receiver should NOT have this entry yet.
+        assert!(
+            !receiver_tree.store().has_entry(&entry.hash).unwrap(),
+            "entry should not exist before broadcast"
+        );
+
+        // Call the handler with a single entry — this is what the uni-stream
+        // handler does when it receives ShoalMessage::LogEntryBroadcast.
+        handle_log_entry_broadcast(
+            vec![entry_bytes],
+            Some(&receiver_tree),
+            &meta,
+            &pending_buf,
+            None, // no transport needed for this test
+            &address_book,
+        );
+
+        // The entry must now be in the receiver's LogTree.
+        assert!(
+            receiver_tree.store().has_entry(&entry.hash).unwrap(),
+            "entry must be applied to LogTree after broadcast"
+        );
+    }
+}
