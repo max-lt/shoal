@@ -1,53 +1,129 @@
-//! XML response generation for S3 API responses.
-//!
-//! Hand-written XML builders for the small set of S3 XML formats we support.
-//! No XML library dependency needed.
+//! XML response types for the S3 API, serialized via `quick-xml` + `serde`.
 
-/// Escape XML special characters in a string.
-pub(crate) fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+use serde::{Deserialize, Serialize};
+
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
+/// Helper: serialize a struct to an S3 XML string with `<?xml ...?>` header.
+fn to_xml<T: Serialize>(value: &T) -> String {
+    let body = quick_xml::se::to_string(value).expect("XML serialization cannot fail");
+    format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}")
 }
 
-/// Build a ListAllMyBucketsResult XML response (for `GET /`).
+// -----------------------------------------------------------------------
+// S3 Error
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "Error")]
+pub(crate) struct S3ErrorXml<'a> {
+    #[serde(rename = "Code")]
+    pub code: &'a str,
+    #[serde(rename = "Message")]
+    pub message: &'a str,
+}
+
+pub(crate) fn error_xml(code: &str, message: &str) -> String {
+    to_xml(&S3ErrorXml { code, message })
+}
+
+// -----------------------------------------------------------------------
+// ListAllMyBucketsResult (GET /)
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "ListAllMyBucketsResult")]
+struct ListAllMyBucketsResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Owner")]
+    owner: Owner,
+    #[serde(rename = "Buckets")]
+    buckets: Buckets,
+}
+
+#[derive(Serialize)]
+struct Owner {
+    #[serde(rename = "ID")]
+    id: String,
+}
+
+#[derive(Serialize)]
+struct Buckets {
+    #[serde(rename = "Bucket", default)]
+    bucket: Vec<BucketEntry>,
+}
+
+#[derive(Serialize)]
+struct BucketEntry {
+    #[serde(rename = "Name")]
+    name: String,
+}
+
 pub(crate) fn list_all_my_buckets(owner_id: &str, buckets: &[String]) -> String {
-    let owner_id = xml_escape(owner_id);
-
-    let mut bucket_entries = String::new();
-    for name in buckets {
-        let name = xml_escape(name);
-        bucket_entries.push_str(&format!(
-            "    <Bucket>\n      <Name>{name}</Name>\n    </Bucket>\n"
-        ));
-    }
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
-         \x20 <Owner>\n\
-         \x20   <ID>{owner_id}</ID>\n\
-         \x20 </Owner>\n\
-         \x20 <Buckets>\n\
-         {bucket_entries}\
-         \x20 </Buckets>\n\
-         </ListAllMyBucketsResult>"
-    )
+    to_xml(&ListAllMyBucketsResult {
+        xmlns: S3_XMLNS,
+        owner: Owner {
+            id: owner_id.to_string(),
+        },
+        buckets: Buckets {
+            bucket: buckets
+                .iter()
+                .map(|name| BucketEntry { name: name.clone() })
+                .collect(),
+        },
+    })
 }
 
-/// Build a CopyObjectResult XML response.
+// -----------------------------------------------------------------------
+// CopyObjectResult
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "CopyObjectResult")]
+struct CopyObjectResultXml {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
 pub(crate) fn copy_object_result(etag: &str) -> String {
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
-         \x20 <ETag>\"{etag}\"</ETag>\n\
-         </CopyObjectResult>"
-    )
+    to_xml(&CopyObjectResultXml {
+        xmlns: S3_XMLNS,
+        etag: format!("\"{etag}\""),
+    })
 }
 
-/// Build a ListObjectsV2 XML response.
+// -----------------------------------------------------------------------
+// ListBucketResult (ListObjectsV2)
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "ListBucketResult")]
+struct ListBucketResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Prefix")]
+    prefix: String,
+    #[serde(rename = "KeyCount")]
+    key_count: usize,
+    #[serde(rename = "MaxKeys")]
+    max_keys: usize,
+    #[serde(rename = "IsTruncated")]
+    is_truncated: bool,
+    #[serde(rename = "Contents", default)]
+    contents: Vec<Contents>,
+}
+
+#[derive(Serialize)]
+struct Contents {
+    #[serde(rename = "Key")]
+    key: String,
+}
+
 pub(crate) fn list_objects_v2(
     bucket: &str,
     prefix: &str,
@@ -55,81 +131,93 @@ pub(crate) fn list_objects_v2(
     max_keys: usize,
     is_truncated: bool,
 ) -> String {
-    let bucket = xml_escape(bucket);
-    let prefix = xml_escape(prefix);
-    let count = keys.len();
-    let truncated = if is_truncated { "true" } else { "false" };
-
-    let mut contents = String::new();
-    for key in keys {
-        let key = xml_escape(key);
-        contents.push_str(&format!(
-            "  <Contents>\n    <Key>{key}</Key>\n  </Contents>\n"
-        ));
-    }
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
-         \x20 <Name>{bucket}</Name>\n\
-         \x20 <Prefix>{prefix}</Prefix>\n\
-         \x20 <KeyCount>{count}</KeyCount>\n\
-         \x20 <MaxKeys>{max_keys}</MaxKeys>\n\
-         \x20 <IsTruncated>{truncated}</IsTruncated>\n\
-         {contents}\
-         </ListBucketResult>"
-    )
+    to_xml(&ListBucketResult {
+        xmlns: S3_XMLNS,
+        name: bucket.to_string(),
+        prefix: prefix.to_string(),
+        key_count: keys.len(),
+        max_keys,
+        is_truncated,
+        contents: keys.iter().map(|k| Contents { key: k.clone() }).collect(),
+    })
 }
 
-/// Build an InitiateMultipartUpload XML response.
+// -----------------------------------------------------------------------
+// InitiateMultipartUploadResult
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "InitiateMultipartUploadResult")]
+struct InitiateMultipartUploadResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "UploadId")]
+    upload_id: String,
+}
+
 pub(crate) fn initiate_multipart_upload(bucket: &str, key: &str, upload_id: &str) -> String {
-    let bucket = xml_escape(bucket);
-    let key = xml_escape(key);
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
-         \x20 <Bucket>{bucket}</Bucket>\n\
-         \x20 <Key>{key}</Key>\n\
-         \x20 <UploadId>{upload_id}</UploadId>\n\
-         </InitiateMultipartUploadResult>"
-    )
+    to_xml(&InitiateMultipartUploadResult {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        upload_id: upload_id.to_string(),
+    })
 }
 
-/// Build a CompleteMultipartUpload XML response.
+// -----------------------------------------------------------------------
+// CompleteMultipartUploadResult
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "CompleteMultipartUploadResult")]
+struct CompleteMultipartUploadResult {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Bucket")]
+    bucket: String,
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "ETag")]
+    etag: String,
+}
+
 pub(crate) fn complete_multipart_upload(bucket: &str, key: &str, etag: &str) -> String {
-    let bucket = xml_escape(bucket);
-    let key = xml_escape(key);
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
-         \x20 <Bucket>{bucket}</Bucket>\n\
-         \x20 <Key>{key}</Key>\n\
-         \x20 <ETag>\"{etag}\"</ETag>\n\
-         </CompleteMultipartUploadResult>"
-    )
+    to_xml(&CompleteMultipartUploadResult {
+        xmlns: S3_XMLNS,
+        bucket: bucket.to_string(),
+        key: key.to_string(),
+        etag: format!("\"{etag}\""),
+    })
 }
 
-/// Parse part numbers from a CompleteMultipartUpload XML request body.
-///
-/// Handles both single-line and multi-line XML by searching for
-/// `<PartNumber>N</PartNumber>` tags anywhere in the body.
+// -----------------------------------------------------------------------
+// CompleteMultipartUpload request parsing (incoming XML)
+// -----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename = "CompleteMultipartUpload")]
+struct CompleteMultipartUploadRequest {
+    #[serde(rename = "Part", default)]
+    parts: Vec<PartInfo>,
+}
+
+#[derive(Deserialize)]
+struct PartInfo {
+    #[serde(rename = "PartNumber")]
+    part_number: u16,
+}
+
+/// Parse part numbers from a `CompleteMultipartUpload` XML request body.
 pub(crate) fn parse_complete_multipart_request(body: &str) -> Vec<u16> {
-    let mut parts = Vec::new();
-    let mut remaining = body;
+    let Ok(req) = quick_xml::de::from_str::<CompleteMultipartUploadRequest>(body) else {
+        return Vec::new();
+    };
 
-    while let Some(start) = remaining.find("<PartNumber>") {
-        remaining = &remaining[start + "<PartNumber>".len()..];
-        if let Some(end) = remaining.find("</PartNumber>") {
-            let num_str = &remaining[..end];
-            if let Ok(n) = num_str.parse::<u16>() {
-                parts.push(n);
-            }
-            remaining = &remaining[end + "</PartNumber>".len()..];
-        } else {
-            break;
-        }
-    }
-
+    let mut parts: Vec<u16> = req.parts.into_iter().map(|p| p.part_number).collect();
     parts.sort();
     parts
 }

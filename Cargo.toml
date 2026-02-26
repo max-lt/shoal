@@ -55,6 +55,7 @@ rand = "0.9"
 # Serialization
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
+quick-xml = { version = "0.37", features = ["serialize"] }
 
 # HTTP
 axum = "0.8"

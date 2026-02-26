@@ -115,15 +115,8 @@ impl IntoResponse for S3Error {
     fn into_response(self) -> axum::response::Response {
         let status = self.status_code();
         let code = self.s3_code();
-        let message = xml::xml_escape(&self.to_string());
-
-        let body = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-             <Error>\n\
-             \x20 <Code>{code}</Code>\n\
-             \x20 <Message>{message}</Message>\n\
-             </Error>"
-        );
+        let message = self.to_string();
+        let body = xml::error_xml(code, &message);
 
         Response::builder()
             .status(status)

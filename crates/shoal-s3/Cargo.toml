@@ -12,6 +12,7 @@ blake3 = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
+quick-xml = { workspace = true }
 subtle = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }

@@ -1194,18 +1194,6 @@ async fn test_error_response_is_xml() {
 }
 
 // -----------------------------------------------------------------------
-// XML helper unit tests
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_xml_escape() {
-    assert_eq!(
-        crate::xml::xml_escape("a<b>c&d\"e'f"),
-        "a&lt;b&gt;c&amp;d&quot;e&apos;f"
-    );
-}
-
-// -----------------------------------------------------------------------
 // Bug 3 repro: maxKeys parameter ignored in ListObjectsV2
 // -----------------------------------------------------------------------
 
@@ -1288,7 +1276,7 @@ async fn test_list_buckets_empty() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
     assert!(body.contains("<ListAllMyBucketsResult"));
-    assert!(body.contains("<Buckets>"));
+    assert!(body.contains("<Buckets"));
     // No buckets yet.
     assert!(!body.contains("<Name>"));
 }
