@@ -326,6 +326,13 @@ pub(crate) async fn put_object_handler(
         return upload_part(&state, &bucket, &key, upload_id, part_number_str, body).await;
     }
 
+    // If x-amz-copy-source is present, this is a CopyObject request.
+    if let Some(copy_source) = headers.get("x-amz-copy-source")
+        && let Ok(source) = copy_source.to_str()
+    {
+        return copy_object(&state, source, &bucket, &key).await;
+    }
+
     // Regular PutObject.
     let mut metadata = BTreeMap::new();
 
@@ -406,6 +413,46 @@ async fn upload_part(
         .status(StatusCode::OK)
         .header("etag", etag)
         .body(Body::empty())
+        .unwrap())
+}
+
+/// Handle a CopyObject request.
+///
+/// `source` is the `x-amz-copy-source` header value: `"/bucket/key"` or `"bucket/key"`.
+async fn copy_object(
+    state: &AppState,
+    source: &str,
+    dst_bucket: &str,
+    dst_key: &str,
+) -> Result<axum::response::Response, S3Error> {
+    // Parse source: strip leading slash, split into bucket/key.
+    let source = source.strip_prefix('/').unwrap_or(source);
+    let (src_bucket, src_key) = source
+        .split_once('/')
+        .ok_or_else(|| S3Error::InvalidRequest {
+            message: format!("invalid x-amz-copy-source: {source}"),
+        })?;
+
+    let object_id = state
+        .engine
+        .copy_object(src_bucket, src_key, dst_bucket, dst_key)
+        .await
+        .map_err(|e| engine_to_s3(e, src_bucket, src_key))?;
+
+    info!(
+        src_bucket,
+        src_key,
+        dst_bucket,
+        dst_key,
+        %object_id,
+        "copy_object"
+    );
+
+    let body = xml::copy_object_result(&object_id.to_string());
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
         .unwrap())
 }
 

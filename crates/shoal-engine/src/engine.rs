@@ -58,6 +58,15 @@ pub trait ShoalEngine: Send + Sync {
     /// Returns `Some(secret)` if found, `None` if no peer has it.
     async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError>;
 
+    /// Copy an object from one location to another (key mapping only, no data copy).
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<ObjectId, EngineError>;
+
     /// Create a bucket (register the name).
     async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError>;
 

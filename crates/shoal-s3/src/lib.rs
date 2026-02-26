@@ -11,7 +11,7 @@
 //! - `DELETE /{bucket}` — DeleteBucket
 //! - `HEAD /{bucket}` — HeadBucket
 //! - `GET /{bucket}?list-type=2&prefix=...` — ListObjectsV2
-//! - `PUT /{bucket}/{key}` — PutObject
+//! - `PUT /{bucket}/{key}` — PutObject (or CopyObject with `x-amz-copy-source`)
 //! - `GET /{bucket}/{key}` — GetObject
 //! - `DELETE /{bucket}/{key}` — DeleteObject
 //! - `HEAD /{bucket}/{key}` — HeadObject

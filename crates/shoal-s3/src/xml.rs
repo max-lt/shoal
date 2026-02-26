@@ -37,6 +37,16 @@ pub(crate) fn list_all_my_buckets(owner_id: &str, buckets: &[String]) -> String 
     )
 }
 
+/// Build a CopyObjectResult XML response.
+pub(crate) fn copy_object_result(etag: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
+         \x20 <ETag>\"{etag}\"</ETag>\n\
+         </CopyObjectResult>"
+    )
+}
+
 /// Build a ListObjectsV2 XML response.
 pub(crate) fn list_objects_v2(
     bucket: &str,

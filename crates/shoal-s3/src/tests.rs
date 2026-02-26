@@ -620,6 +620,128 @@ async fn test_create_bucket() {
 }
 
 // -----------------------------------------------------------------------
+// CopyObject
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_copy_object() {
+    let (app, key_id, secret) = test_router_with_key().await;
+    let data = b"copy me please";
+
+    // PUT source object.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/src-bucket/original.txt")
+            .header("content-type", "text/plain")
+            .header("x-amz-meta-author", "alice")
+            .body(Body::from(data.as_slice()))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let src_etag = response
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // COPY to new location.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/dst-bucket/copied.txt")
+            .header("x-amz-copy-source", "/src-bucket/original.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("<CopyObjectResult"));
+    assert!(body.contains("<ETag>"));
+
+    // GET the copy — should have same data.
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/dst-bucket/copied.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("etag").unwrap().to_str().unwrap(),
+        &src_etag
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "text/plain"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-amz-meta-author")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "alice"
+    );
+    let body = body_bytes(response).await;
+    assert_eq!(body, data);
+
+    // Source should still exist.
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/src-bucket/original.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_copy_nonexistent_source_returns_404() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/dst/copy.txt")
+            .header("x-amz-copy-source", "/src/nope.txt")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// -----------------------------------------------------------------------
 // Admin: POST /admin/keys
 // -----------------------------------------------------------------------
 

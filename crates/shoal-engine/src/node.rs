@@ -882,6 +882,49 @@ impl ShoalNode {
         }
     }
 
+    /// Copy an object: create a new key mapping to the same content.
+    ///
+    /// No data is moved — this is a pure metadata operation thanks to
+    /// content-addressing. The source manifest is reused as-is.
+    pub async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<ObjectId, EngineError> {
+        // Resolve source manifest.
+        let manifest = self.head_object(src_bucket, src_key).await?;
+        let object_id = manifest.object_id;
+
+        // Write destination key mapping + replicate.
+        self.meta.put_object_key(dst_bucket, dst_key, &object_id)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let log_entry = log_tree.append_put(dst_bucket, dst_key, object_id, &manifest)?;
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast copy log entry via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
+        self.event_bus.emit(ManifestReceived {
+            bucket: dst_bucket.to_string(),
+            key: dst_key.to_string(),
+            object_id,
+        });
+
+        Ok(object_id)
+    }
+
     /// Create a bucket (register the name in MetaStore).
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         self.meta.create_bucket(bucket)?;
@@ -1635,6 +1678,16 @@ impl ShoalEngine for ShoalNode {
 
     async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
         ShoalNode::lookup_api_key(self, access_key_id).await
+    }
+
+    async fn copy_object(
+        &self,
+        src_bucket: &str,
+        src_key: &str,
+        dst_bucket: &str,
+        dst_key: &str,
+    ) -> Result<ObjectId, EngineError> {
+        ShoalNode::copy_object(self, src_bucket, src_key, dst_bucket, dst_key).await
     }
 
     async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
