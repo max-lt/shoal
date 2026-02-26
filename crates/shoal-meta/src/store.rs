@@ -1,6 +1,6 @@
 //! [`MetaStore`] implementation with Fjall (disk) and in-memory backends.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::RwLock;
@@ -25,6 +25,7 @@ enum Backend {
         repair_queue: Keyspace,
         peers: Keyspace,
         api_keys: Keyspace,
+        buckets: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -45,6 +46,8 @@ struct MemoryBackend {
     peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// access_key_id (String) → secret_access_key (String).
     api_keys: RwLock<HashMap<String, String>>,
+    /// Explicitly created bucket names.
+    buckets: RwLock<HashSet<String>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -84,6 +87,7 @@ impl MetaStore {
                 repair_queue: RwLock::new(BTreeMap::new()),
                 peers: RwLock::new(HashMap::new()),
                 api_keys: RwLock::new(HashMap::new()),
+                buckets: RwLock::new(HashSet::new()),
             })),
         }
     }
@@ -96,6 +100,7 @@ impl MetaStore {
         let repair_queue = db.keyspace("repair_queue", KeyspaceCreateOptions::default)?;
         let peers = db.keyspace("peers", KeyspaceCreateOptions::default)?;
         let api_keys = db.keyspace("api_keys", KeyspaceCreateOptions::default)?;
+        let buckets = db.keyspace("buckets", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -105,6 +110,7 @@ impl MetaStore {
             repair_queue,
             peers,
             api_keys,
+            buckets,
         })
     }
 
@@ -145,17 +151,23 @@ impl MetaStore {
     // ----- Object key mapping (local cache) -----
 
     /// Map a `bucket/key` pair to an [`ObjectId`].
+    ///
+    /// Also registers the bucket if it doesn't already exist.
     pub fn put_object_key(&self, bucket: &str, key: &str, id: &ObjectId) -> Result<()> {
         let storage_key = object_storage_key(bucket, key);
         match &self.backend {
-            Backend::Fjall { objects, .. } => {
+            Backend::Fjall {
+                objects, buckets, ..
+            } => {
                 objects.insert(storage_key.as_bytes(), id.as_bytes())?;
+                buckets.insert(bucket.as_bytes(), b"")?;
             }
             Backend::Memory(m) => {
                 m.objects
                     .write()
                     .unwrap()
                     .insert(storage_key, *id.as_bytes());
+                m.buckets.write().unwrap().insert(bucket.to_string());
             }
         }
         debug!(bucket, key, object_id = %id, "stored object key mapping");
@@ -281,6 +293,94 @@ impl MetaStore {
                 Ok(entries)
             }
         }
+    }
+
+    // ----- Buckets -----
+
+    /// Register a bucket name. Idempotent.
+    pub fn create_bucket(&self, name: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Fjall { buckets, .. } => {
+                buckets.insert(name.as_bytes(), b"")?;
+            }
+            Backend::Memory(m) => {
+                m.buckets.write().unwrap().insert(name.to_string());
+            }
+        }
+        debug!(bucket = name, "registered bucket");
+        Ok(())
+    }
+
+    /// Remove a bucket name. Returns `true` if the bucket existed.
+    pub fn delete_bucket(&self, name: &str) -> Result<bool> {
+        match &self.backend {
+            Backend::Fjall { buckets, .. } => {
+                let existed = buckets.get(name.as_bytes())?.is_some();
+                buckets.remove(name.as_bytes())?;
+                Ok(existed)
+            }
+            Backend::Memory(m) => Ok(m.buckets.write().unwrap().remove(name)),
+        }
+    }
+
+    /// Check if a bucket exists (explicitly created or has objects).
+    pub fn bucket_exists(&self, name: &str) -> Result<bool> {
+        // Check explicit bucket set first.
+        let in_set = match &self.backend {
+            Backend::Fjall { buckets, .. } => buckets.get(name.as_bytes())?.is_some(),
+            Backend::Memory(m) => m.buckets.read().unwrap().contains(name),
+        };
+
+        if in_set {
+            return Ok(true);
+        }
+
+        // Fall back: bucket exists implicitly if it has any objects.
+        let keys = self.list_objects(name, "")?;
+        Ok(!keys.is_empty())
+    }
+
+    /// List all known bucket names (union of explicit set and implicit from keys).
+    pub fn list_buckets(&self) -> Result<BTreeSet<String>> {
+        let mut names = BTreeSet::new();
+
+        // Explicit buckets.
+        match &self.backend {
+            Backend::Fjall { buckets, .. } => {
+                for guard in buckets.iter() {
+                    let k = guard.key()?;
+                    if let Ok(name) = std::str::from_utf8(&k) {
+                        names.insert(name.to_string());
+                    }
+                }
+            }
+            Backend::Memory(m) => {
+                names.extend(m.buckets.read().unwrap().iter().cloned());
+            }
+        }
+
+        // Implicit buckets from object keys.
+        match &self.backend {
+            Backend::Fjall { objects, .. } => {
+                for guard in objects.iter() {
+                    let k = guard.key()?;
+                    if let Ok(full_key) = std::str::from_utf8(&k) {
+                        if let Some((bucket, _)) = full_key.split_once('/') {
+                            names.insert(bucket.to_string());
+                        }
+                    }
+                }
+            }
+            Backend::Memory(m) => {
+                for full_key in m.objects.read().unwrap().keys() {
+                    if let Some((bucket, _)) = full_key.split_once('/') {
+                        names.insert(bucket.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(names)
     }
 
     // ----- Shard map (local cache) -----

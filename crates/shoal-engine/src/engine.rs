@@ -4,7 +4,7 @@
 //! instead of the concrete [`ShoalNode`](crate::ShoalNode) struct, making
 //! them interchangeable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use shoal_meta::MetaStore;
@@ -57,6 +57,18 @@ pub trait ShoalEngine: Send + Sync {
     ///
     /// Returns `Some(secret)` if found, `None` if no peer has it.
     async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError>;
+
+    /// Create a bucket (register the name).
+    async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError>;
+
+    /// Delete a bucket. Fails if the bucket contains objects.
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError>;
+
+    /// List all known bucket names.
+    async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError>;
+
+    /// Check if a bucket exists.
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError>;
 
     /// Return a reference to the metadata store.
     ///

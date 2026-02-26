@@ -6,7 +6,10 @@
 //! - `POST /admin/keys` — CreateApiKey (requires admin secret)
 //! - `GET /admin/keys` — ListApiKeys (requires admin secret)
 //! - `DELETE /admin/keys/{access_key_id}` — DeleteApiKey (requires admin secret)
+//! - `GET /` — ListBuckets
 //! - `PUT /{bucket}` — CreateBucket
+//! - `DELETE /{bucket}` — DeleteBucket
+//! - `HEAD /{bucket}` — HeadBucket
 //! - `GET /{bucket}?list-type=2&prefix=...` — ListObjectsV2
 //! - `PUT /{bucket}/{key}` — PutObject
 //! - `GET /{bucket}/{key}` — GetObject
@@ -39,7 +42,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
-use axum::routing::{delete, post, put};
+use axum::routing::{delete, get, post, put};
 use shoal_engine::ShoalEngine;
 use tokio::sync::RwLock;
 use tracing::warn;
@@ -129,15 +132,23 @@ impl S3Server {
     fn build_router(state: AppState) -> Router {
         // S3 data-plane routes — require a valid API key.
         let s3_routes = Router::new()
+            // Service-level: list all buckets.
+            .route("/", get(handlers::list_buckets_handler))
             // Bucket-level operations.
             .route(
                 "/{bucket}",
-                put(handlers::create_bucket).get(handlers::list_objects),
+                put(handlers::create_bucket)
+                    .get(handlers::list_objects)
+                    .delete(handlers::delete_bucket_handler)
+                    .head(handlers::head_bucket_handler),
             )
             // Trailing-slash variant — S3 clients often send GET /bucket/.
             .route(
                 "/{bucket}/",
-                put(handlers::create_bucket).get(handlers::list_objects),
+                put(handlers::create_bucket)
+                    .get(handlers::list_objects)
+                    .delete(handlers::delete_bucket_handler)
+                    .head(handlers::head_bucket_handler),
             )
             // Object-level operations (key may contain slashes).
             .route(

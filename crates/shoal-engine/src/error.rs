@@ -48,6 +48,20 @@ pub enum EngineError {
         key: String,
     },
 
+    /// Bucket not found.
+    #[error("bucket not found: {bucket}")]
+    BucketNotFound {
+        /// Bucket name.
+        bucket: String,
+    },
+
+    /// Bucket is not empty (cannot delete).
+    #[error("bucket not empty: {bucket}")]
+    BucketNotEmpty {
+        /// Bucket name.
+        bucket: String,
+    },
+
     /// Not enough nodes in the cluster for the configured erasure coding.
     #[error("not enough nodes: need {needed} (k+m), have {available}")]
     NotEnoughNodes {

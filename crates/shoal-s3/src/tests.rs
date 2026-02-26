@@ -1143,6 +1143,216 @@ async fn test_bug3_list_objects_max_keys_ignored() {
     );
 }
 
+// -----------------------------------------------------------------------
+// ListBuckets (GET /)
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_list_buckets_empty() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("<ListAllMyBucketsResult"));
+    assert!(body.contains("<Buckets>"));
+    // No buckets yet.
+    assert!(!body.contains("<Name>"));
+}
+
+#[tokio::test]
+async fn test_list_buckets_after_create() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    // Create two buckets.
+    for name in ["alpha", "beta"] {
+        let req = sign_request(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/{name}"))
+                .body(Body::empty())
+                .unwrap(),
+            &key_id,
+            &secret,
+        );
+
+        let response = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // List buckets.
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("<Name>alpha</Name>"));
+    assert!(body.contains("<Name>beta</Name>"));
+}
+
+// -----------------------------------------------------------------------
+// DeleteBucket (DELETE /{bucket})
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_delete_empty_bucket() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    // Create bucket.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/delbucket")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
+
+    // Delete bucket.
+    let req = sign_request(
+        Request::builder()
+            .method("DELETE")
+            .uri("/delbucket")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // Verify bucket is gone from listing.
+    let req = sign_request(
+        Request::builder()
+            .method("GET")
+            .uri("/")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    let body = body_string(response).await;
+    assert!(!body.contains("<Name>delbucket</Name>"));
+}
+
+#[tokio::test]
+async fn test_delete_nonempty_bucket_fails() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    // Create bucket + put object.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/fullbucket/obj")
+            .body(Body::from("data"))
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
+
+    // Try to delete non-empty bucket -> 409 Conflict.
+    let req = sign_request(
+        Request::builder()
+            .method("DELETE")
+            .uri("/fullbucket")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = body_string(response).await;
+    assert!(body.contains("BucketNotEmpty"));
+}
+
+// -----------------------------------------------------------------------
+// HeadBucket (HEAD /{bucket})
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_head_bucket_exists() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    // Create bucket.
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri("/headtest")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let _ = app.clone().oneshot(req).await.unwrap();
+
+    // HEAD bucket -> 200.
+    let req = sign_request(
+        Request::builder()
+            .method("HEAD")
+            .uri("/headtest")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_head_bucket_not_found() {
+    let (app, key_id, secret) = test_router_with_key().await;
+
+    let req = sign_request(
+        Request::builder()
+            .method("HEAD")
+            .uri("/nonexistent")
+            .body(Body::empty())
+            .unwrap(),
+        &key_id,
+        &secret,
+    );
+
+    let response = app.oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// -----------------------------------------------------------------------
+// XML helper: parse_complete_multipart_request
+// -----------------------------------------------------------------------
+
 #[test]
 fn test_parse_complete_multipart_request() {
     let body = "\

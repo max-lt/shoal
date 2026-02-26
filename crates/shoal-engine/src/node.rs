@@ -4,7 +4,7 @@
 //! and network transport, and exposes the write/read/delete pipeline for
 //! objects.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointAddr;
@@ -882,6 +882,44 @@ impl ShoalNode {
         }
     }
 
+    /// Create a bucket (register the name in MetaStore).
+    pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        self.meta.create_bucket(bucket)?;
+        Ok(())
+    }
+
+    /// Delete a bucket. Fails if it contains objects.
+    pub async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        // Check bucket exists.
+        if !self.meta.bucket_exists(bucket)? {
+            return Err(EngineError::BucketNotFound {
+                bucket: bucket.to_string(),
+            });
+        }
+
+        // Check bucket is empty.
+        let keys = self.list_objects(bucket, "").await?;
+
+        if !keys.is_empty() {
+            return Err(EngineError::BucketNotEmpty {
+                bucket: bucket.to_string(),
+            });
+        }
+
+        self.meta.delete_bucket(bucket)?;
+        Ok(())
+    }
+
+    /// List all known bucket names.
+    pub async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError> {
+        Ok(self.meta.list_buckets()?)
+    }
+
+    /// Check if a bucket exists.
+    pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
+        Ok(self.meta.bucket_exists(bucket)?)
+    }
+
     /// Retrieve object metadata (manifest) without fetching data.
     ///
     /// Local-first: checks LogTree and MetaStore. If not found but there
@@ -1597,6 +1635,22 @@ impl ShoalEngine for ShoalNode {
 
     async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
         ShoalNode::lookup_api_key(self, access_key_id).await
+    }
+
+    async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        ShoalNode::create_bucket(self, bucket).await
+    }
+
+    async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
+        ShoalNode::delete_bucket(self, bucket).await
+    }
+
+    async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError> {
+        ShoalNode::list_buckets(self).await
+    }
+
+    async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
+        ShoalNode::bucket_exists(self, bucket).await
     }
 
     fn meta(&self) -> &Arc<MetaStore> {

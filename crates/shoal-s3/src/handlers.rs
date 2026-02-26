@@ -194,14 +194,73 @@ fn engine_to_s3(e: shoal_engine::EngineError, bucket: &str, key: &str) -> S3Erro
 }
 
 // -----------------------------------------------------------------------
+// GET / — ListBuckets
+// -----------------------------------------------------------------------
+
+/// List all buckets.
+pub(crate) async fn list_buckets_handler(
+    State(state): State<AppState>,
+) -> Result<axum::response::Response, S3Error> {
+    let buckets = state.engine.list_buckets().await?;
+    let names: Vec<String> = buckets.into_iter().collect();
+    let body = xml::list_all_my_buckets("shoal", &names);
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(body))
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
 // PUT /{bucket} — CreateBucket
 // -----------------------------------------------------------------------
 
-/// Create a bucket. Buckets are namespaces in the key mapping — this is a no-op.
+/// Create a bucket. Registers the bucket name in MetaStore.
 pub(crate) async fn create_bucket(
+    State(state): State<AppState>,
     Path(bucket): Path<String>,
 ) -> Result<axum::response::Response, S3Error> {
+    state.engine.create_bucket(&bucket).await?;
     info!(bucket = %bucket, "create_bucket");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// DELETE /{bucket} — DeleteBucket
+// -----------------------------------------------------------------------
+
+/// Delete a bucket. The bucket must be empty.
+pub(crate) async fn delete_bucket_handler(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Result<axum::response::Response, S3Error> {
+    state.engine.delete_bucket(&bucket).await?;
+    info!(bucket = %bucket, "delete_bucket");
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// HEAD /{bucket} — HeadBucket
+// -----------------------------------------------------------------------
+
+/// Check if a bucket exists. Returns 200 if it does, 404 otherwise.
+pub(crate) async fn head_bucket_handler(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> Result<axum::response::Response, S3Error> {
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
+    }
+
     Ok(Response::builder()
         .status(StatusCode::OK)
         .body(Body::empty())

@@ -12,6 +12,31 @@ pub(crate) fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Build a ListAllMyBucketsResult XML response (for `GET /`).
+pub(crate) fn list_all_my_buckets(owner_id: &str, buckets: &[String]) -> String {
+    let owner_id = xml_escape(owner_id);
+
+    let mut bucket_entries = String::new();
+    for name in buckets {
+        let name = xml_escape(name);
+        bucket_entries.push_str(&format!(
+            "    <Bucket>\n      <Name>{name}</Name>\n    </Bucket>\n"
+        ));
+    }
+
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
+         \x20 <Owner>\n\
+         \x20   <ID>{owner_id}</ID>\n\
+         \x20 </Owner>\n\
+         \x20 <Buckets>\n\
+         {bucket_entries}\
+         \x20 </Buckets>\n\
+         </ListAllMyBucketsResult>"
+    )
+}
+
 /// Build a ListObjectsV2 XML response.
 pub(crate) fn list_objects_v2(
     bucket: &str,

@@ -16,6 +16,13 @@ pub enum S3Error {
         bucket: String,
     },
 
+    /// The bucket is not empty (cannot delete).
+    #[error("bucket not empty: {bucket}")]
+    BucketNotEmpty {
+        /// Bucket name.
+        bucket: String,
+    },
+
     /// The requested object key does not exist.
     #[error("no such key: {bucket}/{key}")]
     NoSuchKey {
@@ -67,12 +74,15 @@ impl S3Error {
     fn status_code(&self) -> StatusCode {
         match self {
             Self::NoSuchBucket { .. } => StatusCode::NOT_FOUND,
+            Self::BucketNotEmpty { .. } => StatusCode::CONFLICT,
             Self::NoSuchKey { .. } => StatusCode::NOT_FOUND,
             Self::NoSuchUpload { .. } => StatusCode::NOT_FOUND,
             Self::InvalidPartNumber { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Engine(e) => match e {
                 shoal_engine::EngineError::ObjectNotFound { .. } => StatusCode::NOT_FOUND,
+                shoal_engine::EngineError::BucketNotFound { .. } => StatusCode::NOT_FOUND,
+                shoal_engine::EngineError::BucketNotEmpty { .. } => StatusCode::CONFLICT,
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             },
             Self::AccessDenied => StatusCode::FORBIDDEN,
@@ -84,12 +94,15 @@ impl S3Error {
     fn s3_code(&self) -> &str {
         match self {
             Self::NoSuchBucket { .. } => "NoSuchBucket",
+            Self::BucketNotEmpty { .. } => "BucketNotEmpty",
             Self::NoSuchKey { .. } => "NoSuchKey",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
             Self::InvalidPartNumber { .. } => "InvalidArgument",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::Engine(e) => match e {
                 shoal_engine::EngineError::ObjectNotFound { .. } => "NoSuchKey",
+                shoal_engine::EngineError::BucketNotFound { .. } => "NoSuchBucket",
+                shoal_engine::EngineError::BucketNotEmpty { .. } => "BucketNotEmpty",
                 _ => "InternalError",
             },
             Self::AccessDenied => "AccessDenied",
