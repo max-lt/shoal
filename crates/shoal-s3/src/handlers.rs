@@ -21,6 +21,15 @@ use crate::xml;
 /// Atomic counter for generating unique upload IDs.
 static UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Standard HTTP headers that are stored in manifest metadata and returned as-is
+/// (not prefixed with `x-amz-meta-`).
+const PASSTHROUGH_HEADERS: &[&str] = &[
+    "content-type",
+    "cache-control",
+    "content-encoding",
+    "content-disposition",
+];
+
 // -----------------------------------------------------------------------
 // POST /admin/keys — CreateApiKey (no auth required)
 // -----------------------------------------------------------------------
@@ -320,11 +329,13 @@ pub(crate) async fn put_object_handler(
     // Regular PutObject.
     let mut metadata = BTreeMap::new();
 
-    // Capture Content-Type.
-    if let Some(ct) = headers.get("content-type")
-        && let Ok(v) = ct.to_str()
-    {
-        metadata.insert("content-type".to_string(), v.to_string());
+    // Capture standard HTTP headers.
+    for &header in PASSTHROUGH_HEADERS {
+        if let Some(val) = headers.get(header)
+            && let Ok(v) = val.to_str()
+        {
+            metadata.insert(header.to_string(), v.to_string());
+        }
     }
 
     // Capture x-amz-meta-* headers as user metadata.
@@ -425,12 +436,16 @@ pub(crate) async fn get_object_handler(
         .header("etag", &etag)
         .header("content-length", data.len().to_string());
 
-    if let Some(ct) = manifest.metadata.get("content-type") {
-        builder = builder.header("content-type", ct);
+    // Return standard HTTP headers stored in metadata.
+    for &header in PASSTHROUGH_HEADERS {
+        if let Some(val) = manifest.metadata.get(header) {
+            builder = builder.header(header, val);
+        }
     }
 
+    // Return user metadata as x-amz-meta-* headers.
     for (k, v) in &manifest.metadata {
-        if k != "content-type" {
+        if !PASSTHROUGH_HEADERS.contains(&k.as_str()) {
             builder = builder.header(format!("x-amz-meta-{k}"), v);
         }
     }
@@ -490,12 +505,16 @@ pub(crate) async fn head_object_handler(
         .header("etag", &etag)
         .header("content-length", manifest.total_size.to_string());
 
-    if let Some(ct) = manifest.metadata.get("content-type") {
-        builder = builder.header("content-type", ct);
+    // Return standard HTTP headers stored in metadata.
+    for &header in PASSTHROUGH_HEADERS {
+        if let Some(val) = manifest.metadata.get(header) {
+            builder = builder.header(header, val);
+        }
     }
 
+    // Return user metadata as x-amz-meta-* headers.
     for (k, v) in &manifest.metadata {
-        if k != "content-type" {
+        if !PASSTHROUGH_HEADERS.contains(&k.as_str()) {
             builder = builder.header(format!("x-amz-meta-{k}"), v);
         }
     }
@@ -539,11 +558,15 @@ async fn initiate_multipart(
     let upload_id = generate_upload_id();
 
     let mut metadata = BTreeMap::new();
-    if let Some(ct) = headers.get("content-type")
-        && let Ok(v) = ct.to_str()
-    {
-        metadata.insert("content-type".to_string(), v.to_string());
+
+    for &header in PASSTHROUGH_HEADERS {
+        if let Some(val) = headers.get(header)
+            && let Ok(v) = val.to_str()
+        {
+            metadata.insert(header.to_string(), v.to_string());
+        }
     }
+
     for (name, value) in headers {
         if let Some(meta_key) = name.as_str().strip_prefix("x-amz-meta-")
             && let Ok(v) = value.to_str()
