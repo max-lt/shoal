@@ -1161,6 +1161,9 @@ impl ShoalNode {
         peers.shuffle(&mut rand::rng());
 
         let mut total_applied = 0usize;
+        // Track Put entries across all peers so we can pull manifests
+        // that weren't available from the peer that gave us the entry.
+        let mut applied_put_entries: Vec<(String, String, ObjectId)> = Vec::new();
 
         // Sync with ALL peers. Refresh tips between each so that entries
         // received from peer N are known when computing the delta from peer N+1.
@@ -1198,6 +1201,22 @@ impl ShoalNode {
                                     applied,
                                     "applied log entries from peer"
                                 );
+
+                                // Track Put entries for the post-loop manifest pass.
+                                for entry in &entries {
+                                    if let shoal_logtree::Action::Put {
+                                        bucket,
+                                        key,
+                                        manifest_id,
+                                    } = &entry.action
+                                    {
+                                        applied_put_entries.push((
+                                            bucket.clone(),
+                                            key.clone(),
+                                            *manifest_id,
+                                        ));
+                                    }
+                                }
 
                                 // Batch-pull missing manifests from this peer.
                                 let missing_manifest_ids: Vec<ObjectId> = entries
@@ -1323,6 +1342,59 @@ impl ShoalNode {
                 }
                 Err(e) => {
                     debug!(from = %peer.node_id, %e, "failed to pull log entries from peer");
+                }
+            }
+        }
+
+        // Final pass: pull manifests that weren't available from the peer
+        // that provided the log entries (e.g. the entry was broadcast without
+        // the manifest, and the writer peer was synced second with applied=0).
+        if !applied_put_entries.is_empty() {
+            let still_missing: Vec<ObjectId> = applied_put_entries
+                .iter()
+                .filter(|(_, _, mid)| {
+                    log_tree.get_manifest(mid).ok().flatten().is_none()
+                        && self.meta.get_manifest(mid).ok().flatten().is_none()
+                })
+                .map(|(_, _, mid)| *mid)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if !still_missing.is_empty() {
+                debug!(
+                    count = still_missing.len(),
+                    "pulling still-missing manifests from peers"
+                );
+
+                for peer in &peers {
+                    let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                        continue;
+                    };
+
+                    match transport.pull_manifests(addr, &still_missing).await {
+                        Ok(manifest_pairs) => {
+                            for (oid, mb) in &manifest_pairs {
+                                if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                    let _ = self.meta.put_manifest(&manifest);
+                                    let _ = log_tree.store().put_manifest(&manifest);
+
+                                    for (bucket, key, mid) in &applied_put_entries {
+                                        if mid == oid {
+                                            let _ = self.meta.put_object_key(
+                                                bucket,
+                                                key,
+                                                &manifest.object_id,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(from = %peer.node_id, %e, "manifest pull failed in final pass");
+                        }
+                    }
                 }
             }
         }
