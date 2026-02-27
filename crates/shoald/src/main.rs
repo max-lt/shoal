@@ -765,8 +765,17 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                     }
                                                 }
                                                 Action::CreateBucket { bucket } => {
-                                                    if let Err(e) = meta_bg.create_bucket(bucket) {
+                                                    if let Err(e) =
+                                                        meta_bg.create_bucket(bucket, None)
+                                                    {
                                                         warn!(%e, "failed to apply gossiped bucket creation");
+                                                    }
+                                                }
+                                                Action::CreateBucketV2 { bucket, owner } => {
+                                                    if let Err(e) = meta_bg
+                                                        .create_bucket(bucket, owner.as_deref())
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped bucket creation v2");
                                                     }
                                                 }
                                                 Action::DeleteBucket { bucket } => {

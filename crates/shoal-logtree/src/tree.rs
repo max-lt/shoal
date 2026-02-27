@@ -109,10 +109,20 @@ impl LogTree {
         self.append(action)
     }
 
-    /// Append a CreateBucket action. Returns the new LogEntry.
+    /// Append a CreateBucket action (legacy, no owner). Returns the new LogEntry.
     pub fn append_create_bucket(&self, bucket: &str) -> Result<LogEntry> {
         let action = Action::CreateBucket {
             bucket: bucket.to_string(),
+        };
+
+        self.append(action)
+    }
+
+    /// Append a CreateBucketV2 action with ownership. Returns the new LogEntry.
+    pub fn append_create_bucket_v2(&self, bucket: &str, owner: Option<&str>) -> Result<LogEntry> {
+        let action = Action::CreateBucketV2 {
+            bucket: bucket.to_string(),
+            owner: owner.map(|s| s.to_string()),
         };
 
         self.append(action)
@@ -710,6 +720,7 @@ impl LogTree {
             | Action::SetTags { .. }
             | Action::DeleteTags { .. }
             | Action::CreateBucket { .. }
+            | Action::CreateBucketV2 { .. }
             | Action::DeleteBucket { .. } => {
                 // No LogTree-internal state change. These actions are
                 // applied to MetaStore externally by the engine / gossip receiver.

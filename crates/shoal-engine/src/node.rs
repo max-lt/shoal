@@ -985,12 +985,16 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Create a bucket, replicating via LogTree+gossip.
-    pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
-        self.meta.create_bucket(bucket)?;
+    /// Create a bucket with optional owner, replicating via LogTree+gossip.
+    pub async fn create_bucket(
+        &self,
+        bucket: &str,
+        owner: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.meta.create_bucket(bucket, owner)?;
 
         if let Some(log_tree) = &self.log_tree {
-            let entry = log_tree.append_create_bucket(bucket)?;
+            let entry = log_tree.append_create_bucket_v2(bucket, owner)?;
             let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
@@ -1055,6 +1059,11 @@ impl ShoalNode {
     /// Check if a bucket exists.
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
         Ok(self.meta.bucket_exists(bucket)?)
+    }
+
+    /// Return the owner of a bucket, or `None` for legacy/admin buckets.
+    pub async fn get_bucket_owner(&self, bucket: &str) -> Result<Option<String>, EngineError> {
+        Ok(self.meta.get_bucket_owner(bucket)?)
     }
 
     /// Retrieve object metadata (manifest) without fetching data.
@@ -1809,8 +1818,8 @@ impl ShoalEngine for ShoalNode {
         ShoalNode::delete_object_tags(self, bucket, key).await
     }
 
-    async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
-        ShoalNode::create_bucket(self, bucket).await
+    async fn create_bucket(&self, bucket: &str, owner: Option<&str>) -> Result<(), EngineError> {
+        ShoalNode::create_bucket(self, bucket, owner).await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
@@ -1823,6 +1832,10 @@ impl ShoalEngine for ShoalNode {
 
     async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
         ShoalNode::bucket_exists(self, bucket).await
+    }
+
+    async fn get_bucket_owner(&self, bucket: &str) -> Result<Option<String>, EngineError> {
+        ShoalNode::get_bucket_owner(self, bucket).await
     }
 
     fn meta(&self) -> &Arc<MetaStore> {

@@ -9,9 +9,18 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use shoal_types::{BucketInfo, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId};
 use tracing::debug;
 
+use serde::{Deserialize, Serialize};
+
 use crate::MetaError;
 
 type Result<T> = std::result::Result<T, MetaError>;
+
+/// On-disk bucket metadata (postcard-serialized).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BucketMeta {
+    pub created_at: u64,
+    pub owner: Option<String>,
+}
 
 /// Inner backend: either Fjall-backed (disk) or pure in-memory.
 enum Backend {
@@ -47,8 +56,8 @@ struct MemoryBackend {
     peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// access_key_id (String) → secret_access_key (String).
     api_keys: RwLock<HashMap<String, String>>,
-    /// Explicitly created bucket names → creation timestamp (unix secs).
-    buckets: RwLock<HashMap<String, u64>>,
+    /// Explicitly created bucket names → metadata.
+    buckets: RwLock<HashMap<String, BucketMeta>>,
     /// `bucket/key` → serialized BTreeMap<String, String> (tags).
     tags: RwLock<HashMap<String, Vec<u8>>>,
 }
@@ -333,18 +342,25 @@ impl MetaStore {
 
     // ----- Buckets -----
 
-    /// Register a bucket name with a creation timestamp. Idempotent.
-    pub fn create_bucket(&self, name: &str) -> Result<()> {
+    /// Register a bucket name with a creation timestamp and optional owner.
+    /// Idempotent: does not overwrite an existing bucket.
+    pub fn create_bucket(&self, name: &str, owner: Option<&str>) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let meta = BucketMeta {
+            created_at: now,
+            owner: owner.map(|s| s.to_string()),
+        };
+
         match &self.backend {
             Backend::Fjall { buckets, .. } => {
-                // Don't overwrite existing timestamp (idempotent).
+                // Don't overwrite existing bucket (idempotent).
                 if buckets.get(name.as_bytes())?.is_none() {
-                    buckets.insert(name.as_bytes(), now.to_le_bytes())?;
+                    let value = postcard::to_allocvec(&meta)?;
+                    buckets.insert(name.as_bytes(), value)?;
                 }
             }
             Backend::Memory(m) => {
@@ -352,9 +368,10 @@ impl MetaStore {
                     .write()
                     .unwrap()
                     .entry(name.to_string())
-                    .or_insert(now);
+                    .or_insert(meta);
             }
         }
+
         debug!(bucket = name, "registered bucket");
         Ok(())
     }
@@ -379,9 +396,39 @@ impl MetaStore {
         }
     }
 
-    /// List all known buckets with creation timestamps.
+    /// Return the owner of a bucket, or `None` for legacy/admin buckets.
+    ///
+    /// Returns `Ok(None)` both when the bucket has no owner and when the
+    /// bucket does not exist (callers should check existence separately).
+    pub fn get_bucket_owner(&self, name: &str) -> Result<Option<String>> {
+        match &self.backend {
+            Backend::Fjall { buckets, .. } => {
+                match buckets.get(name.as_bytes())? {
+                    Some(v) => {
+                        if v.len() == 8 {
+                            // Legacy 8-byte timestamp format: no owner.
+                            Ok(None)
+                        } else if let Ok(meta) = postcard::from_bytes::<BucketMeta>(&v) {
+                            Ok(meta.owner)
+                        } else {
+                            Ok(None)
+                        }
+                    }
+                    None => Ok(None),
+                }
+            }
+            Backend::Memory(m) => Ok(m
+                .buckets
+                .read()
+                .unwrap()
+                .get(name)
+                .and_then(|meta| meta.owner.clone())),
+        }
+    }
+
+    /// List all known buckets with creation timestamps and ownership.
     pub fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
-        let mut names: BTreeMap<String, u64> = BTreeMap::new();
+        let mut result: BTreeMap<String, BucketMeta> = BTreeMap::new();
 
         match &self.backend {
             Backend::Fjall { buckets, .. } => {
@@ -389,29 +436,39 @@ impl MetaStore {
                     let (k, v) = guard.into_inner()?;
 
                     if let Ok(name) = std::str::from_utf8(&k) {
-                        let ts = if v.len() == 8 {
-                            u64::from_le_bytes(v[..8].try_into().unwrap())
+                        let meta = if v.len() == 8 {
+                            // Legacy format: bare u64 LE timestamp, no owner.
+                            BucketMeta {
+                                created_at: u64::from_le_bytes(v[..8].try_into().unwrap()),
+                                owner: None,
+                            }
+                        } else if let Ok(m) = postcard::from_bytes::<BucketMeta>(&v) {
+                            m
                         } else {
-                            0 // legacy entries without timestamp
+                            BucketMeta {
+                                created_at: 0,
+                                owner: None,
+                            }
                         };
-                        names.insert(name.to_string(), ts);
+
+                        result.insert(name.to_string(), meta);
                     }
                 }
             }
             Backend::Memory(m) => {
-                names.extend(
-                    m.buckets
-                        .read()
-                        .unwrap()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), *v)),
-                );
+                for (k, v) in m.buckets.read().unwrap().iter() {
+                    result.insert(k.clone(), v.clone());
+                }
             }
         }
 
-        Ok(names
+        Ok(result
             .into_iter()
-            .map(|(name, created_at)| BucketInfo { name, created_at })
+            .map(|(name, meta)| BucketInfo {
+                name,
+                created_at: meta.created_at,
+                owner: meta.owner,
+            })
             .collect())
     }
 

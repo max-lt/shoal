@@ -71,8 +71,9 @@ pub trait ShoalEngine: Send + Sync {
         dst_key: &str,
     ) -> Result<ObjectId, EngineError>;
 
-    /// Create a bucket (register the name).
-    async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError>;
+    /// Create a bucket with optional owner (access_key_id of the creator).
+    /// Pass `None` for admin-created buckets accessible to all keys.
+    async fn create_bucket(&self, bucket: &str, owner: Option<&str>) -> Result<(), EngineError>;
 
     /// Delete a bucket. Fails if the bucket contains objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError>;
@@ -82,6 +83,9 @@ pub trait ShoalEngine: Send + Sync {
 
     /// Check if a bucket exists.
     async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError>;
+
+    /// Return the owner of a bucket, or `None` for legacy/admin buckets.
+    async fn get_bucket_owner(&self, bucket: &str) -> Result<Option<String>, EngineError>;
 
     /// Set tags on an object, persisting and replicating via LogTree+gossip.
     async fn put_object_tags(

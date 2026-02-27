@@ -126,9 +126,18 @@ fn handle_log_entry_broadcast(
 
         match log_tree.receive_entry(&entry, None) {
             Ok(true) => {
-                // Apply DeleteApiKey actions to MetaStore.
-                if let shoal_logtree::Action::DeleteApiKey { access_key_id } = &entry.action {
-                    let _ = meta.delete_api_key(access_key_id);
+                // Apply MetaStore side-effects for actions that require them.
+                match &entry.action {
+                    shoal_logtree::Action::DeleteApiKey { access_key_id } => {
+                        let _ = meta.delete_api_key(access_key_id);
+                    }
+                    shoal_logtree::Action::CreateBucket { bucket } => {
+                        let _ = meta.create_bucket(bucket, None);
+                    }
+                    shoal_logtree::Action::CreateBucketV2 { bucket, owner } => {
+                        let _ = meta.create_bucket(bucket, owner.as_deref());
+                    }
+                    _ => {}
                 }
 
                 applied += 1;
@@ -276,12 +285,19 @@ fn handle_log_entry_broadcast(
                             }
                         }
 
-                        // Apply DeleteApiKey actions.
+                        // Apply MetaStore side-effects from synced entries.
                         for entry in &entries {
-                            if let shoal_logtree::Action::DeleteApiKey { access_key_id } =
-                                &entry.action
-                            {
-                                let _ = meta.delete_api_key(access_key_id);
+                            match &entry.action {
+                                shoal_logtree::Action::DeleteApiKey { access_key_id } => {
+                                    let _ = meta.delete_api_key(access_key_id);
+                                }
+                                shoal_logtree::Action::CreateBucket { bucket } => {
+                                    let _ = meta.create_bucket(bucket, None);
+                                }
+                                shoal_logtree::Action::CreateBucketV2 { bucket, owner } => {
+                                    let _ = meta.create_bucket(bucket, owner.as_deref());
+                                }
+                                _ => {}
                             }
                         }
 

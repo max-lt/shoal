@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, Response, StatusCode};
 use serde::Serialize;
 use tracing::info;
 
 use crate::AppState;
+use crate::auth::AuthenticatedCaller;
 use crate::error::S3Error;
 use crate::xml;
 
@@ -192,7 +193,7 @@ pub(crate) async fn admin_create_bucket(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, S3Error> {
-    state.engine.create_bucket(&name).await?;
+    state.engine.create_bucket(&name, None).await?;
     info!(bucket = %name, "admin_create_bucket");
     Ok(StatusCode::OK)
 }
@@ -223,15 +224,53 @@ fn engine_to_s3(e: shoal_engine::EngineError, bucket: &str, key: &str) -> S3Erro
 }
 
 // -----------------------------------------------------------------------
+// Bucket ownership check
+// -----------------------------------------------------------------------
+
+/// Verify that `caller` is allowed to access `bucket`.
+///
+/// A bucket with no owner (legacy or admin-created) is accessible to all
+/// authenticated callers. Otherwise only the creating key may access it.
+async fn check_bucket_access(
+    state: &AppState,
+    caller: &AuthenticatedCaller,
+    bucket: &str,
+) -> Result<(), S3Error> {
+    let owner = state
+        .engine
+        .get_bucket_owner(bucket)
+        .await
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to look up bucket owner: {e}"),
+        })?;
+
+    match owner {
+        None => Ok(()),
+        Some(ref key_id) if key_id == &caller.access_key_id => Ok(()),
+        Some(_) => Err(S3Error::AccessDenied),
+    }
+}
+
+// -----------------------------------------------------------------------
 // GET / — ListBuckets
 // -----------------------------------------------------------------------
 
-/// List all buckets.
+/// List buckets visible to the caller (owned by them, or unowned legacy buckets).
 pub(crate) async fn list_buckets_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
 ) -> Result<axum::response::Response, S3Error> {
-    let buckets = state.engine.list_buckets().await?;
-    let body = xml::list_all_my_buckets("shoal", &buckets);
+    let all_buckets = state.engine.list_buckets().await?;
+
+    let visible: Vec<_> = all_buckets
+        .into_iter()
+        .filter(|b| match &b.owner {
+            None => true,
+            Some(key_id) => key_id == &caller.access_key_id,
+        })
+        .collect();
+
+    let body = xml::list_all_my_buckets("shoal", &visible);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -247,6 +286,7 @@ pub(crate) async fn list_buckets_handler(
 /// Create a bucket (or handle unsupported PUT sub-resources like `?policy`).
 pub(crate) async fn create_bucket(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
@@ -265,7 +305,11 @@ pub(crate) async fn create_bucket(
         }
     }
 
-    state.engine.create_bucket(&bucket).await?;
+    state
+        .engine
+        .create_bucket(&bucket, Some(&caller.access_key_id))
+        .await?;
+
     info!(bucket = %bucket, "create_bucket");
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -280,6 +324,7 @@ pub(crate) async fn create_bucket(
 /// Delete a bucket (or handle unsupported DELETE sub-resources like `?policy`).
 pub(crate) async fn delete_bucket_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
@@ -291,6 +336,7 @@ pub(crate) async fn delete_bucket_handler(
         }
     }
 
+    check_bucket_access(&state, &caller, &bucket).await?;
     state.engine.delete_bucket(&bucket).await?;
     info!(bucket = %bucket, "delete_bucket");
     Ok(Response::builder()
@@ -306,6 +352,7 @@ pub(crate) async fn delete_bucket_handler(
 /// Check if a bucket exists. Returns 200 if it does, 404 otherwise.
 pub(crate) async fn head_bucket_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(bucket): Path<String>,
 ) -> Result<axum::response::Response, S3Error> {
     if !state.engine.bucket_exists(&bucket).await? {
@@ -313,6 +360,8 @@ pub(crate) async fn head_bucket_handler(
             bucket: bucket.clone(),
         });
     }
+
+    check_bucket_access(&state, &caller, &bucket).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -349,6 +398,7 @@ const UNSUPPORTED_BUCKET_OPS: &[&str] = &[
 /// Dispatch GET on a bucket: ListMultipartUploads or ListObjectsV2.
 pub(crate) async fn list_objects(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
@@ -360,6 +410,8 @@ pub(crate) async fn list_objects(
             });
         }
     }
+
+    check_bucket_access(&state, &caller, &bucket).await?;
 
     // GET /{bucket}?versioning → GetBucketVersioning (always "not configured")
     if params.contains_key("versioning") {
@@ -426,9 +478,10 @@ async fn list_multipart_uploads(
 
 /// Handle PUT for objects — dispatches between PutObject and UploadPart
 /// based on query parameters.
-#[tracing::instrument(skip(state, params, headers, body), fields(response_status = tracing::field::Empty, etag = tracing::field::Empty))]
+#[tracing::instrument(skip(state, caller, params, headers, body), fields(response_status = tracing::field::Empty, etag = tracing::field::Empty))]
 pub(crate) async fn put_object_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
@@ -436,6 +489,7 @@ pub(crate) async fn put_object_handler(
 ) -> Result<axum::response::Response, S3Error> {
     // PUT /{bucket}/{key}?tagging → PutObjectTagging
     if params.contains_key("tagging") {
+        check_bucket_access(&state, &caller, &bucket).await?;
         return put_object_tagging(&state, &bucket, &key, &body).await;
     }
 
@@ -443,6 +497,7 @@ pub(crate) async fn put_object_handler(
     if let (Some(upload_id), Some(part_number_str)) =
         (params.get("uploadId"), params.get("partNumber"))
     {
+        check_bucket_access(&state, &caller, &bucket).await?;
         return upload_part(&state, &bucket, &key, upload_id, part_number_str, body).await;
     }
 
@@ -450,6 +505,7 @@ pub(crate) async fn put_object_handler(
     if let Some(copy_source) = headers.get("x-amz-copy-source")
         && let Ok(source) = copy_source.to_str()
     {
+        check_bucket_access(&state, &caller, &bucket).await?;
         return copy_object(&state, source, &bucket, &key).await;
     }
 
@@ -459,6 +515,8 @@ pub(crate) async fn put_object_handler(
             bucket: bucket.clone(),
         });
     }
+
+    check_bucket_access(&state, &caller, &bucket).await?;
 
     // Regular PutObject.
     let mut metadata = BTreeMap::new();
@@ -599,12 +657,14 @@ async fn copy_object(
 // -----------------------------------------------------------------------
 
 /// Dispatch GET on an object: GetObjectTagging, ListParts, or GetObject.
-#[tracing::instrument(skip(state, params), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
+#[tracing::instrument(skip(state, caller, params), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
 pub(crate) async fn get_object_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    check_bucket_access(&state, &caller, &bucket).await?;
     // GET /{bucket}/{key}?tagging → GetObjectTagging
     if params.contains_key("tagging") {
         return get_object_tagging(&state, &bucket, &key).await;
@@ -656,12 +716,14 @@ pub(crate) async fn get_object_handler(
 /// Delete an object or its tags.
 ///
 /// S3 spec: DELETE is idempotent — deleting a non-existent key returns 204.
-#[tracing::instrument(skip(state, params))]
+#[tracing::instrument(skip(state, caller, params))]
 pub(crate) async fn delete_object_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    check_bucket_access(&state, &caller, &bucket).await?;
     // DELETE /{bucket}/{key}?tagging → DeleteObjectTagging
     if params.contains_key("tagging") {
         return delete_object_tagging(&state, &bucket, &key).await;
@@ -841,11 +903,13 @@ async fn list_parts(
 // -----------------------------------------------------------------------
 
 /// Return object metadata without fetching the body.
-#[tracing::instrument(skip(state))]
+#[tracing::instrument(skip(state, caller))]
 pub(crate) async fn head_object_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<axum::response::Response, S3Error> {
+    check_bucket_access(&state, &caller, &bucket).await?;
     let manifest = state
         .engine
         .head_object(&bucket, &key)
@@ -884,11 +948,13 @@ pub(crate) async fn head_object_handler(
 /// and CompleteMultipartUpload based on query parameters.
 pub(crate) async fn post_object_handler(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
+    check_bucket_access(&state, &caller, &bucket).await?;
     if params.contains_key("uploads") {
         return initiate_multipart(&state, &bucket, &key, &headers).await;
     }
