@@ -120,11 +120,17 @@ impl GossipService {
         &self,
         bootstrap_peers: Vec<iroh::EndpointId>,
     ) -> Result<(GossipHandle, mpsc::UnboundedReceiver<GossipPayload>), ClusterError> {
-        let topic = self
-            .gossip
-            .subscribe_and_join(self.topic_id, bootstrap_peers)
-            .await
-            .map_err(|e| ClusterError::Gossip(e.to_string()))?;
+        // Use `subscribe` (non-blocking) when there are no bootstrap peers,
+        // because `subscribe_and_join` waits for at least one neighbor which
+        // blocks forever on a single-node cluster.
+        let topic = if bootstrap_peers.is_empty() {
+            self.gossip.subscribe(self.topic_id, bootstrap_peers).await
+        } else {
+            self.gossip
+                .subscribe_and_join(self.topic_id, bootstrap_peers)
+                .await
+        }
+        .map_err(|e| ClusterError::Gossip(e.to_string()))?;
 
         let (sender, receiver) = topic.split();
 

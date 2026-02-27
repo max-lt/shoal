@@ -113,3 +113,9 @@ tempfile = "3"
 
 # Benchmarking
 criterion = { version = "0.5", features = ["async_tokio"] }
+
+[profile.release]
+strip = true
+opt-level = 3
+codegen-units = 1
+lto = true
