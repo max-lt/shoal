@@ -151,20 +151,20 @@ enum Commands {
         #[arg(short, long)]
         memory: bool,
 
-        /// Run in single-node mode (no gossip, no peer manager, no repair).
+        /// Run in standalone mode (no gossip, no peer manager, no repair).
         ///
         /// Useful for development, testing, or standalone deployments where
         /// cluster features are not needed. The node operates as a
         /// self-contained storage engine with an S3 API.
         #[arg(long)]
-        single: bool,
+        standalone: bool,
 
         /// Disable LogTree (DAG-based mutation tracking).
         ///
-        /// Only valid when `--single` is set. Without LogTree, the node
+        /// Only valid when `--standalone` is set. Without LogTree, the node
         /// relies solely on MetaStore for object metadata. This reduces
         /// resource usage but removes mutation history.
-        #[arg(long, requires = "single")]
+        #[arg(long, requires = "standalone")]
         no_logtree: bool,
     },
 
@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
             peer,
             secret,
             memory,
-            single,
+            standalone,
             no_logtree,
         } => {
             // CLI args override config file values.
@@ -250,7 +250,7 @@ async fn main() -> Result<()> {
             if memory {
                 config.storage.backend = "memory".to_string();
             }
-            cmd_start(config, single, no_logtree).await
+            cmd_start(config, standalone, no_logtree).await
         }
         Commands::Status => cmd_status(&config),
         Commands::Repair { action } => match action {
@@ -264,12 +264,12 @@ async fn main() -> Result<()> {
 // shoald start
 // -----------------------------------------------------------------------
 
-async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -> Result<()> {
+async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) -> Result<()> {
     info!("starting shoald");
-    if single_mode {
+    if standalone {
         info!(
             no_logtree = no_logtree,
-            "single-node mode: gossip, peer manager, and repair disabled"
+            "standalone mode: gossip, peer manager, and repair disabled"
         );
     }
     info!(
@@ -307,8 +307,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
     // --- Network transport (iroh QUIC) ---
-    // In single-node mode, skip networking entirely.
-    let (endpoint, transport, cluster_alpn, generated_secret) = if !single_mode {
+    // In standalone mode, skip networking entirely.
+    let (endpoint, transport, cluster_alpn, generated_secret) = if !standalone {
         // Cluster secret: generate if not provided.
         let generated = config.cluster.secret.is_empty();
         if generated {
@@ -395,8 +395,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
     let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
     // --- Peer manager (QUIC ping/pong health checking) ---
-    // In single-node mode, no peer manager is started.
-    let peer_handle = if !single_mode {
+    // In standalone mode, no peer manager is started.
+    let peer_handle = if !standalone {
         let tr = transport
             .clone()
             .expect("transport must be set in cluster mode");
@@ -464,8 +464,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
     };
 
     // --- Gossip service (iroh-gossip) ---
-    // In single-node mode, gossip is entirely skipped.
-    let gossip = if !single_mode {
+    // In standalone mode, gossip is entirely skipped.
+    let gossip = if !standalone {
         let ep = endpoint
             .as_ref()
             .expect("endpoint must be set in cluster mode");
@@ -482,7 +482,7 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
         .map(|g| GossipService::new(g.clone(), config.cluster.secret.as_bytes(), cluster.clone()));
 
     // --- LogTree (DAG-based mutation tracking) ---
-    // In single-node mode with --no-logtree, LogTree is skipped entirely.
+    // In standalone mode with --no-logtree, LogTree is skipped entirely.
     let log_tree = if !no_logtree {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
         let log_store = if memory_mode {
@@ -501,8 +501,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
     };
 
     // --- Incoming connection handler (iroh Router) ---
-    // In single-node mode we skip the router entirely — no inter-node traffic.
-    let (router, pending_entries, gossip_handle, gossip_payload_rx) = if !single_mode {
+    // In standalone mode we skip the router entirely — no inter-node traffic.
+    let (router, pending_entries, gossip_handle, gossip_payload_rx) = if !standalone {
         let peer_handle = peer_handle
             .as_ref()
             .expect("peer_handle must be set in cluster mode");
@@ -591,7 +591,7 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
 
         (Some(router), pending, gh, gossip_payload_rx)
     } else {
-        // Single-node mode: no router, no gossip, empty pending buffer.
+        // Standalone mode: no router, no gossip, empty pending buffer.
         let pending: PendingBuffer = Arc::new(std::sync::Mutex::new(Vec::new()));
         (None, pending, None, None)
     };
@@ -600,7 +600,7 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
     // Processes LogEntry payloads received via gossip from other nodes.
     // Manifests and API key secrets are pulled via QUIC on demand.
     // This block only runs in cluster mode, so log_tree and peer_handle
-    // are guaranteed to be Some (--no-logtree requires --single).
+    // are guaranteed to be Some (--no-logtree requires --standalone).
     if let Some(mut payload_rx) = gossip_payload_rx {
         let meta_gossip = meta.clone();
         let log_tree_gossip = log_tree
@@ -887,8 +887,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
 
     // --- Cluster-only background tasks ---
     // Repair, anti-entropy, pending push retry, and periodic log sync are
-    // only meaningful in cluster mode. In single-node mode they are skipped.
-    if !single_mode {
+    // only meaningful in cluster mode. In standalone mode they are skipped.
+    if !standalone {
         // --- Repair subsystem ---
         let replication_factor = config.shard_replication() as usize;
         let repair_transfer: Arc<dyn ShardTransfer> = Arc::new(TransportShardTransfer {
