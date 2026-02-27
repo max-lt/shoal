@@ -527,6 +527,11 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         None => (None, None),
     };
 
+    // Wire gossip handle into peer manager so it can broadcast NodeJoined events.
+    if let Some(ref handle) = gossip_handle {
+        peer_handle.set_gossip(handle.clone()).await;
+    }
+
     // --- Gossip data payload receiver ---
     // Processes LogEntry payloads received via gossip from other nodes.
     // Manifests and API key secrets are pulled via QUIC on demand.
@@ -537,6 +542,7 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         let bus_gossip = event_bus.clone();
         let transport_gossip: Arc<dyn shoal_net::Transport> = transport.clone();
         let address_book_gossip = address_book.clone();
+        let peer_handle_gossip = peer_handle.clone();
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
 
@@ -735,8 +741,31 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                             }
                         }
                     }
-                    GossipPayload::Event(_) => {
-                        // Membership events propagate via QUIC ping/pong, not gossip.
+                    GossipPayload::Event(event) => {
+                        use shoal_types::ClusterEvent;
+
+                        match event {
+                            ClusterEvent::NodeJoined(member) => {
+                                if member.node_id == node_id {
+                                    continue;
+                                }
+
+                                let eid = iroh::EndpointId::from_bytes(member.node_id.as_bytes())
+                                    .expect("valid endpoint ID");
+                                let addr = iroh::EndpointAddr::new(eid);
+                                peer_handle_gossip
+                                    .add_peer(
+                                        member.node_id,
+                                        addr,
+                                        member.generation,
+                                        member.capacity,
+                                        member.topology,
+                                    )
+                                    .await;
+                                info!(node_id = %member.node_id, "discovered peer via gossip");
+                            }
+                            _ => {} // NodeLeft, NodeDead — future work
+                        }
                     }
                 }
             }

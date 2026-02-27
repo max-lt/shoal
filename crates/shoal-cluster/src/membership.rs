@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 use crate::error::ClusterError;
+use crate::gossip::GossipHandle;
 use crate::state::ClusterState;
 
 /// Shared address book type: maps NodeId → EndpointAddr.
@@ -236,11 +237,20 @@ pub struct PeerHandle {
     node_id: NodeId,
     #[allow(dead_code)]
     config: PeerManagerConfig,
+    gossip: Arc<RwLock<Option<GossipHandle>>>,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl PeerHandle {
+    /// Set the gossip handle after the gossip service has started.
+    ///
+    /// Once set, new peer joins will be broadcast via gossip so all
+    /// nodes in the cluster discover the newcomer.
+    pub async fn set_gossip(&self, handle: GossipHandle) {
+        *self.gossip.write().await = Some(handle);
+    }
+
     /// Return a reference to the shared cluster state.
     pub fn state(&self) -> &Arc<ClusterState> {
         &self.cluster
@@ -315,7 +325,10 @@ impl PeerHandle {
         match response {
             ShoalMessage::JoinResponse { members } => {
                 info!(count = members.len(), "received join response with members");
-                for member in members {
+
+                let mut discovered_addrs = Vec::new();
+
+                for member in &members {
                     if member.node_id == self.node_id {
                         continue;
                     }
@@ -328,21 +341,29 @@ impl PeerHandle {
                         let eid = iroh::EndpointId::from_bytes(member.node_id.as_bytes())
                             .unwrap_or_else(|_| {
                                 warn!(node_id = %member.node_id, "invalid endpoint ID bytes");
-                                // This shouldn't happen but fall back gracefully.
                                 iroh::EndpointId::from_bytes(&[0u8; 32]).expect("zero ID")
                             });
                         iroh::EndpointAddr::new(eid)
                     });
+
+                    discovered_addrs.push(addr.clone());
 
                     self.add_peer(
                         member.node_id,
                         addr,
                         member.generation,
                         member.capacity,
-                        member.topology,
+                        member.topology.clone(),
                     )
                     .await;
                 }
+
+                // Fan-out: send JoinRequest to each discovered peer so they
+                // learn about us immediately (bidirectional awareness).
+                for addr in discovered_addrs {
+                    let _ = self.transport.request_response(addr, &request).await;
+                }
+
                 Ok(())
             }
             other => Err(ClusterError::Net(shoal_net::NetError::Serialization(
@@ -363,8 +384,25 @@ impl PeerHandle {
         topology: NodeTopology,
         remote_addr: iroh::EndpointAddr,
     ) -> ShoalMessage {
-        self.add_peer(node_id, remote_addr, generation, capacity, topology)
+        self.add_peer(node_id, remote_addr, generation, capacity, topology.clone())
             .await;
+
+        // Broadcast the new member via gossip so all nodes learn about it.
+        if let Some(gossip) = self.gossip.read().await.as_ref() {
+            let member = Member {
+                node_id,
+                capacity,
+                state: MemberState::Alive,
+                generation,
+                topology,
+            };
+            let event =
+                shoal_types::GossipPayload::Event(shoal_types::ClusterEvent::NodeJoined(member));
+
+            if let Err(e) = gossip.broadcast_payload(&event).await {
+                warn!(%e, "failed to broadcast NodeJoined via gossip");
+            }
+        }
 
         // Collect all members (including ourselves) for the response.
         let members = self.cluster.members().await;
@@ -462,6 +500,7 @@ pub fn start(
         address_book,
         node_id,
         config,
+        gossip: Arc::new(RwLock::new(None)),
         shutdown_tx,
         task,
     }
