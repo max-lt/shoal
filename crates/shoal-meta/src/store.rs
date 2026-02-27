@@ -344,7 +344,7 @@ impl MetaStore {
             Backend::Fjall { buckets, .. } => {
                 // Don't overwrite existing timestamp (idempotent).
                 if buckets.get(name.as_bytes())?.is_none() {
-                    buckets.insert(name.as_bytes(), &now.to_le_bytes())?;
+                    buckets.insert(name.as_bytes(), now.to_le_bytes())?;
                 }
             }
             Backend::Memory(m) => {
