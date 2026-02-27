@@ -15,6 +15,13 @@ use subtle::ConstantTimeEq;
 
 use crate::S3Error;
 
+/// Authenticated caller identity, inserted as an axum Extension
+/// after successful SigV4 verification.
+#[derive(Clone, Debug)]
+pub(crate) struct AuthenticatedCaller {
+    pub access_key_id: String,
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// Parsed components of an `Authorization: AWS4-HMAC-SHA256 ...` header.
@@ -218,10 +225,12 @@ pub(crate) fn extract_access_key_id(request: &Request) -> Option<String> {
 ///
 /// Accepts `UNSIGNED-PAYLOAD` for the payload hash (matching MinIO / most
 /// S3-compatible servers) since the middleware runs before body consumption.
+///
+/// Returns the authenticated `access_key_id` on success.
 pub(crate) fn verify_sigv4(
     request: &Request,
     api_keys: &HashMap<String, String>,
-) -> Result<(), S3Error> {
+) -> Result<String, S3Error> {
     let auth_header = request
         .headers()
         .get("authorization")
@@ -295,7 +304,7 @@ pub(crate) fn verify_sigv4(
         return Err(S3Error::AccessDenied);
     }
 
-    Ok(())
+    Ok(parsed.access_key_id)
 }
 
 #[cfg(test)]

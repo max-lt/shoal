@@ -97,6 +97,9 @@ pub struct BucketInfo {
     pub name: String,
     /// Creation timestamp (unix seconds).
     pub created_at: u64,
+    /// The access_key_id that created this bucket, or `None` for legacy
+    /// / admin-created buckets (accessible to all authenticated keys).
+    pub owner: Option<String>,
 }
 
 /// Object metadata returned by list-objects APIs.
