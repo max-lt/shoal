@@ -636,6 +636,8 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
                                         let bus_bg = bus_gossip.clone();
 
                                         tokio::spawn(async move {
+                                            use shoal_logtree::Action;
+
                                             // Resolve the author's address for QUIC pulls.
                                             let addr = {
                                                 let book = address_book_bg.read().await;
@@ -643,7 +645,7 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
                                             };
 
                                             match &entry_bg.action {
-                                                shoal_logtree::Action::Put {
+                                                Action::Put {
                                                     bucket,
                                                     key,
                                                     manifest_id,
@@ -712,16 +714,14 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
                                                         }
                                                     }
                                                 }
-                                                shoal_logtree::Action::Delete { bucket, key } => {
+                                                Action::Delete { bucket, key } => {
                                                     bus_bg.emit(LogEntryApplied {
                                                         hash: entry_bg.hash,
                                                         bucket: bucket.clone(),
                                                         key: key.clone(),
                                                     });
                                                 }
-                                                shoal_logtree::Action::CreateApiKey {
-                                                    access_key_id,
-                                                } => {
+                                                Action::CreateApiKey { access_key_id } => {
                                                     // Pull the secret via QUIC.
                                                     if let Some(addr) = addr {
                                                         match transport_bg
@@ -743,34 +743,35 @@ async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -
                                                         }
                                                     }
                                                 }
-                                                shoal_logtree::Action::DeleteApiKey {
-                                                    access_key_id,
-                                                } => {
+                                                Action::DeleteApiKey { access_key_id } => {
                                                     if let Err(e) =
                                                         meta_bg.delete_api_key(access_key_id)
                                                     {
                                                         warn!(%e, "failed to apply gossiped api key deletion");
                                                     }
                                                 }
-                                                shoal_logtree::Action::SetTags {
-                                                    bucket,
-                                                    key,
-                                                    tags,
-                                                } => {
+                                                Action::SetTags { bucket, key, tags } => {
                                                     if let Err(e) =
                                                         meta_bg.put_object_tags(bucket, key, tags)
                                                     {
                                                         warn!(%e, "failed to apply gossiped set_tags");
                                                     }
                                                 }
-                                                shoal_logtree::Action::DeleteTags {
-                                                    bucket,
-                                                    key,
-                                                } => {
+                                                Action::DeleteTags { bucket, key } => {
                                                     if let Err(e) =
                                                         meta_bg.delete_object_tags(bucket, key)
                                                     {
                                                         warn!(%e, "failed to apply gossiped delete_tags");
+                                                    }
+                                                }
+                                                Action::CreateBucket { bucket } => {
+                                                    if let Err(e) = meta_bg.create_bucket(bucket) {
+                                                        warn!(%e, "failed to apply gossiped bucket creation");
+                                                    }
+                                                }
+                                                Action::DeleteBucket { bucket } => {
+                                                    if let Err(e) = meta_bg.delete_bucket(bucket) {
+                                                        warn!(%e, "failed to apply gossiped bucket deletion");
                                                     }
                                                 }
                                                 _ => {} // Merge, Snapshot — no key-level event

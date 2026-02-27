@@ -109,6 +109,24 @@ impl LogTree {
         self.append(action)
     }
 
+    /// Append a CreateBucket action. Returns the new LogEntry.
+    pub fn append_create_bucket(&self, bucket: &str) -> Result<LogEntry> {
+        let action = Action::CreateBucket {
+            bucket: bucket.to_string(),
+        };
+
+        self.append(action)
+    }
+
+    /// Append a DeleteBucket action. Returns the new LogEntry.
+    pub fn append_delete_bucket(&self, bucket: &str) -> Result<LogEntry> {
+        let action = Action::DeleteBucket {
+            bucket: bucket.to_string(),
+        };
+
+        self.append(action)
+    }
+
     /// Append a Delete action. Returns the new LogEntry.
     pub fn append_delete(&self, bucket: &str, key: &str) -> Result<LogEntry> {
         let action = Action::Delete {
@@ -690,8 +708,10 @@ impl LogTree {
             | Action::CreateApiKey { .. }
             | Action::DeleteApiKey { .. }
             | Action::SetTags { .. }
-            | Action::DeleteTags { .. } => {
-                // No LogTree-internal state change. API key and tag actions are
+            | Action::DeleteTags { .. }
+            | Action::CreateBucket { .. }
+            | Action::DeleteBucket { .. } => {
+                // No LogTree-internal state change. These actions are
                 // applied to MetaStore externally by the engine / gossip receiver.
             }
         }

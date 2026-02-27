@@ -985,13 +985,30 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Create a bucket (register the name in MetaStore).
+    /// Create a bucket, replicating via LogTree+gossip.
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         self.meta.create_bucket(bucket)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let entry = log_tree.append_create_bucket(bucket)?;
+            let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast create_bucket via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
         Ok(())
     }
 
-    /// Delete a bucket. Fails if it contains objects.
+    /// Delete a bucket. Fails if it contains objects. Replicates via LogTree+gossip.
     pub async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
         // Check bucket exists.
         if !self.meta.bucket_exists(bucket)? {
@@ -1010,6 +1027,23 @@ impl ShoalNode {
         }
 
         self.meta.delete_bucket(bucket)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let entry = log_tree.append_delete_bucket(bucket)?;
+            let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast delete_bucket via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
         Ok(())
     }
 

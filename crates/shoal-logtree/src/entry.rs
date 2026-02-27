@@ -78,6 +78,10 @@ pub enum Action {
         /// Object key.
         key: String,
     },
+    /// Create a bucket.
+    CreateBucket { bucket: String },
+    /// Delete a bucket.
+    DeleteBucket { bucket: String },
 }
 
 /// A versioned record for a specific `(bucket, key)` pair.
