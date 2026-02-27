@@ -33,7 +33,7 @@ use iroh::{Endpoint, EndpointAddr, SecretKey};
 use iroh_gossip::net::GOSSIP_ALPN;
 use shoal_cluster::membership::AddressBook;
 use shoal_cluster::{ClusterState, GossipService, PeerManagerConfig};
-use shoal_engine::{ShoalNode, ShoalNodeConfig};
+use shoal_engine::{PendingBuffer, ShoalNode, ShoalNodeConfig};
 use shoal_logtree::LogTree;
 use shoal_meta::MetaStore;
 use shoal_net::ShoalTransport;
@@ -150,6 +150,22 @@ enum Commands {
         /// Run fully in-memory (no disk persistence).
         #[arg(short, long)]
         memory: bool,
+
+        /// Run in single-node mode (no gossip, no peer manager, no repair).
+        ///
+        /// Useful for development, testing, or standalone deployments where
+        /// cluster features are not needed. The node operates as a
+        /// self-contained storage engine with an S3 API.
+        #[arg(long)]
+        single: bool,
+
+        /// Disable LogTree (DAG-based mutation tracking).
+        ///
+        /// Only valid when `--single` is set. Without LogTree, the node
+        /// relies solely on MetaStore for object metadata. This reduces
+        /// resource usage but removes mutation history.
+        #[arg(long, requires = "single")]
+        no_logtree: bool,
     },
 
     /// Show cluster status from the local metadata store.
@@ -214,6 +230,8 @@ async fn main() -> Result<()> {
             peer,
             secret,
             memory,
+            single,
+            no_logtree,
         } => {
             // CLI args override config file values.
             if let Some(dir) = data_dir {
@@ -232,7 +250,7 @@ async fn main() -> Result<()> {
             if memory {
                 config.storage.backend = "memory".to_string();
             }
-            cmd_start(config).await
+            cmd_start(config, single, no_logtree).await
         }
         Commands::Status => cmd_status(&config),
         Commands::Repair { action } => match action {
@@ -246,8 +264,14 @@ async fn main() -> Result<()> {
 // shoald start
 // -----------------------------------------------------------------------
 
-async fn cmd_start(mut config: CliConfig) -> Result<()> {
+async fn cmd_start(mut config: CliConfig, single_mode: bool, no_logtree: bool) -> Result<()> {
     info!("starting shoald");
+    if single_mode {
+        info!(
+            no_logtree = no_logtree,
+            "single-node mode: gossip, peer manager, and repair disabled"
+        );
+    }
     info!(
         data_dir = %config.node.data_dir.display(),
         s3_addr = %config.node.s3_listen_addr,
@@ -282,50 +306,50 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let node_id = NodeId::from(*public_key.as_bytes());
     info!(%node_id, endpoint_id = %public_key.fmt_short(), "node identity");
 
-    // --- Cluster secret ---
-    // If no secret was provided (CLI flag, env var, or config file), generate
-    // a random one and display it so the user can pass it to other nodes.
-    let generated_secret = config.cluster.secret.is_empty();
-    if generated_secret {
-        use rand::RngCore;
-        let mut bytes = [0u8; 16];
-        rand::rng().fill_bytes(&mut bytes);
-        config.cluster.secret = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    }
-
     // --- Network transport (iroh QUIC) ---
-    // Derive a cluster-specific ALPN from the shared secret so that nodes
-    // with different secrets cannot even establish QUIC connections.
-    let cluster_alpn = shoal_net::cluster_alpn(config.cluster.secret.as_bytes());
-    info!(
-        cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
-        "cluster identity derived from secret"
-    );
+    // In single-node mode, skip networking entirely.
+    let (endpoint, transport, cluster_alpn, generated_secret) = if !single_mode {
+        // Cluster secret: generate if not provided.
+        let generated = config.cluster.secret.is_empty();
+        if generated {
+            use rand::RngCore;
+            let mut bytes = [0u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            config.cluster.secret = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        }
 
-    // Create the iroh endpoint directly. The Router will manage the accept
-    // loop for incoming connections; the ShoalTransport is used only for
-    // outgoing connections (push/pull shards, peer pings).
-    let endpoint = Endpoint::builder()
-        .secret_key(secret_key)
-        .alpns(vec![cluster_alpn.clone()])
-        .relay_mode(iroh::RelayMode::Default)
-        .bind()
-        .await
-        .context("failed to bind iroh endpoint")?;
+        let alpn = shoal_net::cluster_alpn(config.cluster.secret.as_bytes());
+        info!(
+            cluster_id = %blake3::hash(config.cluster.secret.as_bytes()).to_hex()[..16],
+            "cluster identity derived from secret"
+        );
 
-    let transport = Arc::new(ShoalTransport::from_endpoint_with_alpn(
-        endpoint.clone(),
-        cluster_alpn.clone(),
-    ));
+        let ep = Endpoint::builder()
+            .secret_key(secret_key)
+            .alpns(vec![alpn.clone()])
+            .relay_mode(iroh::RelayMode::Default)
+            .bind()
+            .await
+            .context("failed to bind iroh endpoint")?;
 
-    let local_addr = endpoint.addr();
-    info!(
-        endpoint_id = %endpoint.id().fmt_short(),
-        "iroh endpoint ready"
-    );
-    for addr in local_addr.ip_addrs() {
-        info!(%addr, "listening on");
-    }
+        let tr = Arc::new(ShoalTransport::from_endpoint_with_alpn(
+            ep.clone(),
+            alpn.clone(),
+        ));
+
+        let local_addr = ep.addr();
+        info!(
+            endpoint_id = %ep.id().fmt_short(),
+            "iroh endpoint ready"
+        );
+        for addr in local_addr.ip_addrs() {
+            info!(%addr, "listening on");
+        }
+
+        (Some(ep), Some(tr), Some(alpn), generated)
+    } else {
+        (None, None, None, false)
+    };
 
     // --- Metadata store ---
     let meta = if memory_mode {
@@ -371,83 +395,95 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let address_book: AddressBook = Arc::new(RwLock::new(HashMap::new()));
 
     // --- Peer manager (QUIC ping/pong health checking) ---
-    let peer_handle = Arc::new(shoal_cluster::membership::start(
-        node_id,
-        PeerManagerConfig::default_config(),
-        cluster.clone(),
-        transport.clone() as Arc<dyn shoal_net::Transport>,
-        Some(meta.clone()),
-        address_book.clone(),
-    ));
+    // In single-node mode, no peer manager is started.
+    let peer_handle = if !single_mode {
+        let tr = transport
+            .clone()
+            .expect("transport must be set in cluster mode");
+        let handle = Arc::new(shoal_cluster::membership::start(
+            node_id,
+            PeerManagerConfig::default_config(),
+            cluster.clone(),
+            tr as Arc<dyn shoal_net::Transport>,
+            Some(meta.clone()),
+            address_book.clone(),
+        ));
 
-    // --- Load persisted peers from previous runs ---
-    match meta.list_peer_addrs() {
-        Ok(peers) if !peers.is_empty() => {
-            info!(count = peers.len(), "loading persisted peers");
+        // --- Load persisted peers from previous runs ---
+        match meta.list_peer_addrs() {
+            Ok(peers) if !peers.is_empty() => {
+                info!(count = peers.len(), "loading persisted peers");
 
-            for (peer_node_id, addrs) in &peers {
-                if *peer_node_id == node_id {
-                    continue; // Skip self.
-                }
-
-                if let Ok(eid) = iroh::EndpointId::from_bytes(peer_node_id.as_bytes()) {
-                    let mut addr = EndpointAddr::new(eid);
-
-                    for socket_addr in addrs {
-                        addr = addr.with_ip_addr(*socket_addr);
+                for (peer_node_id, addrs) in &peers {
+                    if *peer_node_id == node_id {
+                        continue; // Skip self.
                     }
 
-                    peer_handle
-                        .add_peer(*peer_node_id, addr, 1, u64::MAX, NodeTopology::default())
-                        .await;
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(e) => {
-            warn!(%e, "failed to load persisted peers");
-        }
-    }
+                    if let Ok(eid) = iroh::EndpointId::from_bytes(peer_node_id.as_bytes()) {
+                        let mut addr = EndpointAddr::new(eid);
 
-    // --- Connect to peer nodes from CLI/config ---
-    for peer_str in &config.cluster.peers {
-        match parse_peer(peer_str) {
-            Ok((peer_endpoint_addr, peer_node_id)) => {
-                // Store peer address for routing.
-                address_book
-                    .write()
-                    .await
-                    .insert(peer_node_id, peer_endpoint_addr.clone());
-                info!(peer = %peer_str, "joining cluster via peer");
-                if let Err(e) = peer_handle.join_via_seed(peer_endpoint_addr).await {
-                    warn!(peer = %peer_str, %e, "failed to join via peer");
+                        for socket_addr in addrs {
+                            addr = addr.with_ip_addr(*socket_addr);
+                        }
+
+                        handle
+                            .add_peer(*peer_node_id, addr, 1, u64::MAX, NodeTopology::default())
+                            .await;
+                    }
                 }
             }
+            Ok(_) => {}
             Err(e) => {
-                warn!(peer = %peer_str, %e, "invalid peer format, skipping");
+                warn!(%e, "failed to load persisted peers");
             }
         }
-    }
+
+        // --- Connect to peer nodes from CLI/config ---
+        for peer_str in &config.cluster.peers {
+            match parse_peer(peer_str) {
+                Ok((peer_endpoint_addr, peer_node_id)) => {
+                    // Store peer address for routing.
+                    address_book
+                        .write()
+                        .await
+                        .insert(peer_node_id, peer_endpoint_addr.clone());
+                    info!(peer = %peer_str, "joining cluster via peer");
+                    if let Err(e) = handle.join_via_seed(peer_endpoint_addr).await {
+                        warn!(peer = %peer_str, %e, "failed to join via peer");
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %peer_str, %e, "invalid peer format, skipping");
+                }
+            }
+        }
+
+        Some(handle)
+    } else {
+        None
+    };
 
     // --- Gossip service (iroh-gossip) ---
-    // Create the Gossip instance and GossipService. The Gossip protocol
-    // handler is registered alongside our custom ShoalProtocol in a single
-    // Router below.
-    let gossip = iroh_gossip::Gossip::builder()
-        .max_message_size(1024 * 1024)
-        .spawn(endpoint.clone());
-    let gossip_service = GossipService::new(
-        gossip.clone(),
-        config.cluster.secret.as_bytes(),
-        cluster.clone(),
-    );
+    // In single-node mode, gossip is entirely skipped.
+    let gossip = if !single_mode {
+        let ep = endpoint
+            .as_ref()
+            .expect("endpoint must be set in cluster mode");
+        Some(
+            iroh_gossip::Gossip::builder()
+                .max_message_size(1024 * 1024)
+                .spawn(ep.clone()),
+        )
+    } else {
+        None
+    };
+    let gossip_service = gossip
+        .as_ref()
+        .map(|g| GossipService::new(g.clone(), config.cluster.secret.as_bytes(), cluster.clone()));
 
     // --- LogTree (DAG-based mutation tracking) ---
-    let log_tree = {
-        // Derive an ed25519-dalek signing key from the iroh SecretKey.
-        // The iroh SecretKey is a Curve25519 key, but its raw bytes are
-        // also a valid ed25519 seed. We use it to create a deterministic
-        // ed25519 signing key for log entry signatures.
+    // In single-node mode with --no-logtree, LogTree is skipped entirely.
+    let log_tree = if !no_logtree {
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_key_bytes);
         let log_store = if memory_mode {
             shoal_logtree::LogTreeStore::open_temporary()
@@ -456,93 +492,129 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
             let log_path = config.node.data_dir.join("logtree");
             shoal_logtree::LogTreeStore::open(&log_path).context("failed to open LogTree store")?
         };
-        Arc::new(LogTree::new(log_store, node_id, signing_key))
+        let tree = Arc::new(LogTree::new(log_store, node_id, signing_key));
+        info!("LogTree initialized");
+        Some(tree)
+    } else {
+        info!("LogTree disabled (--no-logtree)");
+        None
     };
-    info!("LogTree initialized");
 
     // --- Incoming connection handler (iroh Router) ---
-    // A single Router handles both our custom protocol (cluster_alpn) and
-    // the iroh-gossip protocol (GOSSIP_ALPN).
-    let protocol = ShoalProtocol::new(
-        store.clone(),
-        meta.clone(),
-        peer_handle.clone(),
-        address_book.clone(),
-    )
-    .with_log_tree(log_tree.clone())
-    .with_transport(transport.clone() as Arc<dyn shoal_net::Transport>)
-    .with_event_bus(event_bus.clone());
-    let pending_entries = protocol.pending_buffer();
-    let router = Router::builder(endpoint.clone())
-        .accept(cluster_alpn, protocol)
-        .accept(GOSSIP_ALPN, gossip)
-        .spawn();
+    // In single-node mode we skip the router entirely — no inter-node traffic.
+    let (router, pending_entries, gossip_handle, gossip_payload_rx) = if !single_mode {
+        let peer_handle = peer_handle
+            .as_ref()
+            .expect("peer_handle must be set in cluster mode");
 
-    // Print join command for other nodes.
-    if generated_secret {
-        info!("cluster secret (generated): {}", config.cluster.secret);
-    }
-    info!(
-        "to join this node: shoald start --secret {} --peer {}",
-        config.cluster.secret,
-        endpoint.id()
-    );
+        let mut protocol_builder = ShoalProtocol::new(
+            store.clone(),
+            meta.clone(),
+            peer_handle.clone(),
+            address_book.clone(),
+        )
+        .with_transport(
+            transport
+                .clone()
+                .expect("transport must be set in cluster mode")
+                as Arc<dyn shoal_net::Transport>,
+        )
+        .with_event_bus(event_bus.clone());
 
-    // --- Join gossip topic ---
-    // Collect the EndpointIds of configured peers for gossip bootstrap.
-    let peer_endpoint_ids: Vec<iroh::EndpointId> = config
-        .cluster
-        .peers
-        .iter()
-        .filter_map(|p| {
-            let id_str = p.split_once('@').map(|(id, _)| id).unwrap_or(p);
-            id_str.parse().ok()
-        })
-        .collect();
-
-    let gossip_result = if !peer_endpoint_ids.is_empty() {
-        match gossip_service.join(peer_endpoint_ids).await {
-            Ok((handle, rx)) => {
-                info!("joined gossip topic");
-                Some((handle, rx))
-            }
-            Err(e) => {
-                warn!(%e, "failed to join gossip topic — continuing without gossip");
-                None
-            }
+        if let Some(ref lt) = log_tree {
+            protocol_builder = protocol_builder.with_log_tree(lt.clone());
         }
+
+        let pending = protocol_builder.pending_buffer();
+        let gossip_instance = gossip.expect("gossip must be set in cluster mode");
+        let ep = endpoint
+            .as_ref()
+            .expect("endpoint must be set in cluster mode");
+        let alpn = cluster_alpn.expect("cluster_alpn must be set in cluster mode");
+        let router = Router::builder(ep.clone())
+            .accept(alpn, protocol_builder)
+            .accept(GOSSIP_ALPN, gossip_instance)
+            .spawn();
+
+        // Print join command for other nodes.
+        if generated_secret {
+            info!("cluster secret (generated): {}", config.cluster.secret);
+        }
+        info!(
+            "to join this node: shoald start --secret {} --peer {}",
+            config.cluster.secret,
+            ep.id()
+        );
+
+        // --- Join gossip topic ---
+        let gossip_service = gossip_service.expect("gossip_service must be set in cluster mode");
+        let peer_endpoint_ids: Vec<iroh::EndpointId> = config
+            .cluster
+            .peers
+            .iter()
+            .filter_map(|p| {
+                let id_str = p.split_once('@').map(|(id, _)| id).unwrap_or(p);
+                id_str.parse().ok()
+            })
+            .collect();
+
+        let gossip_result = if !peer_endpoint_ids.is_empty() {
+            match gossip_service.join(peer_endpoint_ids).await {
+                Ok((handle, rx)) => {
+                    info!("joined gossip topic");
+                    Some((handle, rx))
+                }
+                Err(e) => {
+                    warn!(%e, "failed to join gossip topic — continuing without gossip");
+                    None
+                }
+            }
+        } else {
+            match gossip_service.join(vec![]).await {
+                Ok((handle, rx)) => Some((handle, rx)),
+                Err(e) => {
+                    warn!(%e, "failed to create gossip topic");
+                    None
+                }
+            }
+        };
+
+        let (gh, gossip_payload_rx) = match gossip_result {
+            Some((handle, rx)) => (Some(handle), Some(rx)),
+            None => (None, None),
+        };
+
+        // Wire gossip handle into peer manager.
+        if let Some(ref handle) = gh {
+            peer_handle.set_gossip(handle.clone()).await;
+        }
+
+        (Some(router), pending, gh, gossip_payload_rx)
     } else {
-        // First node — subscribe to topic without bootstrap peers.
-        match gossip_service.join(vec![]).await {
-            Ok((handle, rx)) => Some((handle, rx)),
-            Err(e) => {
-                warn!(%e, "failed to create gossip topic");
-                None
-            }
-        }
+        // Single-node mode: no router, no gossip, empty pending buffer.
+        let pending: PendingBuffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        (None, pending, None, None)
     };
-
-    let (gossip_handle, gossip_payload_rx) = match gossip_result {
-        Some((handle, rx)) => (Some(handle), Some(rx)),
-        None => (None, None),
-    };
-
-    // Wire gossip handle into peer manager so it can broadcast NodeJoined events.
-    if let Some(ref handle) = gossip_handle {
-        peer_handle.set_gossip(handle.clone()).await;
-    }
 
     // --- Gossip data payload receiver ---
     // Processes LogEntry payloads received via gossip from other nodes.
     // Manifests and API key secrets are pulled via QUIC on demand.
+    // This block only runs in cluster mode, so log_tree and peer_handle
+    // are guaranteed to be Some (--no-logtree requires --single).
     if let Some(mut payload_rx) = gossip_payload_rx {
         let meta_gossip = meta.clone();
-        let log_tree_gossip = log_tree.clone();
+        let log_tree_gossip = log_tree
+            .clone()
+            .expect("log_tree must be set in cluster mode");
         let pending_gossip = pending_entries.clone();
         let bus_gossip = event_bus.clone();
-        let transport_gossip: Arc<dyn shoal_net::Transport> = transport.clone();
+        let transport_gossip: Arc<dyn shoal_net::Transport> = transport
+            .clone()
+            .expect("transport must be set in cluster mode");
         let address_book_gossip = address_book.clone();
-        let peer_handle_gossip = peer_handle.clone();
+        let peer_handle_gossip = peer_handle
+            .clone()
+            .expect("peer_handle must be set in cluster mode");
         tokio::spawn(async move {
             use shoal_types::GossipPayload;
 
@@ -744,27 +816,24 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
                     GossipPayload::Event(event) => {
                         use shoal_types::ClusterEvent;
 
-                        match event {
-                            ClusterEvent::NodeJoined(member) => {
-                                if member.node_id == node_id {
-                                    continue;
-                                }
-
-                                let eid = iroh::EndpointId::from_bytes(member.node_id.as_bytes())
-                                    .expect("valid endpoint ID");
-                                let addr = iroh::EndpointAddr::new(eid);
-                                peer_handle_gossip
-                                    .add_peer(
-                                        member.node_id,
-                                        addr,
-                                        member.generation,
-                                        member.capacity,
-                                        member.topology,
-                                    )
-                                    .await;
-                                info!(node_id = %member.node_id, "discovered peer via gossip");
+                        if let ClusterEvent::NodeJoined(member) = event {
+                            if member.node_id == node_id {
+                                continue;
                             }
-                            _ => {} // NodeLeft, NodeDead — future work
+
+                            let eid = iroh::EndpointId::from_bytes(member.node_id.as_bytes())
+                                .expect("valid endpoint ID");
+                            let addr = iroh::EndpointAddr::new(eid);
+                            peer_handle_gossip
+                                .add_peer(
+                                    member.node_id,
+                                    addr,
+                                    member.generation,
+                                    member.capacity,
+                                    member.topology,
+                                )
+                                .await;
+                            info!(node_id = %member.node_id, "discovered peer via gossip");
                         }
                     }
                 }
@@ -789,11 +858,18 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
         meta.clone(),
         cluster.clone(),
     )
-    .with_transport(transport.clone())
-    .with_address_book(address_book.clone())
-    .with_log_tree(log_tree.clone())
     .with_pending_buffer(pending_entries.clone())
     .with_event_bus(event_bus.clone());
+
+    if let Some(ref tr) = transport {
+        engine_builder = engine_builder
+            .with_transport(tr.clone())
+            .with_address_book(address_book.clone());
+    }
+
+    if let Some(ref lt) = log_tree {
+        engine_builder = engine_builder.with_log_tree(lt.clone());
+    }
 
     if let Some(handle) = gossip_handle {
         engine_builder = engine_builder.with_gossip(handle);
@@ -802,183 +878,175 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let engine = Arc::new(engine_builder);
     let engine_dyn: Arc<dyn shoal_engine::ShoalEngine> = engine.clone();
 
-    // --- Repair subsystem ---
-    // Wire up the repair detector, scheduler, and executor as background
-    // tasks. The detector watches for cluster events (node failures) and
-    // enqueues shards for repair. The scheduler dequeues them respecting
-    // rate limits and the circuit breaker. The executor fetches/reconstructs
-    // missing shards.
-    let replication_factor = config.shard_replication() as usize;
-    let repair_transfer: Arc<dyn ShardTransfer> = Arc::new(TransportShardTransfer {
-        transport: transport.clone(),
-        address_book: address_book.clone(),
-    });
-    let circuit_breaker = Arc::new(CircuitBreaker::new(RepairCircuitBreaker::default()));
-    let throttle = Throttle::new(config.repair_max_bandwidth_bytes());
-    let repair_executor = RepairExecutor::new(
-        cluster.clone(),
-        meta.clone(),
-        store.clone(),
-        repair_transfer,
-        node_id,
-        replication_factor,
-        config.erasure_k() as usize,
-        config.erasure_m() as usize,
-    )
-    .with_event_bus(event_bus.clone());
-    let repair_scheduler = RepairScheduler::new(
-        meta.clone(),
-        cluster.clone(),
-        repair_executor,
-        circuit_breaker,
-        throttle,
-        config.repair_concurrent_transfers(),
-        1000, // poll interval: check repair queue every second
-    );
-    let repair_detector = Arc::new(
-        RepairDetector::new(
-            cluster.clone(),
-            meta.clone(),
-            store.clone(),
-            replication_factor,
-        )
-        .with_event_bus(event_bus.clone()),
-    );
-
-    // Spawn repair background tasks.
-    {
-        let detector = repair_detector.clone();
-        let bus = event_bus.clone();
-        tokio::spawn(async move {
-            detector.run(&bus).await;
-        });
-    }
-    tokio::spawn(async move {
-        repair_scheduler.run().await;
-    });
-    info!(
-        concurrent = config.repair_concurrent_transfers(),
-        bandwidth = config.repair_max_bandwidth_bytes(),
-        "repair subsystem started"
-    );
-
     // --- Shutdown coordination ---
     // A watch channel lets background tasks observe when shutdown begins so
     // they can abort long-running work (e.g. a mid-flight anti-entropy scan)
     // instead of blocking the shutdown sequence.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // --- Anti-entropy background scan ---
-    // Periodically scan local shards to verify integrity and placement.
-    // Corrupt or misplaced shards are enqueued for repair.
-    {
-        let detector = repair_detector.clone();
-        let scan_interval_secs = config.anti_entropy_interval_secs();
-        let mut shutdown_rx = shutdown_rx.clone();
-        tokio::spawn(async move {
-            // Initial delay: let the node settle before the first scan.
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            info!(
-                interval_secs = scan_interval_secs,
-                "anti-entropy background scan started"
-            );
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(scan_interval_secs));
-            loop {
-                // Wait for the next tick or a shutdown signal.
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = shutdown_rx.changed() => {
-                        info!("anti-entropy scan interrupted by shutdown");
-                        break;
-                    }
-                }
+    // --- Cluster-only background tasks ---
+    // Repair, anti-entropy, pending push retry, and periodic log sync are
+    // only meaningful in cluster mode. In single-node mode they are skipped.
+    if !single_mode {
+        // --- Repair subsystem ---
+        let replication_factor = config.shard_replication() as usize;
+        let repair_transfer: Arc<dyn ShardTransfer> = Arc::new(TransportShardTransfer {
+            transport: transport
+                .clone()
+                .expect("transport must be set in cluster mode"),
+            address_book: address_book.clone(),
+        });
+        let circuit_breaker = Arc::new(CircuitBreaker::new(RepairCircuitBreaker::default()));
+        let throttle = Throttle::new(config.repair_max_bandwidth_bytes());
+        let repair_executor = RepairExecutor::new(
+            cluster.clone(),
+            meta.clone(),
+            store.clone(),
+            repair_transfer,
+            node_id,
+            replication_factor,
+            config.erasure_k() as usize,
+            config.erasure_m() as usize,
+        )
+        .with_event_bus(event_bus.clone());
+        let repair_scheduler = RepairScheduler::new(
+            meta.clone(),
+            cluster.clone(),
+            repair_executor,
+            circuit_breaker,
+            throttle,
+            config.repair_concurrent_transfers(),
+            1000,
+        );
+        let repair_detector = Arc::new(
+            RepairDetector::new(
+                cluster.clone(),
+                meta.clone(),
+                store.clone(),
+                replication_factor,
+            )
+            .with_event_bus(event_bus.clone()),
+        );
 
-                // Run the scan, but abort if shutdown arrives mid-scan.
-                tokio::select! {
-                    result = detector.scan_local_shards() => {
-                        match result {
-                            Ok(r) if r.corrupt > 0 || r.misplaced > 0 => {
-                                warn!(
-                                    scanned = r.total_scanned,
-                                    corrupt = r.corrupt,
-                                    misplaced = r.misplaced,
-                                    "anti-entropy scan found issues"
-                                );
-                            }
-                            Ok(r) => {
-                                debug!(
-                                    scanned = r.total_scanned,
-                                    "anti-entropy scan: all shards healthy"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(%e, "anti-entropy scan failed");
-                            }
+        // Spawn repair background tasks.
+        {
+            let detector = repair_detector.clone();
+            let bus = event_bus.clone();
+            tokio::spawn(async move {
+                detector.run(&bus).await;
+            });
+        }
+        tokio::spawn(async move {
+            repair_scheduler.run().await;
+        });
+        info!(
+            concurrent = config.repair_concurrent_transfers(),
+            bandwidth = config.repair_max_bandwidth_bytes(),
+            "repair subsystem started"
+        );
+
+        // --- Anti-entropy background scan ---
+        {
+            let detector = repair_detector.clone();
+            let scan_interval_secs = config.anti_entropy_interval_secs();
+            let mut shutdown_rx = shutdown_rx.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                info!(
+                    interval_secs = scan_interval_secs,
+                    "anti-entropy background scan started"
+                );
+                let mut interval =
+                    tokio::time::interval(std::time::Duration::from_secs(scan_interval_secs));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = shutdown_rx.changed() => {
+                            info!("anti-entropy scan interrupted by shutdown");
+                            break;
                         }
                     }
-                    _ = shutdown_rx.changed() => {
-                        info!("anti-entropy scan interrupted by shutdown");
-                        break;
+
+                    tokio::select! {
+                        result = detector.scan_local_shards() => {
+                            match result {
+                                Ok(r) if r.corrupt > 0 || r.misplaced > 0 => {
+                                    warn!(
+                                        scanned = r.total_scanned,
+                                        corrupt = r.corrupt,
+                                        misplaced = r.misplaced,
+                                        "anti-entropy scan found issues"
+                                    );
+                                }
+                                Ok(r) => {
+                                    debug!(
+                                        scanned = r.total_scanned,
+                                        "anti-entropy scan: all shards healthy"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(%e, "anti-entropy scan failed");
+                                }
+                            }
+                        }
+                        _ = shutdown_rx.changed() => {
+                            info!("anti-entropy scan interrupted by shutdown");
+                            break;
+                        }
                     }
                 }
-            }
-        });
-    }
+            });
+        }
 
-    // --- Pending push retry loop ---
-    // Retries shard pushes that failed during writes (transient network issues).
-    // On success the local copy is deleted, freeing storage on the writer.
-    {
-        let engine = engine.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-            loop {
-                interval.tick().await;
-                let _ = engine.retry_pending_pushes().await;
-            }
-        });
-    }
-
-    // --- Periodic log sync (catch up on mutations from peers) ---
-    // On startup (and periodically when pending entries exist), pull missing
-    // log entries from peers using tips-based delta sync via QUIC.
-    {
-        let engine_sync = engine.clone();
-        let log_tree_sync = log_tree.clone();
-        let pending_sync = pending_entries.clone();
-        tokio::spawn(async move {
-            // Initial delay: let peer manager establish connections.
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-
-            loop {
-                let pending_count = pending_sync.lock().expect("lock").len();
-
-                match engine_sync.sync_log_from_peers().await {
-                    Ok(0) => {}
-                    Ok(n) => info!(count = n, "log sync: applied entries from peers"),
-                    Err(e) => debug!(%e, "log sync attempt failed"),
+        // --- Pending push retry loop ---
+        {
+            let engine = engine.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    interval.tick().await;
+                    let _ = engine.retry_pending_pushes().await;
                 }
+            });
+        }
 
-                let drained = shoal_engine::drain_pending(&log_tree_sync, &pending_sync);
+        // --- Periodic log sync ---
+        {
+            let engine_sync = engine.clone();
+            let log_tree_sync = log_tree
+                .clone()
+                .expect("log_tree must be set in cluster mode");
+            let pending_sync = pending_entries.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                if drained > 0 {
-                    info!(count = drained, "applied buffered log entries after sync");
+                loop {
+                    let pending_count = pending_sync.lock().expect("lock").len();
+
+                    match engine_sync.sync_log_from_peers().await {
+                        Ok(0) => {}
+                        Ok(n) => info!(count = n, "log sync: applied entries from peers"),
+                        Err(e) => debug!(%e, "log sync attempt failed"),
+                    }
+
+                    let drained = shoal_engine::drain_pending(&log_tree_sync, &pending_sync);
+
+                    if drained > 0 {
+                        info!(count = drained, "applied buffered log entries after sync");
+                    }
+
+                    if pending_count == 0 {
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    } else {
+                        debug!(
+                            pending = pending_count,
+                            "pending log entries, retrying sync in 2s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
                 }
-
-                if pending_count == 0 {
-                    // Nothing pending — check again in 5 seconds.
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                } else {
-                    // Pending entries exist — retry more aggressively.
-                    debug!(
-                        pending = pending_count,
-                        "pending log entries, retrying sync in 2s"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-        });
+            });
+        }
     }
 
     // --- S3 HTTP API ---
@@ -996,13 +1064,17 @@ async fn cmd_start(mut config: CliConfig) -> Result<()> {
     let _ = shutdown_tx.send(true);
 
     // 2. Stop the peer manager (stops pinging peers).
-    info!("stopping peer manager");
-    peer_handle.leave();
+    if let Some(ref ph) = peer_handle {
+        info!("stopping peer manager");
+        ph.leave();
+    }
 
     // 3. Shut down the iroh router (stops accepting new connections,
     //    waits for in-flight handlers, then closes the endpoint).
-    info!("shutting down iroh router");
-    router.shutdown().await.context("router shutdown failed")?;
+    if let Some(router) = router {
+        info!("shutting down iroh router");
+        router.shutdown().await.context("router shutdown failed")?;
+    }
 
     // 4. Flush pending OTel spans and logs.
     telemetry::shutdown();

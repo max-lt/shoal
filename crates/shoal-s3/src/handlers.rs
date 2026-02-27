@@ -764,14 +764,14 @@ async fn abort_multipart_upload(
     let mut uploads = state.uploads.write().await;
     let removed = uploads.remove(upload_id);
 
-    if let Some(upload) = removed {
-        if upload.bucket != bucket || upload.key != key {
-            // Put it back — wrong bucket/key.
-            uploads.insert(upload_id.to_string(), upload);
-            return Err(S3Error::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
+    if let Some(upload) = removed
+        && (upload.bucket != bucket || upload.key != key)
+    {
+        // Put it back — wrong bucket/key.
+        uploads.insert(upload_id.to_string(), upload);
+        return Err(S3Error::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        });
     }
     // S3 spec: aborting a non-existent upload returns 204.
 
