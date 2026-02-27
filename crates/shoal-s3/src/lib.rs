@@ -64,6 +64,8 @@ pub(crate) struct MultipartUpload {
     pub parts: BTreeMap<u16, Vec<u8>>,
     /// User metadata captured at initiation.
     pub metadata: BTreeMap<String, String>,
+    /// Object tags captured at initiation (from `x-amz-tagging` header).
+    pub tags: Option<BTreeMap<String, String>>,
 }
 
 /// Shared application state for all S3 handlers.

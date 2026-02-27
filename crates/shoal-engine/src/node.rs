@@ -4,7 +4,7 @@
 //! and network transport, and exposes the write/read/delete pipeline for
 //! objects.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use iroh::EndpointAddr;
@@ -867,14 +867,14 @@ impl ShoalNode {
 
     /// List objects in a bucket with an optional prefix.
     ///
-    /// Returns keys known locally via LogTree or MetaStore. Listing is
+    /// Returns [`ObjectInfo`] known locally via LogTree or MetaStore. Listing is
     /// always local — cross-node visibility is handled by gossip and
     /// periodic sync, not inline on every list call.
     pub async fn list_objects(
         &self,
         bucket: &str,
         prefix: &str,
-    ) -> Result<Vec<String>, EngineError> {
+    ) -> Result<Vec<shoal_types::ObjectInfo>, EngineError> {
         if let Some(log_tree) = &self.log_tree {
             Ok(log_tree.list_keys(bucket, prefix)?)
         } else {
@@ -1013,8 +1013,8 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// List all known bucket names.
-    pub async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError> {
+    /// List all known buckets with metadata.
+    pub async fn list_buckets(&self) -> Result<Vec<shoal_types::BucketInfo>, EngineError> {
         Ok(self.meta.list_buckets()?)
     }
 
@@ -1724,7 +1724,11 @@ impl ShoalEngine for ShoalNode {
         ShoalNode::delete_object(self, bucket, key).await
     }
 
-    async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError> {
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<shoal_types::ObjectInfo>, EngineError> {
         ShoalNode::list_objects(self, bucket, prefix).await
     }
 
@@ -1779,7 +1783,7 @@ impl ShoalEngine for ShoalNode {
         ShoalNode::delete_bucket(self, bucket).await
     }
 
-    async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError> {
+    async fn list_buckets(&self) -> Result<Vec<shoal_types::BucketInfo>, EngineError> {
         ShoalNode::list_buckets(self).await
     }
 

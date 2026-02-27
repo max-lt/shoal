@@ -87,6 +87,34 @@ define_id!(
 );
 
 // ---------------------------------------------------------------------------
+// List API result types
+// ---------------------------------------------------------------------------
+
+/// Bucket metadata returned by list-buckets APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketInfo {
+    /// Bucket name.
+    pub name: String,
+    /// Creation timestamp (unix seconds).
+    pub created_at: u64,
+}
+
+/// Object metadata returned by list-objects APIs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectInfo {
+    /// Object key (without bucket prefix).
+    pub key: String,
+    /// Total object size in bytes.
+    pub size: u64,
+    /// Last modified timestamp (unix seconds).
+    pub last_modified: u64,
+    /// Hex-encoded ObjectId for display (e.g. ETag).
+    pub etag: String,
+    /// Raw ObjectId for programmatic use.
+    pub object_id: ObjectId,
+}
+
+// ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------
 

@@ -90,17 +90,17 @@ tests/
 
 No C/C++ bindings in the dependency tree.
 
-| Purpose          | Crate               |
-| ---------------- | -------------------- |
-| Hashing          | `blake3`             |
-| Metadata DB      | `fjall` v3           |
-| Erasure coding   | `reed-solomon-simd`  |
-| Networking       | `iroh` 0.96          |
-| Gossip           | `iroh-gossip`        |
-| Membership       | `foca`               |
-| Serialization    | `postcard` + `serde` |
-| HTTP             | `axum`               |
-| Async            | `tokio`              |
+| Purpose        | Crate                |
+| -------------- | -------------------- |
+| Hashing        | `blake3`             |
+| Metadata DB    | `fjall` v3           |
+| Erasure coding | `reed-solomon-simd`  |
+| Networking     | `iroh` 0.96          |
+| Gossip         | `iroh-gossip`        |
+| Membership     | `foca`               |
+| Serialization  | `postcard` + `serde` |
+| HTTP           | `axum`               |
+| Async          | `tokio`              |
 
 ## Build & Test
 
@@ -117,34 +117,34 @@ cargo fmt --check                    # format check
 
 All 15 milestones complete. The full storage engine works end-to-end:
 
-| Crate | Description | Tests |
-| ----- | ----------- | ----- |
-| `shoal-types` | Shared types, IDs | 40 |
-| `shoal-store` | Shard storage trait + backends | 36 |
-| `shoal-cas` | Content addressing, chunking | 15 |
-| `shoal-erasure` | Reed-Solomon coding | 43 |
-| `shoal-placement` | Consistent hash ring | 33 |
-| `shoal-meta` | Metadata persistence (Fjall) | 36 |
-| `shoal-net` | iroh QUIC transport | 32 |
-| `shoal-cluster` | Membership + gossip | 20 |
-| `shoal-logtree` | Signed mutation DAG | 44 |
-| `shoal-repair` | Auto-repair, circuit breaker | 27 |
-| `shoal-engine` | Node orchestrator | 115 |
-| `shoal-s3` | S3 HTTP API | 17 |
-| `shoald` | CLI, config, auto-detection | 16 |
-| integration | End-to-end + chaos + torture | 49 |
+| Crate             | Description                    | Tests |
+| ----------------- | ------------------------------ | ----- |
+| `shoal-types`     | Shared types, IDs              | 40    |
+| `shoal-store`     | Shard storage trait + backends | 36    |
+| `shoal-cas`       | Content addressing, chunking   | 15    |
+| `shoal-erasure`   | Reed-Solomon coding            | 43    |
+| `shoal-placement` | Consistent hash ring           | 33    |
+| `shoal-meta`      | Metadata persistence (Fjall)   | 36    |
+| `shoal-net`       | iroh QUIC transport            | 32    |
+| `shoal-cluster`   | Membership + gossip            | 20    |
+| `shoal-logtree`   | Signed mutation DAG            | 44    |
+| `shoal-repair`    | Auto-repair, circuit breaker   | 27    |
+| `shoal-engine`    | Node orchestrator              | 115   |
+| `shoal-s3`        | S3 HTTP API                    | 17    |
+| `shoald`          | CLI, config, auto-detection    | 16    |
+| integration       | End-to-end + chaos + torture   | 49    |
 
 **Total: 523 tests**, all passing, clippy clean.
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Getting Started](docs/getting-started.md) | Quick start, single-node and multi-node setup |
-| [Architecture](docs/architecture.md) | System design, data flow, failure handling |
-| [Configuration](docs/configuration.md) | Full TOML config reference, hardware profiles |
-| [Security](docs/security.md) | Trust model, CA-based authentication design |
-| [Implementation Plan](docs/plan.md) | Detailed milestone plan with architecture notes |
+| Document                                   | Description                                     |
+| ------------------------------------------ | ----------------------------------------------- |
+| [Getting Started](docs/getting-started.md) | Quick start, single-node and multi-node setup   |
+| [Architecture](docs/architecture.md)       | System design, data flow, failure handling      |
+| [Configuration](docs/configuration.md)     | Full TOML config reference, hardware profiles   |
+| [Security](docs/security.md)               | Trust model, CA-based authentication design     |
+| [Implementation Plan](docs/plan.md)        | Detailed milestone plan with architecture notes |
 
 ## License
 

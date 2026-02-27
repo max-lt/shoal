@@ -731,8 +731,8 @@ fn test_bidirectional_sync_convergence() {
     assert_eq!(keys_b.len(), 6);
 
     // Both should resolve the same keys.
-    let mut sorted_a = keys_a.clone();
-    let mut sorted_b = keys_b.clone();
+    let mut sorted_a: Vec<String> = keys_a.into_iter().map(|o| o.key).collect();
+    let mut sorted_b: Vec<String> = keys_b.into_iter().map(|o| o.key).collect();
     sorted_a.sort();
     sorted_b.sort();
     assert_eq!(sorted_a, sorted_b);

@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::SigningKey;
-use shoal_types::{HybridClock, Manifest, NodeId, ObjectId};
+use shoal_types::{HybridClock, Manifest, NodeId, ObjectId, ObjectInfo};
 use tracing::{debug, warn};
 
 use crate::entry::{Action, LogEntry, Version};
@@ -273,11 +273,11 @@ impl LogTree {
         Ok(None)
     }
 
-    /// List keys in a bucket with prefix.
-    pub fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    /// List keys in a bucket with prefix, returning rich [`ObjectInfo`].
+    pub fn list_keys(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let all_keys = self.store.list_keys(bucket, prefix)?;
 
-        // Filter out keys whose latest version is deleted.
+        // Filter out keys whose latest version is deleted, resolve manifests.
         let mut result = Vec::new();
 
         for key in all_keys {
@@ -285,7 +285,20 @@ impl LogTree {
                 && let Some(latest) = versions.first()
                 && !latest.deleted
             {
-                result.push(key);
+                let object_id = latest.manifest_id;
+                let (size, last_modified) = self
+                    .store
+                    .get_manifest(&object_id)?
+                    .map(|m| (m.total_size, m.created_at))
+                    .unwrap_or((0, 0));
+
+                result.push(ObjectInfo {
+                    key,
+                    size,
+                    last_modified,
+                    etag: object_id.to_string(),
+                    object_id,
+                });
             }
         }
 

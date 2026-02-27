@@ -1,12 +1,12 @@
 //! [`MetaStore`] implementation with Fjall (disk) and in-memory backends.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::RwLock;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
-use shoal_types::{Manifest, Member, NodeId, ObjectId, ShardId};
+use shoal_types::{BucketInfo, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId};
 use tracing::debug;
 
 use crate::MetaError;
@@ -47,8 +47,8 @@ struct MemoryBackend {
     peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// access_key_id (String) → secret_access_key (String).
     api_keys: RwLock<HashMap<String, String>>,
-    /// Explicitly created bucket names.
-    buckets: RwLock<HashSet<String>>,
+    /// Explicitly created bucket names → creation timestamp (unix secs).
+    buckets: RwLock<HashMap<String, u64>>,
     /// `bucket/key` → serialized BTreeMap<String, String> (tags).
     tags: RwLock<HashMap<String, Vec<u8>>>,
 }
@@ -90,7 +90,7 @@ impl MetaStore {
                 repair_queue: RwLock::new(BTreeMap::new()),
                 peers: RwLock::new(HashMap::new()),
                 api_keys: RwLock::new(HashMap::new()),
-                buckets: RwLock::new(HashSet::new()),
+                buckets: RwLock::new(HashMap::new()),
                 tags: RwLock::new(HashMap::new()),
             })),
         }
@@ -162,18 +162,14 @@ impl MetaStore {
     pub fn put_object_key(&self, bucket: &str, key: &str, id: &ObjectId) -> Result<()> {
         let storage_key = object_storage_key(bucket, key);
         match &self.backend {
-            Backend::Fjall {
-                objects, buckets, ..
-            } => {
+            Backend::Fjall { objects, .. } => {
                 objects.insert(storage_key.as_bytes(), id.as_bytes())?;
-                buckets.insert(bucket.as_bytes(), b"")?;
             }
             Backend::Memory(m) => {
                 m.objects
                     .write()
                     .unwrap()
                     .insert(storage_key, *id.as_bytes());
-                m.buckets.write().unwrap().insert(bucket.to_string());
             }
         }
         debug!(bucket, key, object_id = %id, "stored object key mapping");
@@ -207,8 +203,8 @@ impl MetaStore {
 
     /// List all object keys in a bucket that start with the given prefix.
     ///
-    /// Returns keys without the bucket prefix (i.e. just the key portion).
-    pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    /// Returns [`ObjectInfo`] with size, last_modified, etag resolved from manifests.
+    pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let scan_prefix = if prefix.is_empty() {
             format!("{bucket}/")
         } else {
@@ -216,35 +212,69 @@ impl MetaStore {
         };
         let bucket_prefix = format!("{bucket}/");
 
-        match &self.backend {
+        // Phase 1: collect (key, ObjectId) pairs.
+        let pairs: Vec<(String, ObjectId)> = match &self.backend {
             Backend::Fjall { objects, .. } => {
-                let mut keys = Vec::new();
+                let mut out = Vec::new();
+
                 for guard in objects.prefix(scan_prefix.as_bytes()) {
-                    let k = guard.key()?;
+                    let (k, v) = guard.into_inner()?;
                     let full_key = std::str::from_utf8(&k).map_err(|e| {
                         MetaError::CorruptData(format!("object key is not valid UTF-8: {e}"))
                     })?;
+
                     if let Some(stripped) = full_key.strip_prefix(&bucket_prefix) {
-                        keys.push(stripped.to_string());
+                        let arr: [u8; 32] = v[..32].try_into().map_err(|_| {
+                            MetaError::CorruptData(format!(
+                                "ObjectId expected 32 bytes, got {}",
+                                v.len()
+                            ))
+                        })?;
+                        out.push((stripped.to_string(), ObjectId::from(arr)));
                     }
                 }
-                Ok(keys)
+
+                out
             }
             Backend::Memory(m) => {
                 let map = m.objects.read().unwrap();
-                let mut keys = Vec::new();
-                for full_key in map.range(scan_prefix.clone()..) {
-                    let k = full_key.0.as_str();
+                let mut out = Vec::new();
+
+                for (full_key, arr) in map.range(scan_prefix.clone()..) {
+                    let k = full_key.as_str();
+
                     if !k.starts_with(&scan_prefix) {
                         break;
                     }
+
                     if let Some(stripped) = k.strip_prefix(&bucket_prefix) {
-                        keys.push(stripped.to_string());
+                        out.push((stripped.to_string(), ObjectId::from(*arr)));
                     }
                 }
-                Ok(keys)
+
+                out
             }
+        };
+
+        // Phase 2: resolve manifests for metadata.
+        let mut result = Vec::with_capacity(pairs.len());
+
+        for (key, object_id) in pairs {
+            let (size, last_modified) = self
+                .get_manifest(&object_id)?
+                .map(|m| (m.total_size, m.created_at))
+                .unwrap_or((0, 0));
+
+            result.push(ObjectInfo {
+                key,
+                size,
+                last_modified,
+                etag: object_id.to_string(),
+                object_id,
+            });
         }
+
+        Ok(result)
     }
 
     /// Delete an object key mapping.
@@ -303,14 +333,26 @@ impl MetaStore {
 
     // ----- Buckets -----
 
-    /// Register a bucket name. Idempotent.
+    /// Register a bucket name with a creation timestamp. Idempotent.
     pub fn create_bucket(&self, name: &str) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
         match &self.backend {
             Backend::Fjall { buckets, .. } => {
-                buckets.insert(name.as_bytes(), b"")?;
+                // Don't overwrite existing timestamp (idempotent).
+                if buckets.get(name.as_bytes())?.is_none() {
+                    buckets.insert(name.as_bytes(), &now.to_le_bytes())?;
+                }
             }
             Backend::Memory(m) => {
-                m.buckets.write().unwrap().insert(name.to_string());
+                m.buckets
+                    .write()
+                    .unwrap()
+                    .entry(name.to_string())
+                    .or_insert(now);
             }
         }
         debug!(bucket = name, "registered bucket");
@@ -325,68 +367,52 @@ impl MetaStore {
                 buckets.remove(name.as_bytes())?;
                 Ok(existed)
             }
-            Backend::Memory(m) => Ok(m.buckets.write().unwrap().remove(name)),
+            Backend::Memory(m) => Ok(m.buckets.write().unwrap().remove(name).is_some()),
         }
     }
 
-    /// Check if a bucket exists (explicitly created or has objects).
+    /// Check if a bucket exists.
     pub fn bucket_exists(&self, name: &str) -> Result<bool> {
-        // Check explicit bucket set first.
-        let in_set = match &self.backend {
-            Backend::Fjall { buckets, .. } => buckets.get(name.as_bytes())?.is_some(),
-            Backend::Memory(m) => m.buckets.read().unwrap().contains(name),
-        };
-
-        if in_set {
-            return Ok(true);
+        match &self.backend {
+            Backend::Fjall { buckets, .. } => Ok(buckets.get(name.as_bytes())?.is_some()),
+            Backend::Memory(m) => Ok(m.buckets.read().unwrap().contains_key(name)),
         }
-
-        // Fall back: bucket exists implicitly if it has any objects.
-        let keys = self.list_objects(name, "")?;
-        Ok(!keys.is_empty())
     }
 
-    /// List all known bucket names (union of explicit set and implicit from keys).
-    pub fn list_buckets(&self) -> Result<BTreeSet<String>> {
-        let mut names = BTreeSet::new();
+    /// List all known buckets with creation timestamps.
+    pub fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
+        let mut names: BTreeMap<String, u64> = BTreeMap::new();
 
-        // Explicit buckets.
         match &self.backend {
             Backend::Fjall { buckets, .. } => {
                 for guard in buckets.iter() {
-                    let k = guard.key()?;
+                    let (k, v) = guard.into_inner()?;
+
                     if let Ok(name) = std::str::from_utf8(&k) {
-                        names.insert(name.to_string());
+                        let ts = if v.len() == 8 {
+                            u64::from_le_bytes(v[..8].try_into().unwrap())
+                        } else {
+                            0 // legacy entries without timestamp
+                        };
+                        names.insert(name.to_string(), ts);
                     }
                 }
             }
             Backend::Memory(m) => {
-                names.extend(m.buckets.read().unwrap().iter().cloned());
+                names.extend(
+                    m.buckets
+                        .read()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), *v)),
+                );
             }
         }
 
-        // Implicit buckets from object keys.
-        match &self.backend {
-            Backend::Fjall { objects, .. } => {
-                for guard in objects.iter() {
-                    let k = guard.key()?;
-                    if let Ok(full_key) = std::str::from_utf8(&k) {
-                        if let Some((bucket, _)) = full_key.split_once('/') {
-                            names.insert(bucket.to_string());
-                        }
-                    }
-                }
-            }
-            Backend::Memory(m) => {
-                for full_key in m.objects.read().unwrap().keys() {
-                    if let Some((bucket, _)) = full_key.split_once('/') {
-                        names.insert(bucket.to_string());
-                    }
-                }
-            }
-        }
-
-        Ok(names)
+        Ok(names
+            .into_iter()
+            .map(|(name, created_at)| BucketInfo { name, created_at })
+            .collect())
     }
 
     // ----- Shard map (local cache) -----
@@ -906,7 +932,12 @@ mod tests {
             store.put_object_key("bucket", "b.txt", &id2).unwrap();
             store.put_object_key("bucket", "c.txt", &id3).unwrap();
 
-            let mut keys = store.list_objects("bucket", "").unwrap();
+            let mut keys: Vec<String> = store
+                .list_objects("bucket", "")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             keys.sort();
             assert_eq!(keys, vec!["a.txt", "b.txt", "c.txt"]);
         });
@@ -927,11 +958,21 @@ mod tests {
                 .unwrap();
             store.put_object_key("bucket", "docs/c.pdf", &id3).unwrap();
 
-            let mut keys = store.list_objects("bucket", "photos/").unwrap();
+            let mut keys: Vec<String> = store
+                .list_objects("bucket", "photos/")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             keys.sort();
             assert_eq!(keys, vec!["photos/a.jpg", "photos/b.jpg"]);
 
-            let docs = store.list_objects("bucket", "docs/").unwrap();
+            let docs: Vec<String> = store
+                .list_objects("bucket", "docs/")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             assert_eq!(docs, vec!["docs/c.pdf"]);
         });
     }
@@ -951,10 +992,20 @@ mod tests {
             store.put_object_key("bucket1", "file.txt", &id).unwrap();
             store.put_object_key("bucket2", "file.txt", &id).unwrap();
 
-            let keys1 = store.list_objects("bucket1", "").unwrap();
+            let keys1: Vec<String> = store
+                .list_objects("bucket1", "")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             assert_eq!(keys1, vec!["file.txt"]);
 
-            let keys2 = store.list_objects("bucket2", "").unwrap();
+            let keys2: Vec<String> = store
+                .list_objects("bucket2", "")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             assert_eq!(keys2, vec!["file.txt"]);
         });
     }
@@ -1411,7 +1462,12 @@ mod tests {
             store.put_object_key("b", "a/x", &id).unwrap();
             store.put_object_key("b", "a/y", &id).unwrap();
 
-            let result = store.list_objects("b", "a/").unwrap();
+            let result: Vec<String> = store
+                .list_objects("b", "a/")
+                .unwrap()
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
             assert_eq!(result.len(), 2);
             assert!(result.contains(&"a/x".to_string()));
             assert!(result.contains(&"a/y".to_string()));

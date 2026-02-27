@@ -1561,7 +1561,14 @@ async fn test_new_node_lists_objects_after_manifest_sync() {
     // Explicit sync pulls manifests from peers.
     c.node(2).sync_manifests_from_peers().await.unwrap();
 
-    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
+    let mut keys_after: Vec<String> = c
+        .node(2)
+        .list_objects("b", "")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
     keys_after.sort();
     assert_eq!(
         keys_after,
@@ -1756,7 +1763,7 @@ async fn test_logtree_get_reads_from_materialized_state() {
 
     let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert_eq!(keys.len(), 1);
-    assert_eq!(keys[0], "k");
+    assert_eq!(keys[0].key, "k");
 }
 
 /// With LogTree: sync_log_from_peers recovers missed entries.
@@ -1856,7 +1863,14 @@ async fn test_logtree_sync_from_peers() {
     );
 
     // Node 2 should now see both objects.
-    let mut keys_after = c.node(2).list_objects("b", "").await.unwrap();
+    let mut keys_after: Vec<String> = c
+        .node(2)
+        .list_objects("b", "")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
     keys_after.sort();
     assert_eq!(keys_after, vec!["key1.txt", "key2.txt"]);
 
@@ -2186,7 +2200,7 @@ async fn test_bug4_cross_node_visibility_without_manual_broadcast() {
     for i in 1..4 {
         let keys = c.node(i).list_objects("b", "").await.unwrap();
         assert!(
-            keys.contains(&"cross-node-test".to_string()),
+            keys.iter().any(|o| o.key == "cross-node-test"),
             "BUG 4: node {i} list_objects doesn't include the key"
         );
     }
@@ -2409,7 +2423,7 @@ async fn test_chaos_partition_then_heal() {
     // Node 2 should NOT see the "during" object (missed the broadcast).
     let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert!(
-        !keys.contains(&"during".to_string()),
+        !keys.iter().any(|o| o.key == "during"),
         "node 2 should not see 'during' while partitioned"
     );
 
@@ -2435,10 +2449,9 @@ async fn test_chaos_partition_then_heal() {
     assert!(synced >= 1, "sync should find the 'during' manifest");
 
     // Node 2 can now list both objects.
-    let mut keys = c.node(2).list_objects("b", "").await.unwrap();
-    keys.sort();
+    let keys = c.node(2).list_objects("b", "").await.unwrap();
     assert!(
-        keys.contains(&"during".to_string()),
+        keys.iter().any(|o| o.key == "during"),
         "node 2 should see 'during' after sync"
     );
 

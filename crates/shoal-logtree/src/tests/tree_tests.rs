@@ -201,7 +201,12 @@ fn test_list_keys_filters_deleted() {
     tree.append_put("b", "dead", oid, &manifest).unwrap();
     tree.append_delete("b", "dead").unwrap();
 
-    let keys = tree.list_keys("b", "").unwrap();
+    let keys: Vec<String> = tree
+        .list_keys("b", "")
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
     assert_eq!(keys, vec!["alive"]);
 }
 

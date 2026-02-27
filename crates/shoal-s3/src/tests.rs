@@ -1187,7 +1187,6 @@ async fn test_error_response_is_xml() {
     );
 
     let body = body_string(response).await;
-    assert!(body.contains("<?xml version=\"1.0\""));
     assert!(body.contains("<Error>"));
     assert!(body.contains("<Code>NoSuchKey</Code>"));
     assert!(body.contains("<Message>"));

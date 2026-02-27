@@ -287,10 +287,8 @@ impl RepairExecutor {
         // For now, we rely on the caller to have stored manifests and use a
         // linear scan approach through the objects keyspace.
         let objects = self.meta.list_objects("__all__", "")?;
-        for key in &objects {
-            if let Ok(Some(object_id)) = self.meta.get_object_key("__all__", key)
-                && let Ok(Some(manifest)) = self.meta.get_manifest(&object_id)
-            {
+        for obj in &objects {
+            if let Ok(Some(manifest)) = self.meta.get_manifest(&obj.object_id) {
                 for (ci, chunk) in manifest.chunks.iter().enumerate() {
                     for shard_meta in &chunk.shards {
                         if shard_meta.shard_id == shard_id {

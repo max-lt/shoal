@@ -4,11 +4,11 @@
 //! instead of the concrete [`ShoalNode`](crate::ShoalNode) struct, making
 //! them interchangeable.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use shoal_meta::MetaStore;
-use shoal_types::{Manifest, ObjectId};
+use shoal_types::{BucketInfo, Manifest, ObjectId, ObjectInfo};
 
 use crate::error::EngineError;
 
@@ -45,7 +45,11 @@ pub trait ShoalEngine: Send + Sync {
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError>;
 
     /// List objects in a bucket with an optional prefix filter.
-    async fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<String>, EngineError>;
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> Result<Vec<ObjectInfo>, EngineError>;
 
     /// Create an API key, persist it, and replicate via LogTree+gossip.
     async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError>;
@@ -73,8 +77,8 @@ pub trait ShoalEngine: Send + Sync {
     /// Delete a bucket. Fails if the bucket contains objects.
     async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError>;
 
-    /// List all known bucket names.
-    async fn list_buckets(&self) -> Result<BTreeSet<String>, EngineError>;
+    /// List all known buckets with metadata.
+    async fn list_buckets(&self) -> Result<Vec<BucketInfo>, EngineError>;
 
     /// Check if a bucket exists.
     async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError>;

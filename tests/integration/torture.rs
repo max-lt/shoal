@@ -686,7 +686,14 @@ async fn test_delete_then_list_consistency() {
     }
 
     // List should return exactly the kept keys.
-    let mut listed = c.node(0).list_objects("dl", "").await.unwrap();
+    let mut listed: Vec<String> = c
+        .node(0)
+        .list_objects("dl", "")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
     listed.sort();
     kept.sort();
     assert_eq!(listed, kept, "list after delete should match kept keys");

@@ -191,6 +191,13 @@ fn generate_upload_id() -> String {
     format!("{hash}")
 }
 
+/// Parse `key=value&key=value` URL-encoded tag string (from `x-amz-tagging` header).
+fn parse_url_tags(s: &str) -> BTreeMap<String, String> {
+    form_urlencoded::parse(s.as_bytes())
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
 /// Convert an `EngineError` to an `S3Error`, mapping `ObjectNotFound` to `NoSuchKey`.
 fn engine_to_s3(e: shoal_engine::EngineError, bucket: &str, key: &str) -> S3Error {
     match e {
@@ -211,8 +218,7 @@ pub(crate) async fn list_buckets_handler(
     State(state): State<AppState>,
 ) -> Result<axum::response::Response, S3Error> {
     let buckets = state.engine.list_buckets().await?;
-    let names: Vec<String> = buckets.into_iter().collect();
-    let body = xml::list_all_my_buckets("shoal", &names);
+    let body = xml::list_all_my_buckets("shoal", &buckets);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -225,11 +231,27 @@ pub(crate) async fn list_buckets_handler(
 // PUT /{bucket} — CreateBucket
 // -----------------------------------------------------------------------
 
-/// Create a bucket. Registers the bucket name in MetaStore.
+/// Create a bucket (or handle unsupported PUT sub-resources like `?policy`).
 pub(crate) async fn create_bucket(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // PUT /{bucket}?versioning → reject (we don't support enabling versioning)
+    if params.contains_key("versioning") {
+        return Err(S3Error::NotImplemented {
+            message: "bucket versioning is not supported".to_string(),
+        });
+    }
+
+    for &op in UNSUPPORTED_BUCKET_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("bucket operation '{op}' is not supported"),
+            });
+        }
+    }
+
     state.engine.create_bucket(&bucket).await?;
     info!(bucket = %bucket, "create_bucket");
     Ok(Response::builder()
@@ -242,11 +264,20 @@ pub(crate) async fn create_bucket(
 // DELETE /{bucket} — DeleteBucket
 // -----------------------------------------------------------------------
 
-/// Delete a bucket. The bucket must be empty.
+/// Delete a bucket (or handle unsupported DELETE sub-resources like `?policy`).
 pub(crate) async fn delete_bucket_handler(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
+    Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    for &op in UNSUPPORTED_BUCKET_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("bucket operation '{op}' is not supported"),
+            });
+        }
+    }
+
     state.engine.delete_bucket(&bucket).await?;
     info!(bucket = %bucket, "delete_bucket");
     Ok(Response::builder()
@@ -280,12 +311,53 @@ pub(crate) async fn head_bucket_handler(
 // GET /{bucket}?list-type=2&prefix=... — ListObjectsV2
 // -----------------------------------------------------------------------
 
+/// Bucket-level sub-resources that we don't implement.
+const UNSUPPORTED_BUCKET_OPS: &[&str] = &[
+    "policy",
+    "lifecycle",
+    "cors",
+    "encryption",
+    "replication",
+    "tagging",
+    "accelerate",
+    "logging",
+    "metrics",
+    "analytics",
+    "inventory",
+    "notification",
+    "publicAccessBlock",
+    "object-lock",
+    "intelligent-tiering",
+    "website",
+    "requestPayment",
+    "acl",
+];
+
 /// Dispatch GET on a bucket: ListMultipartUploads or ListObjectsV2.
 pub(crate) async fn list_objects(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // Reject unsupported bucket sub-resources early.
+    for &op in UNSUPPORTED_BUCKET_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("bucket operation '{op}' is not supported"),
+            });
+        }
+    }
+
+    // GET /{bucket}?versioning → GetBucketVersioning (always "not configured")
+    if params.contains_key("versioning") {
+        let body = xml::versioning_configuration();
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/xml")
+            .body(Body::from(body))
+            .unwrap());
+    }
+
     // GET /{bucket}?uploads → ListMultipartUploads
     if params.contains_key("uploads") {
         return list_multipart_uploads(&state, &bucket).await;
@@ -298,10 +370,15 @@ pub(crate) async fn list_objects(
         .unwrap_or(1000);
     tracing::debug!(bucket = %bucket, prefix, max_keys, "list_objects");
 
-    let keys = state.engine.list_objects(&bucket, prefix).await?;
-    let truncated = keys.len() > max_keys;
-    let returned_keys = if truncated { &keys[..max_keys] } else { &keys };
-    let body = xml::list_objects_v2(&bucket, prefix, returned_keys, max_keys, truncated);
+    let objects = state.engine.list_objects(&bucket, prefix).await?;
+    let truncated = objects.len() > max_keys;
+    let returned = if truncated {
+        &objects[..max_keys]
+    } else {
+        &objects
+    };
+
+    let body = xml::list_objects_v2(&bucket, prefix, returned, max_keys, truncated);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -363,6 +440,13 @@ pub(crate) async fn put_object_handler(
         return copy_object(&state, source, &bucket, &key).await;
     }
 
+    // Bucket must exist (standard S3 behavior).
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
+    }
+
     // Regular PutObject.
     let mut metadata = BTreeMap::new();
 
@@ -384,10 +468,21 @@ pub(crate) async fn put_object_handler(
         }
     }
 
+    // Parse x-amz-tagging header (key=value&key=value format).
+    let inline_tags = headers
+        .get("x-amz-tagging")
+        .and_then(|v| v.to_str().ok())
+        .map(parse_url_tags);
+
     let object_id = state
         .engine
         .put_object(&bucket, &key, &body, metadata)
         .await?;
+
+    // Store inline tags if present.
+    if let Some(tags) = inline_tags {
+        let _ = state.engine.put_object_tags(&bucket, &key, tags).await;
+    }
     let etag = format!("\"{object_id}\"");
 
     let span = tracing::Span::current();
@@ -559,6 +654,11 @@ pub(crate) async fn delete_object_handler(
         return delete_object_tagging(&state, &bucket, &key).await;
     }
 
+    // DELETE /{bucket}/{key}?uploadId=... → AbortMultipartUpload
+    if let Some(upload_id) = params.get("uploadId") {
+        return abort_multipart_upload(&state, &bucket, &key, upload_id).await;
+    }
+
     match state.engine.delete_object(&bucket, &key).await {
         Ok(()) => {
             info!(bucket = %bucket, key = %key, "delete_object");
@@ -612,6 +712,12 @@ async fn put_object_tagging(
     let body_str = String::from_utf8_lossy(body);
     let tags = xml::parse_tagging_request(&body_str);
 
+    if tags.len() > 10 {
+        return Err(S3Error::BadRequest {
+            message: format!("Object tags cannot exceed 10, got {}", tags.len()),
+        });
+    }
+
     state
         .engine
         .put_object_tags(bucket, key, tags)
@@ -638,6 +744,38 @@ async fn delete_object_tagging(
         .delete_object_tags(bucket, key)
         .await
         .map_err(|e| engine_to_s3(e, bucket, key))?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// DELETE /{bucket}/{*key}?uploadId=... — AbortMultipartUpload
+// -----------------------------------------------------------------------
+
+async fn abort_multipart_upload(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<axum::response::Response, S3Error> {
+    let mut uploads = state.uploads.write().await;
+    let removed = uploads.remove(upload_id);
+
+    if let Some(upload) = removed {
+        if upload.bucket != bucket || upload.key != key {
+            // Put it back — wrong bucket/key.
+            uploads.insert(upload_id.to_string(), upload);
+            return Err(S3Error::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+    }
+    // S3 spec: aborting a non-existent upload returns 204.
+
+    info!(bucket, key, upload_id, "abort_multipart_upload");
 
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -778,6 +916,12 @@ async fn initiate_multipart(
         }
     }
 
+    // Capture x-amz-tagging header for the completed object.
+    let tags = headers
+        .get("x-amz-tagging")
+        .and_then(|v| v.to_str().ok())
+        .map(parse_url_tags);
+
     {
         let mut uploads = state.uploads.write().await;
         uploads.insert(
@@ -787,6 +931,7 @@ async fn initiate_multipart(
                 key: key.to_string(),
                 parts: BTreeMap::new(),
                 metadata,
+                tags,
             },
         );
     }
@@ -852,6 +997,12 @@ async fn complete_multipart(
         .engine
         .put_object(bucket, key, &assembled, upload.metadata)
         .await?;
+
+    // Apply tags captured at initiation.
+    if let Some(tags) = upload.tags {
+        let _ = state.engine.put_object_tags(bucket, key, tags).await;
+    }
+
     let etag = format!("{object_id}");
 
     info!(

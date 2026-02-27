@@ -4,8 +4,6 @@ use axum::body::Body;
 use axum::http::{Response, StatusCode};
 use axum::response::IntoResponse;
 
-use crate::xml;
-
 /// Errors returned by S3 API handlers.
 #[derive(Debug, thiserror::Error)]
 pub enum S3Error {
@@ -67,6 +65,20 @@ pub enum S3Error {
         /// Description of the internal failure.
         message: String,
     },
+
+    /// The requested operation is not implemented.
+    #[error("not implemented: {message}")]
+    NotImplemented {
+        /// Description of the unimplemented operation.
+        message: String,
+    },
+
+    /// Bad request (e.g. exceeded tag limit).
+    #[error("bad request: {message}")]
+    BadRequest {
+        /// Description of the validation error.
+        message: String,
+    },
 }
 
 impl S3Error {
@@ -87,6 +99,8 @@ impl S3Error {
             },
             Self::AccessDenied => StatusCode::FORBIDDEN,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
+            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -107,6 +121,8 @@ impl S3Error {
             },
             Self::AccessDenied => "AccessDenied",
             Self::Internal { .. } => "InternalError",
+            Self::NotImplemented { .. } => "NotImplemented",
+            Self::BadRequest { .. } => "BadRequest",
         }
     }
 }
@@ -116,7 +132,12 @@ impl IntoResponse for S3Error {
         let status = self.status_code();
         let code = self.s3_code();
         let message = self.to_string();
-        let body = xml::error_xml(code, &message);
+
+        let body = quick_xml::se::to_string(&crate::xml::S3ErrorXml {
+            code,
+            message: &message,
+        })
+        .expect("S3ErrorXml contains only safe ASCII strings");
 
         Response::builder()
             .status(status)
