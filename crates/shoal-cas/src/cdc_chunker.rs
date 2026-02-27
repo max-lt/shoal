@@ -13,20 +13,27 @@ use shoal_types::ChunkId;
 
 use crate::chunker::Chunk;
 
-/// CDC minimum chunk size (16 KB).
+/// Default CDC minimum chunk size (16 KB).
 pub const CDC_MIN_SIZE: u32 = 16_384;
 
-/// CDC average chunk size (64 KB).
+/// Default CDC average chunk size (64 KB).
 pub const CDC_AVG_SIZE: u32 = 65_536;
 
-/// CDC maximum chunk size (256 KB).
+/// Default CDC maximum chunk size (256 KB).
 pub const CDC_MAX_SIZE: u32 = 262_144;
 
 /// Content-defined chunker using the FastCDC algorithm.
 ///
 /// Chunk boundaries are determined by a rolling hash over the data content,
-/// producing chunks between [`CDC_MIN_SIZE`] and [`CDC_MAX_SIZE`] bytes
-/// with an average of [`CDC_AVG_SIZE`].
+/// producing chunks between `min_size` and `max_size` bytes
+/// with an average of `avg_size`.
+///
+/// Parameters are derived from `chunk_size` using a fixed 1:4:16 ratio:
+/// - `min_size` = `chunk_size / 16`
+/// - `avg_size` = `chunk_size / 4`
+/// - `max_size` = `chunk_size`
+///
+/// The minimum valid `chunk_size` is 1024 (FastCDC constraint).
 pub struct CdcChunker {
     min_size: u32,
     avg_size: u32,
@@ -34,12 +41,29 @@ pub struct CdcChunker {
 }
 
 impl CdcChunker {
-    /// Create a new CDC chunker with the standard parameters.
+    /// Create a new CDC chunker with the default parameters (256 KB max).
     pub fn new() -> Self {
+        Self::from_chunk_size(CDC_MAX_SIZE)
+    }
+
+    /// Create a CDC chunker derived from the configured chunk size.
+    ///
+    /// The chunk size maps to `max_size`; `avg_size` and `min_size` are
+    /// derived as `chunk_size / 4` and `chunk_size / 16` respectively.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `chunk_size < 1024` (FastCDC minimum).
+    pub fn from_chunk_size(chunk_size: u32) -> Self {
+        assert!(
+            chunk_size >= 1024,
+            "chunk_size must be >= 1024 (got {chunk_size})"
+        );
+
         Self {
-            min_size: CDC_MIN_SIZE,
-            avg_size: CDC_AVG_SIZE,
-            max_size: CDC_MAX_SIZE,
+            min_size: chunk_size / 16,
+            avg_size: chunk_size / 4,
+            max_size: chunk_size,
         }
     }
 

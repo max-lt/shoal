@@ -150,7 +150,7 @@ impl ShoalNode {
             store,
             meta,
             cluster,
-            cdc_chunker: CdcChunker::new(),
+            cdc_chunker: CdcChunker::from_chunk_size(config.chunk_size),
             encoder: ErasureEncoder::new(config.erasure_k, config.erasure_m),
             erasure_k: config.erasure_k,
             erasure_m: config.erasure_m,

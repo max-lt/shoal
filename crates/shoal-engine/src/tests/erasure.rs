@@ -13,8 +13,8 @@ use super::helpers::{single_node, test_data};
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_erasure_k4_m2() {
-    let node = single_node(512, 4, 2).await;
-    let data = test_data(3000);
+    let node = single_node(1024, 4, 2).await;
+    let data = test_data(50); // below CDC min (64) → 1 chunk
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await
@@ -22,7 +22,7 @@ async fn test_erasure_k4_m2() {
 
     let (got, manifest) = node.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
-    // With CDC, 3000 bytes (< 16KB min) → 1 chunk, each with 6 shards (k=4+m=2).
+    // Below CDC min → 1 chunk, with 6 shards (k=4+m=2).
     assert_eq!(manifest.chunks.len(), 1);
     assert_eq!(manifest.chunks[0].shards.len(), 6);
 }
@@ -208,10 +208,9 @@ async fn test_identical_data_same_shard_ids() {
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_different_erasure_configs_different_manifests() {
-    // With CDC, chunk_size param doesn't affect chunking (fixed CDC params).
     // Different erasure configs (k, m) produce different shard layouts → different manifests.
-    let node_a = single_node(512, 2, 1).await;
-    let node_b = single_node(512, 4, 2).await;
+    let node_a = single_node(1024, 2, 1).await;
+    let node_b = single_node(1024, 4, 2).await;
     let data = test_data(2000);
 
     let oid_a = node_a

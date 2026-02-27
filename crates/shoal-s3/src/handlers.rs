@@ -184,6 +184,19 @@ pub(crate) async fn delete_api_key(
         .unwrap())
 }
 
+// -----------------------------------------------------------------------
+// POST /admin/buckets/{name} — CreateBucket (admin, no auth)
+// -----------------------------------------------------------------------
+
+pub(crate) async fn admin_create_bucket(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, S3Error> {
+    state.engine.create_bucket(&name).await?;
+    info!(bucket = %name, "admin_create_bucket");
+    Ok(StatusCode::OK)
+}
+
 /// Generate a unique multipart upload ID using an atomic counter + blake3.
 fn generate_upload_id() -> String {
     let count = UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);

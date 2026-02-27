@@ -1101,7 +1101,7 @@ async fn test_3_node_one_byte_under_chunk() {
 #[ntest::timeout(30000)]
 async fn test_3_node_small_object_single_chunk() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
-    let data = test_data(1025);
+    let data = test_data(50); // below CDC min (64) → single chunk
 
     c.node(2)
         .put_object("b", "small", &data, BTreeMap::new())
@@ -1110,7 +1110,6 @@ async fn test_3_node_small_object_single_chunk() {
     c.broadcast_manifest(2, "b", "small").await;
 
     let manifest = c.node(2).head_object("b", "small").await.unwrap();
-    // 1025 bytes < CDC min (16KB) → single chunk.
     assert_eq!(manifest.chunks.len(), 1, "small data should be 1 CDC chunk");
 
     for i in 0..3 {
@@ -1422,7 +1421,7 @@ async fn test_pulled_shards_cached_locally() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_2_node_k1_m1() {
-    let c = TestCluster::new(2, 512, 1, 1).await;
+    let c = TestCluster::new(2, 1024, 1, 1).await;
     let data = test_data(3000);
 
     c.node(0)
@@ -1440,7 +1439,7 @@ async fn test_2_node_k1_m1() {
 #[tokio::test]
 #[ntest::timeout(30000)]
 async fn test_2_node_kill_one() {
-    let c = TestCluster::with_replication(2, 512, 1, 1, 2).await;
+    let c = TestCluster::with_replication(2, 1024, 1, 1, 2).await;
     let data = test_data(3000);
 
     c.node(0)
@@ -1886,8 +1885,8 @@ async fn test_logtree_sync_from_peers() {
 #[ntest::timeout(30000)]
 async fn test_logtree_overwrite_after_sync() {
     let c = TestCluster::new(3, 1024, 2, 1).await;
-    let v1 = test_data(2000);
-    let v2 = test_data(3000);
+    let v1 = test_data(50); // below CDC min → single chunk
+    let v2 = test_data(60);
 
     // Node 0 writes v1, all nodes get it.
     c.node(0)
@@ -2250,9 +2249,10 @@ async fn test_chaos_large_object_read_with_latency() {
         ..Default::default()
     };
 
-    let c = TestCluster::with_chaos(4, 4096, 2, 2, chaos).await;
+    let c = TestCluster::with_chaos(4, 262_144, 2, 2, chaos).await;
 
     // 1 MB object — enough chunks to exercise the pipeline under latency.
+    // chunk_size=256KB → CDC avg=64KB → ~16 chunks for 1MB.
     let data = test_data(1_048_576);
 
     c.node(0)
@@ -3118,11 +3118,13 @@ async fn test_chaos_all_faults_combined() {
     let controller = c.chaos_controller.as_ref().unwrap();
 
     // Phase 1: write 10 objects normally.
+    // Use small data (< CDC min of 64 bytes) so each object is a single chunk,
+    // keeping the chaos test focused on fault tolerance, not chunk count.
     let mut objects: Vec<(String, Vec<u8>, usize)> = Vec::new();
     for i in 0..10 {
         let writer = i % 7;
         let key = format!("chaos-all-{i}");
-        let data = test_data(1000 + i * 100);
+        let data = test_data(30 + i);
         c.node(writer)
             .put_object("b", &key, &data, BTreeMap::new())
             .await
@@ -3142,7 +3144,7 @@ async fn test_chaos_all_faults_combined() {
     for i in 10..20 {
         let writer = i % 5; // only nodes 0-4 as writers
         let key = format!("chaos-all-{i}");
-        let data = test_data(1000 + i * 100);
+        let data = test_data(30 + i);
         c.node(writer)
             .put_object("b", &key, &data, BTreeMap::new())
             .await
@@ -3160,7 +3162,7 @@ async fn test_chaos_all_faults_combined() {
     for i in 20..30 {
         let writer = i % 6; // nodes 0-5, node 6 still dead
         let key = format!("chaos-all-{i}");
-        let data = test_data(1000 + i * 100);
+        let data = test_data(30 + i);
         c.node(writer)
             .put_object("b", &key, &data, BTreeMap::new())
             .await

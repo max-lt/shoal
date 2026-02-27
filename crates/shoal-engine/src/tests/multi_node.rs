@@ -36,7 +36,7 @@ async fn test_three_node_put_get_same_node() {
 #[ntest::timeout(10000)]
 async fn test_three_node_lose_one_shard_per_chunk() {
     // k=2, m=1 across 3 nodes. Lose 1 shard per chunk -> still reads.
-    let nodes = three_node_cluster(512, 2, 1).await;
+    let nodes = three_node_cluster(1024, 2, 1).await;
     let data = test_data(2000);
 
     nodes[0]

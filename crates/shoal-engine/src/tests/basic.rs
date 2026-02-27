@@ -257,18 +257,15 @@ async fn test_head_nonexistent() {
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_head_object_chunk_count() {
-    let node = single_node(256, 2, 1).await;
+    let node = single_node(1024, 2, 1).await;
 
-    // With CDC (min=16KB, avg=64KB, max=256KB), small data produces 1 chunk,
-    // empty data produces 0 chunks.
+    // With chunk_size=1024, CDC params are min=64, avg=256, max=1024.
     // (size, min_chunks, max_chunks)
     let cases: &[(usize, usize, usize)] = &[
-        (0, 0, 0),                // empty → 0 chunks
-        (1, 1, 1),                // tiny → 1 chunk
-        (255, 1, 1),              // small → 1 chunk
-        (1024, 1, 1),             // below CDC min → 1 chunk
-        (16_384, 1, 1),           // at CDC min → 1 chunk
-        (300_000, 2, usize::MAX), // above CDC max → multiple chunks
+        (0, 0, 0),             // empty → 0 chunks
+        (1, 1, 1),             // tiny → 1 chunk
+        (50, 1, 1),            // below CDC min (64) → 1 chunk
+        (5000, 2, usize::MAX), // well above max → multiple chunks
     ];
 
     for &(size, min_chunks, max_chunks) in cases {

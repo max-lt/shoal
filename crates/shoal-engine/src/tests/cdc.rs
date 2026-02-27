@@ -114,9 +114,9 @@ async fn test_cdc_large_file_chunk_bounds() {
         "2MB should produce multiple chunks"
     );
 
-    // Verify all chunks (except possibly the last) are >= min_size.
-    let min_size = shoal_cas::CDC_MIN_SIZE;
-    let max_size = shoal_cas::CDC_MAX_SIZE;
+    // chunk_size=1024 → CDC min=64, max=1024.
+    let min_size: u32 = 1024 / 16;
+    let max_size: u32 = 1024;
 
     for (i, chunk) in manifest.chunks.iter().enumerate() {
         if i < manifest.chunks.len() - 1 {

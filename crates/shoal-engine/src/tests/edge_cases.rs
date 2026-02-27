@@ -94,9 +94,9 @@ async fn test_empty_key_name() {
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_data_below_cdc_min() {
-    // Data smaller than CDC min_size → single chunk.
-    let node = single_node(256, 2, 1).await;
-    let data = test_data(1000);
+    // Data smaller than CDC min_size (chunk_size/16 = 64) → single chunk.
+    let node = single_node(1024, 2, 1).await;
+    let data = test_data(50); // < 64 byte min
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await
@@ -104,15 +104,15 @@ async fn test_data_below_cdc_min() {
     let (got, manifest) = node.get_object("b", "k").await.unwrap();
     assert_eq!(got, data);
     assert_eq!(manifest.chunks.len(), 1);
-    assert_eq!(manifest.chunks[0].raw_length, 1000);
+    assert_eq!(manifest.chunks[0].raw_length, 50);
 }
 
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_data_at_cdc_min_boundary() {
-    // Data exactly at CDC min_size → single chunk.
-    let node = single_node(256, 2, 1).await;
-    let data = test_data(16_384); // CDC_MIN_SIZE
+    // Data exactly at CDC min_size (chunk_size/16 = 64) → single chunk.
+    let node = single_node(1024, 2, 1).await;
+    let data = test_data(64);
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await
@@ -126,9 +126,9 @@ async fn test_data_at_cdc_min_boundary() {
 #[tokio::test]
 #[ntest::timeout(10000)]
 async fn test_data_above_cdc_max() {
-    // Data larger than CDC max_size → multiple chunks.
-    let node = single_node(256, 2, 1).await;
-    let data = test_data(300_000); // > 256KB max
+    // Data larger than CDC max_size (chunk_size = 1024) → multiple chunks.
+    let node = single_node(1024, 2, 1).await;
+    let data = test_data(5000); // > 1024 max
 
     node.put_object("b", "k", &data, BTreeMap::new())
         .await

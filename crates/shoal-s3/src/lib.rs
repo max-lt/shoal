@@ -181,7 +181,8 @@ impl S3Server {
             .route(
                 "/admin/keys/{access_key_id}",
                 delete(handlers::delete_api_key),
-            );
+            )
+            .route("/admin/buckets/{name}", post(handlers::admin_create_bucket));
 
         Router::new()
             .merge(s3_routes)

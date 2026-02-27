@@ -160,7 +160,7 @@ async fn test_shard_replication_1_distributes_across_nodes() {
 #[ntest::timeout(10000)]
 async fn test_writer_stores_all_shards_locally_without_transport() {
     let nodes = three_node_cluster(1024, 2, 1).await;
-    let data = test_data(1024);
+    let data = test_data(50); // below CDC min → 1 chunk
 
     // Write from node 0 (no transport -> stores everything locally).
     nodes[0]
@@ -169,6 +169,7 @@ async fn test_writer_stores_all_shards_locally_without_transport() {
         .unwrap();
 
     let manifest = nodes[0].head_object("b", "k").await.unwrap();
+    assert_eq!(manifest.chunks.len(), 1, "small data → 1 chunk");
 
     // Without transport, the writer stores ALL shards (k+m = 3) locally.
     let mut local_count = 0;
