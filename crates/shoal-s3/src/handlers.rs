@@ -373,6 +373,16 @@ pub(crate) async fn head_bucket_handler(
 // GET /{bucket}?list-type=2&prefix=... — ListObjectsV2
 // -----------------------------------------------------------------------
 
+/// Object-level sub-resources that we don't implement.
+const UNSUPPORTED_OBJECT_OPS: &[&str] = &[
+    "acl",
+    "retention",
+    "legal-hold",
+    "torrent",
+    "restore",
+    "select",
+];
+
 /// Bucket-level sub-resources that we don't implement.
 const UNSUPPORTED_BUCKET_OPS: &[&str] = &[
     "policy",
@@ -487,6 +497,15 @@ pub(crate) async fn put_object_handler(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
+    // Reject unsupported object sub-resources early.
+    for &op in UNSUPPORTED_OBJECT_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("object operation '{op}' is not supported"),
+            });
+        }
+    }
+
     // PUT /{bucket}/{key}?tagging → PutObjectTagging
     if params.contains_key("tagging") {
         check_bucket_access(&state, &caller, &bucket).await?;
@@ -665,6 +684,16 @@ pub(crate) async fn get_object_handler(
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
     check_bucket_access(&state, &caller, &bucket).await?;
+
+    // Reject unsupported object sub-resources early.
+    for &op in UNSUPPORTED_OBJECT_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("object operation '{op}' is not supported"),
+            });
+        }
+    }
+
     // GET /{bucket}/{key}?tagging → GetObjectTagging
     if params.contains_key("tagging") {
         return get_object_tagging(&state, &bucket, &key).await;
@@ -724,6 +753,16 @@ pub(crate) async fn delete_object_handler(
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
     check_bucket_access(&state, &caller, &bucket).await?;
+
+    // Reject unsupported object sub-resources early.
+    for &op in UNSUPPORTED_OBJECT_OPS {
+        if params.contains_key(op) {
+            return Err(S3Error::NotImplemented {
+                message: format!("object operation '{op}' is not supported"),
+            });
+        }
+    }
+
     // DELETE /{bucket}/{key}?tagging → DeleteObjectTagging
     if params.contains_key("tagging") {
         return delete_object_tagging(&state, &bucket, &key).await;
