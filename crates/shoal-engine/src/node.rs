@@ -985,12 +985,16 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Create a bucket, replicating via LogTree+gossip.
-    pub async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
-        self.meta.create_bucket(bucket)?;
+    /// Create a bucket with optional owner, replicating via LogTree+gossip.
+    pub async fn create_bucket(
+        &self,
+        bucket: &str,
+        owner: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.meta.create_bucket(bucket, owner)?;
 
         if let Some(log_tree) = &self.log_tree {
-            let entry = log_tree.append_create_bucket(bucket)?;
+            let entry = log_tree.append_create_bucket_v2(bucket, owner)?;
             let entry_bytes = postcard::to_allocvec(&entry).unwrap_or_default();
 
             if let Some(gossip) = &self.gossip {
@@ -1055,6 +1059,11 @@ impl ShoalNode {
     /// Check if a bucket exists.
     pub async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
         Ok(self.meta.bucket_exists(bucket)?)
+    }
+
+    /// Return the owner of a bucket, or `None` for legacy/admin buckets.
+    pub async fn get_bucket_owner(&self, bucket: &str) -> Result<Option<String>, EngineError> {
+        Ok(self.meta.get_bucket_owner(bucket)?)
     }
 
     /// Retrieve object metadata (manifest) without fetching data.
@@ -1152,6 +1161,9 @@ impl ShoalNode {
         peers.shuffle(&mut rand::rng());
 
         let mut total_applied = 0usize;
+        // Track Put entries across all peers so we can pull manifests
+        // that weren't available from the peer that gave us the entry.
+        let mut applied_put_entries: Vec<(String, String, ObjectId)> = Vec::new();
 
         // Sync with ALL peers. Refresh tips between each so that entries
         // received from peer N are known when computing the delta from peer N+1.
@@ -1189,6 +1201,22 @@ impl ShoalNode {
                                     applied,
                                     "applied log entries from peer"
                                 );
+
+                                // Track Put entries for the post-loop manifest pass.
+                                for entry in &entries {
+                                    if let shoal_logtree::Action::Put {
+                                        bucket,
+                                        key,
+                                        manifest_id,
+                                    } = &entry.action
+                                    {
+                                        applied_put_entries.push((
+                                            bucket.clone(),
+                                            key.clone(),
+                                            *manifest_id,
+                                        ));
+                                    }
+                                }
 
                                 // Batch-pull missing manifests from this peer.
                                 let missing_manifest_ids: Vec<ObjectId> = entries
@@ -1314,6 +1342,59 @@ impl ShoalNode {
                 }
                 Err(e) => {
                     debug!(from = %peer.node_id, %e, "failed to pull log entries from peer");
+                }
+            }
+        }
+
+        // Final pass: pull manifests that weren't available from the peer
+        // that provided the log entries (e.g. the entry was broadcast without
+        // the manifest, and the writer peer was synced second with applied=0).
+        if !applied_put_entries.is_empty() {
+            let still_missing: Vec<ObjectId> = applied_put_entries
+                .iter()
+                .filter(|(_, _, mid)| {
+                    log_tree.get_manifest(mid).ok().flatten().is_none()
+                        && self.meta.get_manifest(mid).ok().flatten().is_none()
+                })
+                .map(|(_, _, mid)| *mid)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+
+            if !still_missing.is_empty() {
+                debug!(
+                    count = still_missing.len(),
+                    "pulling still-missing manifests from peers"
+                );
+
+                for peer in &peers {
+                    let Some(addr) = self.resolve_addr(&peer.node_id).await else {
+                        continue;
+                    };
+
+                    match transport.pull_manifests(addr, &still_missing).await {
+                        Ok(manifest_pairs) => {
+                            for (oid, mb) in &manifest_pairs {
+                                if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
+                                    let _ = self.meta.put_manifest(&manifest);
+                                    let _ = log_tree.store().put_manifest(&manifest);
+
+                                    for (bucket, key, mid) in &applied_put_entries {
+                                        if mid == oid {
+                                            let _ = self.meta.put_object_key(
+                                                bucket,
+                                                key,
+                                                &manifest.object_id,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            debug!(from = %peer.node_id, %e, "manifest pull failed in final pass");
+                        }
+                    }
                 }
             }
         }
@@ -1809,8 +1890,8 @@ impl ShoalEngine for ShoalNode {
         ShoalNode::delete_object_tags(self, bucket, key).await
     }
 
-    async fn create_bucket(&self, bucket: &str) -> Result<(), EngineError> {
-        ShoalNode::create_bucket(self, bucket).await
+    async fn create_bucket(&self, bucket: &str, owner: Option<&str>) -> Result<(), EngineError> {
+        ShoalNode::create_bucket(self, bucket, owner).await
     }
 
     async fn delete_bucket(&self, bucket: &str) -> Result<(), EngineError> {
@@ -1823,6 +1904,10 @@ impl ShoalEngine for ShoalNode {
 
     async fn bucket_exists(&self, bucket: &str) -> Result<bool, EngineError> {
         ShoalNode::bucket_exists(self, bucket).await
+    }
+
+    async fn get_bucket_owner(&self, bucket: &str) -> Result<Option<String>, EngineError> {
+        ShoalNode::get_bucket_owner(self, bucket).await
     }
 
     fn meta(&self) -> &Arc<MetaStore> {

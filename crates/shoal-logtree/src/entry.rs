@@ -78,8 +78,13 @@ pub enum Action {
         /// Object key.
         key: String,
     },
-    /// Create a bucket.
+    /// Create a bucket (legacy, no owner).
     CreateBucket { bucket: String },
+    /// Create a bucket with ownership tracking.
+    CreateBucketV2 {
+        bucket: String,
+        owner: Option<String>,
+    },
     /// Delete a bucket.
     DeleteBucket { bucket: String },
 }

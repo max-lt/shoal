@@ -13,16 +13,16 @@ use crate::error::CasError;
 
 /// Intermediate manifest content used to derive the ObjectId.
 ///
-/// This contains everything except the `object_id` and `version` fields,
-/// so we can serialize it deterministically, hash it, and then set `object_id`.
-/// The version is excluded so that bumping the version doesn't change existing
-/// ObjectIds (the content hasn't changed, only the envelope format).
+/// Only content-defining fields are included: `total_size`, `chunk_size`,
+/// `chunks`, and `metadata`. The `object_id`, `version`, and `created_at`
+/// fields are excluded so that the ObjectId is purely content-addressed
+/// (matching S3 ETag semantics where identical data always produces the
+/// same hash regardless of upload timestamp).
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ManifestContent {
     total_size: u64,
     chunk_size: u32,
     chunks: Vec<ChunkMeta>,
-    created_at: u64,
     metadata: BTreeMap<String, String>,
 }
 
@@ -55,7 +55,6 @@ pub fn build_manifest_with_timestamp(
         total_size,
         chunk_size,
         chunks: chunks.to_vec(),
-        created_at,
         metadata: metadata.clone(),
     };
 

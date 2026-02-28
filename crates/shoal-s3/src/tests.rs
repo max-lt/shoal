@@ -229,6 +229,22 @@ async fn body_string(response: axum::response::Response) -> String {
     String::from_utf8(body_bytes(response).await).unwrap()
 }
 
+/// Create a bucket via a signed `PUT /{bucket}` request.
+async fn create_test_bucket(app: &axum::Router, bucket: &str, key_id: &str, secret: &str) {
+    let req = sign_request(
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/{bucket}"))
+            .body(Body::empty())
+            .unwrap(),
+        key_id,
+        secret,
+    );
+
+    let response = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 // -----------------------------------------------------------------------
 // PutObject + GetObject round-trip
 // -----------------------------------------------------------------------
@@ -236,6 +252,7 @@ async fn body_string(response: axum::response::Response) -> String {
 #[tokio::test]
 async fn test_put_get_object() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
     let data = b"hello world, this is shoal!";
 
     // PUT object.
@@ -302,6 +319,7 @@ async fn test_put_get_object() {
 #[tokio::test]
 async fn test_head_object() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
     let data = vec![42u8; 3000];
 
     // PUT.
@@ -374,6 +392,7 @@ async fn test_head_object() {
 #[tokio::test]
 async fn test_list_objects_with_prefix() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     // PUT several objects.
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/c.txt"] {
@@ -444,6 +463,7 @@ async fn test_list_objects_with_prefix() {
 #[tokio::test]
 async fn test_delete_then_get_404() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     // PUT.
     let req = sign_request(
@@ -498,6 +518,7 @@ async fn test_delete_then_get_404() {
 #[tokio::test]
 async fn test_multipart_upload_3_parts() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
     let part1: Vec<u8> = vec![0xAA; 1024];
     let part2: Vec<u8> = vec![0xBB; 1024];
     let part3: Vec<u8> = vec![0xCC; 512];
@@ -626,6 +647,8 @@ async fn test_create_bucket() {
 #[tokio::test]
 async fn test_copy_object() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "src-bucket", &key_id, &secret).await;
+    create_test_bucket(&app, "dst-bucket", &key_id, &secret).await;
     let data = b"copy me please";
 
     // PUT source object.
@@ -725,6 +748,8 @@ async fn test_copy_object() {
 #[tokio::test]
 async fn test_copy_nonexistent_source_returns_404() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "dst", &key_id, &secret).await;
+    create_test_bucket(&app, "src", &key_id, &secret).await;
 
     let req = sign_request(
         Request::builder()
@@ -879,6 +904,9 @@ async fn test_delete_api_key_revokes_access() {
     let body = body_string(response).await;
     let key: ApiKeyResponse = serde_json::from_str(&body).unwrap();
 
+    // Create bucket first.
+    create_test_bucket(&app, "mybucket", &key.access_key_id, &key.secret_access_key).await;
+
     // Verify the key works for S3 operations.
     let req = sign_request(
         Request::builder()
@@ -1007,6 +1035,7 @@ async fn test_s3_auth_wrong_key_rejected() {
 #[tokio::test]
 async fn test_s3_auth_correct_sigv4_accepted() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     // Correct SigV4 -> 200.
     let req = sign_request(
@@ -1050,6 +1079,7 @@ async fn test_s3_without_key_always_rejected() {
 #[tokio::test]
 async fn test_get_nonexistent_returns_404() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     let req = sign_request(
         Request::builder()
@@ -1075,6 +1105,7 @@ async fn test_get_nonexistent_returns_404() {
 #[tokio::test]
 async fn test_etag_is_blake3_hex() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     let req = sign_request(
         Request::builder()
@@ -1105,6 +1136,7 @@ async fn test_etag_is_blake3_hex() {
 #[tokio::test]
 async fn test_user_metadata_passthrough() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     // PUT with metadata.
     let req = sign_request(
@@ -1162,6 +1194,7 @@ async fn test_user_metadata_passthrough() {
 #[tokio::test]
 async fn test_error_response_is_xml() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     let req = sign_request(
         Request::builder()
@@ -1203,6 +1236,7 @@ async fn test_error_response_is_xml() {
 #[tokio::test]
 async fn test_bug3_list_objects_max_keys_ignored() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "mybucket", &key_id, &secret).await;
 
     // Write 5 objects with a shared prefix.
     for i in 0..5 {
@@ -1373,8 +1407,9 @@ async fn test_delete_empty_bucket() {
 #[tokio::test]
 async fn test_delete_nonempty_bucket_fails() {
     let (app, key_id, secret) = test_router_with_key().await;
+    create_test_bucket(&app, "fullbucket", &key_id, &secret).await;
 
-    // Create bucket + put object.
+    // Put object into bucket.
     let req = sign_request(
         Request::builder()
             .method("PUT")

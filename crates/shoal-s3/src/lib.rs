@@ -85,29 +85,41 @@ pub(crate) struct AppState {
 /// Constant-time signature comparison prevents timing attacks.
 async fn auth_middleware(
     State(state): State<AppState>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, S3Error> {
     let mut keys = state.engine.meta().load_all_api_keys().unwrap_or_default();
 
-    // If SigV4 fails, try pulling the missing key from peers before rejecting.
-    if let Err(_e) = auth::verify_sigv4(&request, &keys) {
-        // Extract the access_key_id from the Authorization header to try a peer pull.
-        if let Some(access_key_id) = auth::extract_access_key_id(&request)
-            && !keys.contains_key(&access_key_id)
-            && let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await
-        {
-            keys.insert(access_key_id, secret);
+    // Try SigV4 verification; on success we get the access_key_id back.
+    let caller_key_id = match auth::verify_sigv4(&request, &keys) {
+        Ok(key_id) => key_id,
+        Err(_e) => {
+            // Extract the access_key_id from the Authorization header to try a peer pull.
+            if let Some(access_key_id) = auth::extract_access_key_id(&request)
+                && !keys.contains_key(&access_key_id)
+                && let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await
+            {
+                keys.insert(access_key_id, secret);
 
-            // Retry verification with the newly fetched key.
-            if auth::verify_sigv4(&request, &keys).is_ok() {
-                return Ok(next.run(request).await);
+                // Retry verification with the newly fetched key.
+                match auth::verify_sigv4(&request, &keys) {
+                    Ok(key_id) => key_id,
+                    Err(_) => {
+                        warn!("unauthorized S3 request");
+                        return Err(S3Error::AccessDenied);
+                    }
+                }
+            } else {
+                warn!("unauthorized S3 request");
+                return Err(S3Error::AccessDenied);
             }
         }
+    };
 
-        warn!("unauthorized S3 request");
-        return Err(S3Error::AccessDenied);
-    }
+    // Insert caller identity so handlers can extract it.
+    request.extensions_mut().insert(auth::AuthenticatedCaller {
+        access_key_id: caller_key_id,
+    });
 
     Ok(next.run(request).await)
 }
