@@ -66,13 +66,25 @@ impl ShardStore for FileStore {
         let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp_path = path.with_extension(format!("tmp.{seq}"));
 
-        tokio::fs::write(&tmp_path, &data).await?;
+        {
+            use tokio::io::AsyncWriteExt;
+            let mut f = tokio::fs::File::create(&tmp_path).await?;
+            f.write_all(&data).await?;
+            f.sync_all().await?;
+        }
 
         // rename is atomic on POSIX — if two concurrent writes race, the
         // last rename wins and the result is still correct (same content).
         // If the file was created between our metadata check and here,
         // the rename harmlessly overwrites it with identical data.
         tokio::fs::rename(&tmp_path, &path).await?;
+
+        // Fsync the parent directory so the new directory entry is durable.
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = tokio::fs::File::open(parent).await {
+                let _ = dir.sync_all().await;
+            }
+        }
 
         debug!(%id, path = %path.display(), size = data.len(), "stored shard to file");
         Ok(())
