@@ -1,253 +1,202 @@
-# Shoal Deep Code Review
+# Shoal Deep Code Review (v2 — post-fix re-evaluation)
 
 **Reviewer**: Senior Systems Engineer (Rust, distributed systems, storage infrastructure)
-**Codebase**: ~35,500 lines across 13 crates + integration/chaos tests
+**Codebase**: ~36,000 lines across 13 crates + integration/chaos tests
 **Method**: Full source code analysis only. No documentation consulted.
+**Revision**: Re-evaluated after fixes merged from main.
+
+---
+
+## Fixes Applied Since v1
+
+| v1 Finding | Status | Details |
+|------------|--------|---------|
+| 🔴 FileStore missing fsync | **FIXED** | `file_store.rs:69-87`: `sync_all()` on file before rename + fsync on parent directory. Correct two-phase durable write. |
+| 🔴 Admin endpoints unauthenticated | **NOT FIXED** | `lib.rs:186-187`: TODO comment remains. Still open. |
+| 🟠 Connection pool global mutex | **NOT FIXED** | `transport.rs:127-148`: Same global lock during QUIC connect. |
+| 🟠 Multipart uploads unbounded | **NOT FIXED** | `handlers.rs:622`: Still `body.to_vec()` into HashMap, no limits. |
+| 🟠 `unwrap_or_default()` on LogEntry | **NOT FIXED** | `node.rs:552,802,905,939,971,998` etc.: Still silently drops serialization errors. |
+| 🟠 Erasure decoder duplicate indices | **NOT FIXED** | `decoder.rs:60-68`: Fast path unchanged. |
+| 🟠 Manifest ObjectId not verified | **NOT FIXED** | `manifest.rs:86-96`: Deserialization still skips ObjectId verification. |
+| 🟠 Throttle livelock on large shards | **FIXED** | `throttle.rs:49-77`: Now computes wait time from deficit/rate, sleeps precisely, retries. No more infinite loop. |
+
+**New features added**: Bucket ownership model, object tagging (Get/Put/Delete), CopyObject, ListParts, AbortMultipartUpload, versioning stub, unsupported S3 operation rejection, targeted pull for pending log entries, shard retrieval with owner+fallback strategy.
 
 ---
 
 ## Dimension Ratings (1-5)
 
-| Dimension | Rating | Summary |
-|-----------|--------|---------|
-| 1. Distributed Systems Correctness | 3.5/5 | LWW-based DAG is sound; no formal split-brain protection; gossip-only metadata propagation has convergence gaps |
-| 2. Storage Engine Integrity | 2.5/5 | **Missing fsync** in FileStore is a critical data loss path; verify-on-read mitigates but doesn't prevent loss |
-| 3. Concurrency & Safety | 4/5 | Zero unsafe in most crates; one justified libc call; `expect("lock poisoned")` is the main concern |
-| 4. Error Handling & Resilience | 3.5/5 | Proper `thiserror` throughout; `unwrap_or_default()` on serialization silently drops errors; partial failure handling is good |
-| 5. Security | 3/5 | SigV4 with constant-time comparison is good; admin endpoints are **unauthenticated**; multipart uploads are unbounded in memory |
-| 6. Performance | 3.5/5 | Hot path allocations in CDC chunking; connection pool holds mutex during QUIC connect; shard fetch is sequential per chunk |
-| 7. API Correctness | 3.5/5 | Core S3 ops work; no Range request support; no continuation token for ListObjectsV2; multipart ETag format is wrong |
-| 8. Code Quality | 4.5/5 | Idiomatic Rust; clean separation of concerns; comprehensive test suite; strong type system usage |
+| Dimension | v1 | v2 | Change | Summary |
+|-----------|----|----|--------|---------|
+| 1. Distributed Systems Correctness | 3.5 | 3.5 | — | LWW DAG is sound; no split-brain protection; new targeted-pull improves convergence |
+| 2. Storage Engine Integrity | 2.5 | **4.0** | +1.5 | **Fsync fixed** — the single largest data loss vector is eliminated. Manifest verification still missing. |
+| 3. Concurrency & Safety | 4.0 | 4.0 | — | Global connection pool lock remains the main concern |
+| 4. Error Handling & Resilience | 3.5 | 3.5 | — | `unwrap_or_default()` still present in 6+ sites; throttle livelock fixed |
+| 5. Security | 3.0 | 3.0 | — | Admin endpoints still unauthenticated; multipart still unbounded |
+| 6. Performance | 3.5 | 3.5 | — | Read path improved (owner+fallback strategy) but shard fetch still sequential |
+| 7. API Correctness | 3.5 | **4.0** | +0.5 | Tagging, CopyObject, ListParts, AbortMultipart, bucket ownership added |
+| 8. Code Quality | 4.5 | 4.5 | — | New features maintain same quality bar; repetitive broadcast pattern still not extracted |
 
 ---
 
-## Findings
+## Updated Findings
 
 ### 1. Distributed Systems Correctness
 
-#### Finding 1.1 — LogTree LWW conflict resolution is correct but has a determinism gap
-- **File:Line** — `crates/shoal-logtree/src/tree.rs:738`
+#### Finding 1.1 — LogTree LWW conflict resolution is correct ✅
+- **File:Line** — `crates/shoal-logtree/src/tree.rs:735-753`
 - **Severity** — 🟡 Minor
-- **Description** — Conflict resolution uses `(HLC desc, NodeId desc)` for Last-Writer-Wins. This is deterministic and converges correctly. The `HybridClock` implementation (`shoal-types/src/lib.rs:464-478`) uses CAS loops with `SeqCst` ordering and `witness()` correctly advances the local clock. However, the HLC only provides causal ordering within a single node's chain — concurrent writes on two partitioned nodes with drifted wall clocks can produce unexpected ordering when the partition heals.
-- **Recommendation** — Document the wall-clock dependency explicitly. Consider adding a clock-skew warning when `witness()` observes a remote HLC more than N seconds ahead.
+- **Description** — LWW with `(HLC desc, NodeId desc)` tiebreak is correct and deterministic. HLC implementation at `shoal-types/src/lib.rs:467-481` uses CAS loops with `SeqCst`. The `witness()` method correctly advances the local clock via `fetch_max`. No changes since v1.
+- **Recommendation** — Consider adding a clock-skew warning when `witness()` observes a remote HLC more than N seconds ahead.
 
 #### Finding 1.2 — No split-brain protection beyond circuit breaker
 - **File:Line** — `crates/shoal-repair/src/circuit_breaker.rs:52-89`
 - **Severity** — 🟠 Major
-- **Description** — The circuit breaker suspends repair when >=50% of nodes are down (`max_down_fraction`). However, there is no quorum mechanism preventing both halves of a network partition from accepting writes. Two partitioned sub-clusters will each maintain their own LogTree DAG tips, diverging independently. When the partition heals, the LWW merge may silently discard writes from the "losing" side. This is acceptable for an eventually-consistent system, but the lack of any notification that writes were lost is concerning.
-- **Recommendation** — Emit a `ClusterEvent::ConflictDetected` when merge discovers concurrent writes to the same key from different nodes with close HLC timestamps. Log the overwritten ObjectId.
+- **Description** — Unchanged. No quorum mechanism. Two partitioned sub-clusters will diverge independently. LWW merge may silently discard writes from the "losing" side.
+- **Recommendation** — Emit `ClusterEvent::ConflictDetected` when merge discovers concurrent writes to the same key from different nodes with close HLC timestamps.
 
-#### Finding 1.3 — Gossip broadcast is fire-and-forget
-- **File:Line** — `crates/shoal-engine/src/node.rs:554-559`
-- **Severity** — 🟡 Minor
-- **Description** — All metadata broadcasts (log entries, manifests) use `gossip.broadcast_payload()` which is fire-and-forget. If the broadcast fails, a `warn!` is logged but the write still succeeds. The periodic `sync_log_from_peers()` provides eventual consistency, but there's no bounded convergence guarantee — a node that missed a gossip message won't see the update until the next sync cycle.
-- **Recommendation** — This is acceptable for the current architecture. Ensure `sync_log_from_peers()` runs on a bounded interval (it does in the daemon).
-
-#### Finding 1.4 — `compute_delta` BFS stops at peer tips but peer may have pruned ancestors
-- **File:Line** — `crates/shoal-logtree/src/tree.rs:387-471`
-- **Severity** — 🟡 Minor
-- **Description** — The delta computation uses the peer's tips as a termination condition for BFS traversal. If the peer has pruned entries before a snapshot (via `prune_before`), the delta may include entries whose parents are in the pruned region. The `apply_sync_entries` method at line 604-621 handles this correctly by only validating in-delta parents, treating out-of-delta parent references as boundary entries. This is a correct design.
-- **Recommendation** — No change needed. The current relaxed parent validation for sync entries is the right approach for a prunable DAG.
-
-#### Finding 1.5 — Membership uses direct ping, not indirect ping
+#### Finding 1.3 — Membership uses direct ping, not indirect ping
 - **File:Line** — `crates/shoal-cluster/src/membership.rs:119-150`
 - **Severity** — 🟠 Major
-- **Description** — The `PeerManager` pings peers directly via QUIC `request_response`. Unlike SWIM protocol (which the plan references via `foca`), there is no indirect ping through a third node to distinguish "peer is dead" from "network path to peer is broken." This means asymmetric network failures (A cannot reach B, but C can reach both) will cause A to mark B as dead, triggering unnecessary shard repairs.
-- **Recommendation** — Implement indirect ping: when direct ping fails N times, ask a random healthy peer to ping the suspect node on your behalf before declaring it dead.
+- **Description** — Unchanged. No indirect ping through a third node. Asymmetric network failures cause false-positive death declarations and unnecessary repair storms.
+- **Recommendation** — Implement indirect ping: when direct ping fails N times, ask a random healthy peer to ping the suspect on your behalf.
+
+#### Finding 1.4 — NEW: Targeted pull for pending log entries improves convergence
+- **File:Line** — `crates/shoal-engine/src/node.rs:840-858` and `crates/shoald/src/handler.rs:170-312`
+- **Severity** — 🔵 Positive finding
+- **Description** — New `targeted_pull_for_key()` method checks the pending buffer for buffered entries with missing parents, spawns a targeted QUIC pull from the entry's author, and retries resolution. Combined with eager pull in the handler (`handler.rs:170-312`), this significantly improves convergence when entries arrive out of order. The pull includes batch manifest and API key secret retrieval — well designed.
 
 ### 2. Storage Engine Integrity
 
-#### Finding 2.1 — FileStore: No fsync before rename (DATA LOSS)
-- **File:Line** — `crates/shoal-store/src/file_store.rs:69-75`
-- **Severity** — 🔴 Critical
-- **Description** — The write path uses `tokio::fs::write()` then `tokio::fs::rename()` without calling `fsync()` on the file or the parent directory. On power loss, the kernel may have committed the rename to the journal but not the file contents, resulting in a valid filename pointing to zero-filled or partial data. The verify-on-read mechanism (`file_store.rs:84-95`) catches this as `CorruptShard`, but the data is irrecoverably lost — it has already been acknowledged to the writer.
-- **Recommendation** —
-```rust
-// After write, before rename:
-let file = tokio::fs::File::open(&tmp_path).await?;
-file.sync_all().await?;
-tokio::fs::rename(&tmp_path, &path).await?;
-// Fsync parent directory:
-let parent = tokio::fs::File::open(path.parent().unwrap()).await?;
-parent.sync_all().await?;
-```
+#### Finding 2.1 — ✅ FIXED: FileStore now has proper fsync
+- **File:Line** — `crates/shoal-store/src/file_store.rs:69-87`
+- **Severity** — ~~🔴 Critical~~ → 🔵 Resolved
+- **Description** — The write path now correctly:
+  1. Creates a uniquely-named temp file with atomic counter suffix (`file_store.rs:66-67`)
+  2. Writes data via `AsyncWriteExt` (`file_store.rs:71-72`)
+  3. Calls `f.sync_all()` before rename (`file_store.rs:73`) — **ensures data is durable on disk**
+  4. Renames atomically (`file_store.rs:80`)
+  5. Fsyncs the parent directory (`file_store.rs:83-87`) — **ensures directory entry is durable**
+
+  This is the textbook correct two-phase durable write pattern. The previous critical data loss vector is fully eliminated. Concurrent write tests (`test_bug2_concurrent_writes_no_enoent`, `test_concurrent_writes_same_shard_id`) confirm the atomic counter suffix prevents ENOENT races.
 
 #### Finding 2.2 — Manifest ObjectId not verified on deserialization
-- **File:Line** — `crates/shoal-cas/src/manifest.rs:87-97`
+- **File:Line** — `crates/shoal-cas/src/manifest.rs:86-96`
 - **Severity** — 🟠 Major
-- **Description** — `deserialize_manifest()` accepts any manifest without verifying that the embedded `object_id` matches `blake3(ManifestContent)`. A corrupted or tampered manifest in Fjall or received from a peer would be silently accepted. The system claims "content-addressing everywhere" and "verify-on-read" but manifests are not covered.
-- **Recommendation** — Add `verify_manifest()` that recomputes `ObjectId` from `ManifestContent` and compares. Call it in `deserialize_manifest()` or at the engine layer on every manifest load.
+- **Description** — Unchanged. `deserialize_manifest()` checks version but does NOT recompute `blake3(ManifestContent)` to verify the embedded `object_id`. A corrupted or tampered manifest would be silently accepted.
+- **Recommendation** — Add `verify_manifest()` that recomputes ObjectId from `ManifestContent` fields and compares.
 
-#### Finding 2.3 — Orphaned temp files accumulate on write failures
-- **File:Line** — `crates/shoal-store/src/file_store.rs:67-75`
+#### Finding 2.3 — Shard data not garbage-collected on object deletion
+- **File:Line** — `crates/shoal-engine/src/node.rs:779`
 - **Severity** — 🟡 Minor
-- **Description** — If `tokio::fs::write()` succeeds but `tokio::fs::rename()` fails, the `.tmp.{N}` file persists on disk indefinitely. Over time, failed writes leak disk space.
-- **Recommendation** — Use a Drop guard or `finally` block to clean up the temp file on error.
-
-#### Finding 2.4 — Shard data not garbage-collected on object deletion
-- **File:Line** — `crates/shoal-engine/src/node.rs:774-837`
-- **Severity** — 🟡 Minor
-- **Description** — `delete_object()` removes the key mapping and manifest reference but explicitly does NOT delete the underlying shard data. Comment at line 777: "a background GC pass would clean up orphaned shards (post-milestone optimization)." This means deleted objects continue consuming storage until manually cleaned.
-- **Recommendation** — Implement background shard GC that scans for shards not referenced by any manifest.
+- **Description** — Unchanged. Comment says "a background GC pass would clean up orphaned shards."
 
 ### 3. Concurrency & Safety
 
 #### Finding 3.1 — Connection pool holds mutex during QUIC handshake
 - **File:Line** — `crates/shoal-net/src/transport.rs:127-148`
 - **Severity** — 🟠 Major
-- **Description** — `get_connection()` holds the connection cache mutex for the entire duration of `self.endpoint.connect()`, which performs a full QUIC handshake (potentially including relay negotiation). This blocks ALL concurrent `get_connection()` calls to ANY peer, not just the target peer. If a connect takes 5 seconds (relay fallback, slow peer), all other shard pushes/pulls are stalled.
-- **Recommendation** — Use per-peer locking or a concurrent map. Alternatively, release the lock after cache miss, connect without the lock, then re-acquire and check before inserting (double-check pattern). The comment at lines 33-37 explains why a global mutex was chosen (to prevent duplicate connections), but the blast radius is too wide.
+- **Description** — Unchanged. Global `tokio::sync::Mutex` held during `endpoint.connect()`. The comment at line 124-126 acknowledges the trade-off ("to prevent the TOCTOU race") but the blast radius remains too wide — one slow peer blocks all other connections.
+- **Recommendation** — Use per-peer locking or a double-check pattern (release lock, connect, re-acquire, check before insert).
 
 #### Finding 3.2 — `expect("lock poisoned")` throughout codebase
-- **File:Line** — `crates/shoal-store/src/memory_store.rs:45,71,76,86,91,107` and `crates/shoal-engine/src/node.rs:265,322,336,522`
+- **File:Line** — `crates/shoal-meta/src/store.rs` (30+ sites), `crates/shoal-engine/src/node.rs:522`
 - **Severity** — 🟡 Minor
-- **Description** — At least 10 call sites use `expect("lock poisoned")` on `std::sync::Mutex` and `RwLock`. If any task panics while holding a lock, ALL subsequent operations on that store will panic, cascading to process-wide crash.
-- **Recommendation** — Either use `parking_lot::Mutex` (does not poison) or handle the `PoisonError` by unwrapping the inner value.
-
-#### Finding 3.3 — Zero `unsafe` in all library crates (except justified libc call)
-- **File:Line** — `crates/shoal-store/src/file_store.rs:211-256`
-- **Severity** — 🔵 Suggestion (positive finding)
-- **Description** — The entire codebase has exactly one `unsafe` block: the `libc::statvfs` call for filesystem capacity reporting. It is well-documented with a safety comment, correctly uses `CString`, and checks the return value. All other crates are safe Rust.
+- **Description** — Unchanged. Memory backend in MetaStore uses `.unwrap()` on every `RwLock` access. A single panic while holding a lock cascades to process-wide crash.
+- **Recommendation** — Switch to `parking_lot::Mutex` (no poisoning) or unwrap the `PoisonError` inner value.
 
 ### 4. Error Handling & Resilience
 
 #### Finding 4.1 — `unwrap_or_default()` on serialization silently drops data
-- **File:Line** — `crates/shoal-engine/src/node.rs:552,802,905,939,970,994,1033`
+- **File:Line** — `crates/shoal-engine/src/node.rs:552,802,905,939,971,998`
 - **Severity** — 🟠 Major
-- **Description** — Multiple sites serialize `LogEntry` with `postcard::to_allocvec(&log_entry).unwrap_or_default()`. If serialization fails, an empty `Vec<u8>` is broadcast via gossip. Peers receiving this will fail to deserialize (empty bytes), silently dropping the mutation. The entry was already applied locally but never propagated — a silent consistency divergence.
-- **Recommendation** — Propagate the error. If `to_allocvec` fails (which is extremely unlikely for a well-formed `LogEntry`), the write should fail rather than silently lose the replication.
+- **Description** — Unchanged. Six+ call sites still serialize `LogEntry` with `postcard::to_allocvec(&log_entry).unwrap_or_default()`. On failure, empty bytes are broadcast — peers silently drop the mutation. The count has actually grown with new features (tags, bucket operations).
+- **Recommendation** — Replace with `postcard::to_allocvec(&log_entry)?` and propagate the error. Postcard serialization failure on a well-formed struct is extremely unlikely, but if it happens, the write should fail visibly rather than silently break replication.
 
-#### Finding 4.2 — Erasure decoder fast path silently accepts duplicate indices
+#### Finding 4.2 — Erasure decoder fast path accepts duplicate indices
 - **File:Line** — `crates/shoal-erasure/src/decoder.rs:60-68`
 - **Severity** — 🟠 Major
-- **Description** — When `originals.len() == k`, the fast path bypasses Reed-Solomon decoding and concatenates the shard data by index. However, it does not check for duplicate shard indices. If two shards with the same index are provided (e.g., from a buggy repair), the output is silently garbage — wrong data returned to the user with no error.
-- **Recommendation** — Add a uniqueness check: `let indices: HashSet<_> = originals.iter().map(|(i, _)| *i).collect(); if indices.len() != k { /* fall through to RS decode */ }`.
+- **Description** — Unchanged. When `originals.len() == k`, the fast path concatenates by index without checking uniqueness. Duplicate indices produce garbage output.
+- **Recommendation** — Add uniqueness check or fall through to RS decode on duplicate indices.
 
-#### Finding 4.3 — Partial write failure leaves local shards without remote copies
-- **File:Line** — `crates/shoal-engine/src/node.rs:486-523`
-- **Severity** — 🟡 Minor
-- **Description** — When remote shard pushes fail, they are queued in `pending_pushes` for retry. This is a correct design. The retry mechanism at `node.rs:258-332` is well-implemented: it re-checks ring ownership (in case the ring changed), re-resolves addresses, and re-queues on failure. The writer keeps a local copy as a fallback.
-
-#### Finding 4.4 — `ErasureEncoder::new(0, m)` causes panic, not error
-- **File:Line** — `crates/shoal-erasure/src/encoder.rs:38-39`
-- **Severity** — 🟡 Minor
-- **Description** — The encoder constructor accepts `k=0` without validation. This causes a division-by-zero panic at `encode()` time (`chunk.len().div_ceil(self.k)`).
-- **Recommendation** — Add validation: `assert!(k >= 1, "k must be at least 1")` or return `Result`.
+#### Finding 4.3 — ✅ FIXED: Throttle livelock on large shards
+- **File:Line** — `crates/shoal-repair/src/throttle.rs:49-77`
+- **Severity** — ~~🟠 Major~~ → 🔵 Resolved
+- **Description** — The `acquire()` method now correctly computes `wait_time = deficit / rate` when tokens are insufficient, sleeps for that duration, then retries. This eliminates the previous livelock where shards larger than `bytes_per_sec` caused an infinite loop (available was capped at capacity but bytes exceeded it). The doc comment at line 47-48 even explains the clamping behavior.
 
 ### 5. Security
 
 #### Finding 5.1 — Admin endpoints are unauthenticated
-- **File:Line** — `crates/shoal-s3/src/lib.rs:174-185`
+- **File:Line** — `crates/shoal-s3/src/lib.rs:186-197`
 - **Severity** — 🔴 Critical
-- **Description** — `POST /admin/keys`, `GET /admin/keys`, `DELETE /admin/keys/{id}`, and `POST /admin/buckets/{name}` have NO authentication middleware applied. Any network-reachable client can create API keys, list all key IDs, delete keys, and create buckets. The code even has a TODO comment at line 175: "gate behind admin_secret once we have a proper admin UI / bootstrap flow."
-- **Recommendation** — Gate admin routes behind `Authorization: Bearer <admin_secret>` immediately. The admin secret should be configured via environment variable or config file, not hardcoded.
+- **Description** — Unchanged. TODO comment at line 187: "gate behind admin_secret once we have a proper admin UI / bootstrap flow." `POST /admin/keys`, `GET /admin/keys`, `DELETE /admin/keys/{id}`, and `POST /admin/buckets/{name}` have no auth middleware.
+- **Recommendation** — Gate behind `Authorization: Bearer <admin_secret>` configured via environment variable.
 
 #### Finding 5.2 — Multipart upload parts stored entirely in memory
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:545` and `crates/shoal-s3/src/lib.rs:64`
+- **File:Line** — `crates/shoal-s3/src/handlers.rs:622`
 - **Severity** — 🟠 Major
-- **Description** — `upload.parts.insert(part_number, body.to_vec())` stores each uploaded part as a `Vec<u8>` in a `HashMap` held in an `RwLock`. There is no limit on the number of concurrent multipart uploads or total memory consumed. An attacker can initiate thousands of multipart uploads and upload large parts to exhaust server memory. The 5 GiB body limit (`DefaultBodyLimit::max(5 * 1024 * 1024 * 1024)`) applies per-request, but accumulation across uploads is unbounded.
-- **Recommendation** — Add limits: max concurrent uploads per bucket, max total memory for in-flight parts, and an upload expiration timer.
+- **Description** — Unchanged. `upload.parts.insert(part_number, body.to_vec())` with no limits on concurrent uploads or total memory.
 
-#### Finding 5.3 — API key generation uses modular bias
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:50`
-- **Severity** — 🟡 Minor
-- **Description** — `(rng.next_u32() as usize) % ALPHA_NUMERIC.len()` introduces modular bias since `2^32 % 36 != 0`. With 36 characters and u32, the bias is ~0.00000084% per character — negligible in practice but not cryptographically ideal.
-- **Recommendation** — Use `rng.random_range(0..ALPHA_NUMERIC.len())` from the `rand` crate for unbiased sampling. This is not urgent — the access key ID is not a secret.
+#### Finding 5.3 — NEW: Bucket ownership model added (positive)
+- **File:Line** — `crates/shoal-s3/src/handlers.rs:234-252`
+- **Severity** — 🔵 Positive finding
+- **Description** — New `check_bucket_access()` middleware verifies that the authenticated caller owns the bucket (or the bucket has no owner for legacy/admin-created buckets). This is applied on all S3 data-plane operations. The ownership is replicated via `CreateBucketV2` action in the LogTree DAG. Well-designed multi-tenant isolation.
 
-#### Finding 5.4 — SigV4 implementation is solid
-- **File:Line** — `crates/shoal-s3/src/auth.rs:221-298`
-- **Severity** — 🔵 Suggestion (positive finding)
-- **Description** — The AWS Signature V4 verification uses `subtle::ConstantTimeEq` for signature comparison (line 289-292), correctly preventing timing attacks. The HMAC chain derivation matches the AWS spec. `UNSIGNED-PAYLOAD` is accepted as the default payload hash, which is standard for S3-compatible servers.
-
-#### Finding 5.5 — No bucket/key name validation
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:430-512`
-- **Severity** — 🟡 Minor
-- **Description** — Bucket names and object keys are passed directly to `MetaStore` and `FileStore` without validation. While `FileStore` uses hex-encoded `ShardId` filenames (preventing path traversal for shard storage), the metadata store keys use raw bucket/key strings. Bucket names like `../../etc` or keys with null bytes could cause issues with Fjall or downstream systems.
-- **Recommendation** — Validate bucket names against S3 naming rules (3-63 chars, lowercase, no consecutive dots) and reject keys containing null bytes.
-
-#### Finding 5.6 — API key secrets sent over plaintext QUIC
-- **File:Line** — `crates/shoal-net/src/transport.rs:568-601`
+#### Finding 5.4 — API key secrets sent without authorization check
+- **File:Line** — `crates/shoald/src/handler.rs:466-478`
 - **Severity** — 🟠 Major
-- **Description** — `pull_api_keys()` transmits `(access_key_id, secret_access_key)` pairs over QUIC streams. While QUIC is encrypted (TLS 1.3), the API key secrets are serialized in plaintext within the application-layer message. Any node in the cluster can request any API key secret from any other node — there is no authorization check on who can pull secrets.
-- **Recommendation** — Restrict API key pull to the `ShoalMessage::ApiKeyRequest` handler on the receiving side. Consider encrypting secrets at the application layer or restricting which nodes can request keys (e.g., only during join).
+- **Description** — Unchanged. `ApiKeyRequest` handler returns secrets to any connected node without checking authorization. Any node in the cluster can read all API key secrets.
 
 ### 6. Performance
 
-#### Finding 6.1 — CDC chunking copies all chunk data
-- **File:Line** — `crates/shoal-cas/src/cdc_chunker.rs:103`
+#### Finding 6.1 — Shard fetching sequential within each chunk
+- **File:Line** — `crates/shoal-engine/src/node.rs:630-719`
 - **Severity** — 🟡 Minor
-- **Description** — `Bytes::copy_from_slice(chunk_data)` copies each chunk from the input buffer. Since FastCDC provides `(offset, length)` pairs into the original slice, a zero-copy approach using `Bytes::from(data_bytes).slice(offset..offset+length)` would avoid ~1x total data copying.
-- **Recommendation** — Accept `Bytes` input and use `Bytes::slice()` for zero-copy chunking in the hot path.
+- **Description** — Still sequential. However, the read path now has improved fallback logic: after trying known owners from `meta.get_shard_owners()`, it falls back to ring-computed owners, then to ALL cluster members (`node.rs:659-668`). This is more resilient but doesn't address the latency concern — each candidate is tried sequentially.
+- **Recommendation** — Fetch shards concurrently with `JoinSet`, cancel remaining futures after `k` successes.
 
-#### Finding 6.2 — Shard fetching is sequential within each chunk
-- **File:Line** — `crates/shoal-engine/src/node.rs:630-718`
-- **Severity** — 🟡 Minor
-- **Description** — The read path fetches shards one-at-a-time within each chunk: for each shard, it tries local store, then cache, then sequentially iterates through remote owners. With `k+m=6` shards and network latency, this serializes 6 potential network round-trips per chunk. S3-compatible clients expect sub-second GET latency for small objects.
-- **Recommendation** — Fetch all shards for a chunk concurrently using `JoinSet`, keeping only the first `k` successful responses.
-
-#### Finding 6.3 — `get_object` loads entire object into memory
+#### Finding 6.2 — `get_object` loads entire object into memory
 - **File:Line** — `crates/shoal-engine/src/node.rs:625`
 - **Severity** — 🟡 Minor
-- **Description** — `Vec::with_capacity(manifest.total_size as usize)` pre-allocates the entire object in memory. For a 1 GB object, this is a 1 GB allocation. There is no streaming/chunked response path.
-- **Recommendation** — For large objects, consider a streaming approach that yields chunks as they are decoded, feeding directly into the HTTP response body.
-
-#### Finding 6.4 — Vnode position computation heap-allocates
-- **File:Line** — `crates/shoal-placement/src/ring.rs:391`
-- **Severity** — 🔵 Suggestion
-- **Description** — `Vec::with_capacity(34)` heap-allocates on every `vnode_position` call. Since this is called `weight` times per `add_node`, a stack-allocated `[u8; 34]` array would eliminate these allocations.
+- **Description** — Unchanged. Full object materialized in `Vec::with_capacity(manifest.total_size)`.
 
 ### 7. API Correctness
 
-#### Finding 7.1 — No Range request support (GET partial content)
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:603-649`
+#### Finding 7.1 — No Range request support
+- **File:Line** — `crates/shoal-s3/src/handlers.rs:679-739`
 - **Severity** — 🟠 Major
-- **Description** — The `get_object_handler` does not parse the `Range` header or return `206 Partial Content`. All GETs return the full object body. This breaks S3 clients that rely on range requests for resumable downloads, multipart downloads, and partial reads (e.g., Parquet/ORC column access patterns).
-- **Recommendation** — Parse `Range: bytes=start-end`, slice the assembled data, and return `206 Partial Content` with `Content-Range` header.
+- **Description** — Unchanged. No `Range` header parsing, no `206 Partial Content`.
 
-#### Finding 7.2 — ListObjectsV2 has no continuation token
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:379-401`
-- **Severity** — 🟡 Minor
-- **Description** — The `max-keys` parameter is parsed and used to truncate results, and `IsTruncated` is set correctly. However, there is no `continuation-token` support. When `IsTruncated=true`, S3 clients need to send a follow-up request with the continuation token to get the next page. Currently, the client has no way to paginate.
-- **Recommendation** — Use the last returned key as the continuation token and filter `list_objects` results starting after that key.
+#### Finding 7.2 — NEW: Comprehensive S3 operation coverage added (positive)
+- **Severity** — 🔵 Positive finding
+- **Description** — Significant new operations: `CopyObject` (`handlers.rs:637-672`), `GetObjectTagging/PutObjectTagging/DeleteObjectTagging` (`handlers.rs:797-866`), `ListParts` (`handlers.rs:904-938`), `AbortMultipartUpload` (`handlers.rs:872-898`), `GetBucketVersioning` stub (`handlers.rs:427-434`), and rejection of 16+ unsupported sub-resources (`UNSUPPORTED_BUCKET_OPS`, `UNSUPPORTED_OBJECT_OPS`). Good S3 compatibility progress.
 
-#### Finding 7.3 — Multipart upload ETag format is incorrect
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:1019`
+#### Finding 7.3 — Multipart ETag format still incorrect
+- **File:Line** — `crates/shoal-s3/src/handlers.rs:1124`
 - **Severity** — 🟡 Minor
-- **Description** — The CompleteMultipartUpload response returns `etag: format!("{object_id}")` without the `-N` suffix. S3 specifies that multipart ETags should be `"hash-partcount"` (e.g., `"abc123-3"`). Some S3 clients check this format to determine if an object was uploaded via multipart.
-- **Recommendation** — Return `format!("\"{object_id}-{part_count}\"")`.
+- **Description** — `format!("{object_id}")` without `-N` suffix. S3 specifies multipart ETags as `"hash-partcount"`.
 
-#### Finding 7.4 — `PutObject` reads entire body into memory before processing
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:435`
+#### Finding 7.4 — NEW: CompleteMultipart removes upload before validation
+- **File:Line** — `crates/shoal-s3/src/handlers.rs:1079-1092`
 - **Severity** — 🟡 Minor
-- **Description** — The `body: bytes::Bytes` parameter in the handler signature means axum buffers the entire request body in memory before the handler runs. Combined with the 5 GiB body limit, a single PUT could consume 5 GiB of RAM.
-- **Recommendation** — For production, consider streaming the body through CDC chunking without full buffering. The FastCDC algorithm can work on a streaming basis with `StreamCDC`.
-
-#### Finding 7.5 — Upload ID is predictable (sequential counter + blake3)
-- **File:Line** — `crates/shoal-s3/src/handlers.rs:201-205`
-- **Severity** — 🟡 Minor
-- **Description** — `generate_upload_id()` uses `UPLOAD_COUNTER.fetch_add(1)` hashed with blake3. Since blake3 is not a secret, and the counter starts at 1, all upload IDs are deterministic from process start. An attacker could predict future upload IDs and attempt to access or corrupt them.
-- **Recommendation** — Include a per-process random seed in the hash input, or use a CSPRNG directly.
+- **Description** — `complete_multipart()` removes the upload from the HashMap at line 1081, then checks `upload.bucket != bucket || upload.key != key` at line 1088. If the check fails, the upload is already destroyed — the client gets `NoSuchUpload` and has lost all uploaded parts. The `AbortMultipartUpload` handler at `handlers.rs:878-889` correctly handles this by reinserting on mismatch — the complete path should do the same.
+- **Recommendation** — Re-insert the upload on bucket/key mismatch, or check before removing.
 
 ### 8. Code Quality
 
-#### Finding 8.1 — Consistent, idiomatic Rust throughout
-- **Severity** — 🔵 Suggestion (positive finding)
-- **Description** — The codebase consistently uses `thiserror` for errors, `tracing` for logging, `async_trait` for async traits, and derives the correct trait sets for ID types. The `define_id!` macro at `shoal-types/src/lib.rs:22-67` elegantly generates four ID newtypes with all needed traits. Error types are descriptive and contextual.
+#### Finding 8.1 — Consistent, idiomatic Rust throughout ✅
+- **Severity** — 🔵 Positive finding
+- **Description** — New features (tagging, bucket ownership, copy, abort multipart) maintain the same high quality bar: `thiserror` for errors, `tracing` with structured fields, proper separation of concerns. The `ShoalEngine` trait (`engine.rs:25-113`) was cleanly extended with 6 new methods without breaking the abstraction.
 
-#### Finding 8.2 — Test coverage is thorough
-- **Severity** — 🔵 Suggestion (positive finding)
-- **Description** — ~3,100 lines of integration tests cover local pipelines, multi-node write/read, node failure/recovery, rebalancing, stress testing, network partitions, and random kill scenarios. Unit tests exist in every crate. The `shoal-placement` crate alone has 35 unit tests covering every edge case.
+#### Finding 8.2 — Test coverage extended
+- **Severity** — 🔵 Positive finding
+- **Description** — New tests in `shoal-s3/src/tests.rs` (+37 lines) and `shoald/src/handler.rs:504-564` (LogTree broadcast regression test). `file_store.rs` gained two concurrent write tests (`test_bug2_concurrent_writes_no_enoent`, `test_concurrent_writes_same_shard_id`) that specifically exercise the ENOENT race fix.
 
-#### Finding 8.3 — Repetitive gossip broadcast pattern
-- **File:Line** — `crates/shoal-engine/src/node.rs:548-564, 800-813, 903-916, 937-950, 969-982, 993-1005, 1031-1044`
-- **Severity** — 🔵 Suggestion
-- **Description** — Seven near-identical blocks follow the pattern: serialize log entry → if gossip exists, broadcast, else unicast. This is a candidate for extraction into a helper method.
-- **Recommendation** — Extract a `broadcast_log_entry(&self, entry: &LogEntry) -> Result<(), EngineError>` helper.
-
-#### Finding 8.4 — NodeId used as ed25519 public key
-- **File:Line** — `crates/shoal-logtree/src/entry.rs:150`
-- **Severity** — 🔵 Suggestion
-- **Description** — `VerifyingKey::from_bytes(self.node_id.as_bytes())` reconstructs the ed25519 public key from the NodeId bytes. This works because NodeId is derived from the iroh endpoint key, which is also ed25519. This is a strong design choice — the NodeId IS the public key, so there's no separate key management.
+#### Finding 8.3 — Repetitive gossip broadcast pattern (now worse)
+- **File:Line** — `crates/shoal-engine/src/node.rs:548-564, 800-813, 903-916, 937-950, 969-982, 996-1009, 1031-1044`
+- **Severity** — 🟡 Minor (upgraded from 🔵)
+- **Description** — With new features (tags, buckets), the identical serialize-broadcast-or-unicast pattern is now replicated 7+ times. Each occurrence includes the same `unwrap_or_default()` bug. Extracting a helper would fix both issues at once.
+- **Recommendation** — Extract `fn broadcast_log_entry(&self, entry: &LogEntry) -> Result<(), EngineError>` that handles serialization (with proper `?` propagation) and gossip/unicast dispatch.
 
 ---
 
@@ -255,50 +204,68 @@ parent.sync_all().await?;
 
 ### Top 5 Critical Issues (Ranked by Blast Radius)
 
-1. **🔴 FileStore missing fsync** (`file_store.rs:69-75`) — Silent data loss on power failure. Every acknowledged write is at risk. Blast radius: ALL stored data.
+1. **🔴 Admin endpoints unauthenticated** (`shoal-s3/src/lib.rs:186-197`) — Any network-reachable client can create/delete API keys and create buckets. Blast radius: complete security bypass. **UNCHANGED since v1.**
 
-2. **🔴 Admin endpoints unauthenticated** (`shoal-s3/src/lib.rs:174-185`) — Any network-reachable client can create/delete API keys and create buckets. Blast radius: complete security bypass.
+2. **🟠 `unwrap_or_default()` on LogEntry serialization** (`node.rs:552,802,905,939,971,998`) — Failed serialization silently drops metadata replication. The pattern has grown (now 7+ sites) with new features. Blast radius: silent consistency divergence across cluster. **UNCHANGED since v1.**
 
-3. **🟠 Connection pool mutex blocks all peers during QUIC connect** (`transport.rs:127-148`) — A slow or unreachable peer stalls all concurrent network operations. Blast radius: cluster-wide write/read latency spike.
+3. **🟠 Connection pool mutex blocks all peers during QUIC connect** (`transport.rs:127-148`) — A slow or unreachable peer stalls all concurrent network operations. Blast radius: cluster-wide write/read latency spike. **UNCHANGED since v1.**
 
-4. **🟠 Multipart uploads unbounded in memory** (`handlers.rs:545`) — Resource exhaustion DoS vector. Blast radius: OOM crash of the node.
+4. **🟠 Multipart uploads unbounded in memory** (`handlers.rs:622`) — Resource exhaustion DoS vector. Blast radius: OOM crash of the node. **UNCHANGED since v1.**
 
-5. **🟠 `unwrap_or_default()` on LogEntry serialization** (`node.rs:552`) — Failed serialization silently drops metadata replication. Blast radius: silent consistency divergence across cluster.
+5. **🟠 Manifest ObjectId not verified on deserialization** (`manifest.rs:86-96`) — Corrupted or tampered manifests silently accepted. Blast radius: wrong data returned to users. **UNCHANGED since v1.** (Promoted from #6 since fsync was fixed.)
+
+### What Changed
+
+**Resolved** (previously top 5):
+- ~~🔴 FileStore missing fsync~~ — **FIXED** with textbook-correct two-phase durable write (`sync_all()` + dir fsync).
+- ~~🟠 Throttle livelock~~ — **FIXED** with proper deficit/rate wait computation.
+
+**New positive additions**:
+- Bucket ownership model with multi-tenant access control
+- Object tagging (Get/Put/Delete) with LogTree replication
+- CopyObject (metadata-only, zero data copy)
+- Targeted pull for pending log entries (improved convergence)
+- Comprehensive unsupported S3 operation rejection
+- Concurrent write regression tests for FileStore
 
 ### Distributed Systems Correctness Assessment
 
-The LogTree DAG with HLC timestamps and LWW conflict resolution is a **sound foundation** for eventual consistency. The topological sort (Kahn's algorithm) for sync delta computation is correctly implemented. Signature verification on entry receive prevents forgery. The auto-merge mechanism for multiple tips ensures convergence.
+Same as v1. The LogTree DAG with HLC+LWW is a **sound foundation** for eventual consistency. Kahn's topological sort for sync delta is correct. Signature verification prevents forgery. Auto-merge converges tips.
 
-**Key gap**: No quorum writes, no read-repair, no indirect ping for failure detection. The system is designed for AP (availability + partition tolerance) with eventual consistency, which is appropriate for an S3-compatible store. However, the lack of indirect ping means asymmetric network failures cause unnecessary repair storms.
+**Key gap**: No quorum writes, no read-repair, no indirect ping. AP system with eventual consistency — appropriate for S3-compatible storage.
+
+**Improvement**: The new targeted-pull mechanism (`node.rs:840-858`, `handler.rs:170-312`) significantly improves convergence for out-of-order entries, including batch manifest and API key secret retrieval.
 
 ### Data Loss / Corruption Risk Assessment
 
-**Risk: MODERATE-HIGH**
+**Risk: ~~MODERATE-HIGH~~ → MODERATE**
 
-- The missing `fsync` in `FileStore` is the single largest data loss vector. Any power failure can corrupt acknowledged shards.
-- Verify-on-read catches corruption but cannot recover the data.
-- Manifest ObjectId is not verified on deserialization, allowing corrupted manifests to propagate.
-- Erasure coding provides redundancy (k+m shards), but with `shard_replication=1` (default), each shard exists on exactly one node. Power loss on that node loses the shard permanently.
+The **fsync fix** eliminates the single largest data loss vector. Remaining concerns:
+- Manifest ObjectId not verified on deserialization (corrupted manifests could propagate)
+- Erasure decoder fast path accepts duplicate indices (garbage output, not data loss per se)
+- `shard_replication=1` default means each shard on exactly one node — node loss = shard loss (mitigated by erasure coding: losing < m shards per chunk is recoverable)
 
-**Mitigating factors**:
-- Content-addressing (BLAKE3) at every layer catches most corruption.
-- Network transfers verify integrity on receive (`transport.rs:311-323`).
-- The repair scheduler prioritizes shards with fewest remaining copies.
+**Mitigating factors** (strengthened since v1):
+- **FileStore now fsyncs** — acknowledged durability is real
+- Content-addressing (BLAKE3) at every layer catches corruption
+- Verify-on-read detects corrupt shards and triggers RS decode from peers
+- Repair scheduler prioritizes shards with fewest remaining copies
 
-### Technical Debt Level: **MEDIUM**
+### Technical Debt Level: **MEDIUM** (reduced from MEDIUM-HIGH)
 
 **Priorities (ordered)**:
-1. Add fsync to FileStore (Critical — data integrity)
+1. ~~Add fsync to FileStore~~ ✅ **DONE**
 2. Authenticate admin endpoints (Critical — security)
-3. Add shard GC on delete (Medium — storage leak)
-4. Fix connection pool contention (Medium — latency under load)
-5. Add Range request support (Medium — S3 compatibility)
-6. Validate manifest ObjectId on load (Medium — integrity)
-7. Fix erasure decoder fast-path duplicate index bug (Medium — correctness)
-8. Extract gossip broadcast helper (Low — code quality)
+3. Fix `unwrap_or_default()` + extract broadcast helper (Major — correctness, code quality)
+4. Fix connection pool contention (Major — latency under load)
+5. Add Range request support (Major — S3 compatibility)
+6. Validate manifest ObjectId on load (Major — integrity)
+7. Add multipart upload memory limits (Major — DoS prevention)
+8. Fix erasure decoder fast-path duplicate index (Major — correctness)
+9. Add shard GC on delete (Minor — storage leak)
 
 ### "If I Fix a Single Thing" — The ONE Issue Before Deployment
 
-**Add `fsync` to `FileStore::put()`.**
+**Authenticate the admin endpoints.**
 
-Without fsync, every shard write is a promise written in pencil. A single power event — and they happen — silently replaces stored data with zeros. The verify-on-read mechanism transforms this from "silent corruption" to "data loss with a good error message," but the data is still gone. In a distributed storage system, acknowledged durability is the bedrock contract. Everything else — erasure coding, repair, replication — assumes the local store actually stores. Fix this first.
+With fsync fixed, the storage layer is now durable. The new biggest risk is that **anyone on the network can create API keys** (`POST /admin/keys`) and gain full read/write access to all buckets. The TODO comment is right there in the code — this just needs `Authorization: Bearer <admin_secret>` middleware on the admin routes. A 15-line change that closes the largest security hole in the system.
