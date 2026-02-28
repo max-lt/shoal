@@ -29,22 +29,42 @@ Shoal is an impressive, well-engineered distributed object storage engine. The c
 
 **Symptom**: After syncing LogTree entries from peers, a node reads stale data (v1) instead of the latest overwrite (v2).
 
-**Root Cause**: Race condition in `sync_log_from_peers` manifest pull logic.
+**Root Cause**: Two interacting bugs — a manifest sync ordering issue and a stale MetaStore fallback.
 
-The sync function iterates over peers in random order. For each peer, it:
+**This is a flaky test** (~50% failure rate depending on random peer ordering).
+
+#### Bug 1: `sync_log_from_peers` only pulls manifests from the peer that provided the entries
+
+The sync function iterates over peers in **random order** (line 1152: `peers.shuffle`). For each peer, it:
 1. Pulls log entries
 2. Applies them
-3. **Only if new entries were applied**, pulls missing manifests **from that same peer**
+3. **Only if new entries were applied**, pulls missing manifests **from that same peer only**
 
 The bug manifests when:
-1. Node 2 syncs from Node 1 first: gets v2 LogTree entry, but Node 1 doesn't have v2's manifest (it only received the LogTree entry via broadcast, not the manifest). Manifest pull returns empty.
-2. Node 2 syncs from Node 0 next: no new entries to apply (already got them from Node 1), so manifest pull is **skipped entirely**.
-3. Result: v2's manifest is never fetched. `lookup_manifest` falls through to MetaStore's stale `(bucket,key) -> v1_object_id` mapping and returns v1's data.
+1. Node 0 writes v1, broadcasts LogTree entry to nodes 1 and 2 (but **not the manifest** — the mock transport calls `receive_entry(&entry, None)`).
+2. Node 2 reads v1 successfully by pulling the manifest from node 0 on demand. Node 2's MetaStore caches `("b","key.txt") -> v1_object_id`.
+3. Node 2 is killed. Node 0 writes v2, broadcasts entry to node 1 (again without manifest).
+4. Node 2 is revived, calls `sync_log_from_peers()`.
+5. **If node 1 is contacted first**: gets v2 entry, tries to pull v2 manifest from node 1 — **node 1 doesn't have it** (only received the entry, not the manifest). Returns empty.
+6. **Node 0 is contacted next**: no new entries (already applied from node 1), `applied = 0`, manifest pull **skipped**.
+7. v2's manifest is never fetched.
 
-**Fix needed in** `crates/shoal-engine/src/node.rs` (`sync_log_from_peers`):
-- Track all missing manifest IDs across the entire sync loop, not per-peer
-- After syncing entries from all peers, do a **second pass** to pull any still-missing manifests from any available peer
-- Or: in `lookup_manifest`, when `object_id_from_dag != object_id_from_meta`, prefer the DAG's ObjectId and attempt a manifest pull rather than returning the stale MetaStore result
+#### Bug 2: `lookup_manifest` returns stale MetaStore result ignoring LogTree resolution
+
+When `get_object` is called after the failed sync:
+1. `log_tree.resolve("b", "key.txt")` correctly returns `v2_object_id`
+2. `log_tree.get_manifest(&v2_object_id)` returns `None` (never stored)
+3. Falls through to MetaStore: `meta.get_object_key("b", "key.txt")` returns **stale** `v1_object_id`
+4. `meta.get_manifest(&v1_object_id)` returns v1's manifest (cached from step 2)
+5. Returns v1's data (50 bytes) instead of v2's data (60 bytes)
+
+The MetaStore fallback at lines 1466-1474 does not check whether `object_id_from_dag` differs from `object_id_from_meta`. It blindly returns whatever MetaStore has.
+
+#### Recommended Fixes
+
+**Fix for Bug 1** (primary): After the per-peer sync loop, do a **second pass** to pull any still-missing manifests from **all available peers**, not just the one that provided the entries.
+
+**Fix for Bug 2** (defense in depth): In `lookup_manifest`, when `object_id_from_dag` is `Some(v2_id)` but the LogTree cache misses, check if `object_id_from_meta` differs. If they differ, skip the stale MetaStore result and attempt a manifest pull using `object_id_from_dag`.
 
 ---
 
