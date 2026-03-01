@@ -28,6 +28,8 @@ fn test_receive_rejects_invalid_hash() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: ObjectId::from([1u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
 
     let mut entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);
@@ -49,6 +51,8 @@ fn test_receive_rejects_invalid_signature() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: ObjectId::from([1u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
 
     let mut entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);
@@ -89,6 +93,8 @@ fn test_receive_duplicate_entry_returns_false() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: oid,
+        total_size: 0,
+        created_at: 0,
     };
 
     let entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);
@@ -111,6 +117,8 @@ fn test_receive_valid_entry_succeeds() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: oid,
+        total_size: 0,
+        created_at: 0,
     };
 
     let entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);

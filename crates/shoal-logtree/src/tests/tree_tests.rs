@@ -38,6 +38,7 @@ fn test_append_put_creates_entry() {
             bucket,
             key,
             manifest_id,
+            ..
         } => {
             assert_eq!(bucket, "b");
             assert_eq!(key, "k");

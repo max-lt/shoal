@@ -357,7 +357,13 @@ impl IntegrationCluster {
             }
             node.meta().put_manifest(&manifest).unwrap();
             node.meta()
-                .put_object_key(bucket, key, &manifest.object_id)
+                .put_object_key(
+                    bucket,
+                    key,
+                    &manifest.object_id,
+                    manifest.total_size,
+                    manifest.created_at,
+                )
                 .unwrap();
         }
     }

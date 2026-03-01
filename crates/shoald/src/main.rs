@@ -649,6 +649,7 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                     bucket,
                                                     key,
                                                     manifest_id,
+                                                    ..
                                                 } => {
                                                     bus_bg.emit(LogEntryApplied {
                                                         hash: entry_bg.hash,
@@ -699,6 +700,8 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                                                 bucket,
                                                                                 key,
                                                                                 &manifest.object_id,
+                                                                                manifest.total_size,
+                                                                                manifest.created_at,
                                                                             );
                                                                         let _ = log_tree_bg
                                                                             .store()

@@ -87,7 +87,13 @@ async fn test_network_partition_and_heal() {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
                 c.node(target)
                     .meta()
-                    .put_object_key("part", &key, &manifest.object_id)
+                    .put_object_key(
+                        "part",
+                        &key,
+                        &manifest.object_id,
+                        manifest.total_size,
+                        manifest.created_at,
+                    )
                     .unwrap();
             }
         }
@@ -165,7 +171,13 @@ async fn test_split_brain_writes_both_sides() {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
                 c.node(target)
                     .meta()
-                    .put_object_key("split", &key, &manifest.object_id)
+                    .put_object_key(
+                        "split",
+                        &key,
+                        &manifest.object_id,
+                        manifest.total_size,
+                        manifest.created_at,
+                    )
                     .unwrap();
             }
         }
@@ -192,7 +204,13 @@ async fn test_split_brain_writes_both_sides() {
                 c.node(target).meta().put_manifest(&manifest).unwrap();
                 c.node(target)
                     .meta()
-                    .put_object_key("split", &key, &manifest.object_id)
+                    .put_object_key(
+                        "split",
+                        &key,
+                        &manifest.object_id,
+                        manifest.total_size,
+                        manifest.created_at,
+                    )
                     .unwrap();
             }
         }

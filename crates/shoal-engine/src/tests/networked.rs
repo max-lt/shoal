@@ -460,7 +460,13 @@ impl TestCluster {
             self.nodes[i].meta().put_manifest(&manifest).unwrap();
             self.nodes[i]
                 .meta()
-                .put_object_key(bucket, key, &manifest.object_id)
+                .put_object_key(
+                    bucket,
+                    key,
+                    &manifest.object_id,
+                    manifest.total_size,
+                    manifest.created_at,
+                )
                 .unwrap();
         }
     }
@@ -521,7 +527,13 @@ async fn simulate_manifest_broadcast(
     target.meta().put_manifest(&manifest).unwrap();
     target
         .meta()
-        .put_object_key(bucket, key, &manifest.object_id)
+        .put_object_key(
+            bucket,
+            key,
+            &manifest.object_id,
+            manifest.total_size,
+            manifest.created_at,
+        )
         .unwrap();
 }
 

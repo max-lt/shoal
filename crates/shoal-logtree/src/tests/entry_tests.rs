@@ -12,6 +12,8 @@ fn test_compute_hash_deterministic() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: ObjectId::from([1u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
     let parents = vec![];
 
@@ -27,6 +29,8 @@ fn test_verify_hash_passes() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: ObjectId::from([1u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
 
     let entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);
@@ -40,6 +44,8 @@ fn test_verify_hash_fails_on_tamper() {
         bucket: "b".into(),
         key: "k".into(),
         manifest_id: ObjectId::from([1u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
 
     let mut entry = LogEntry::new_signed(100, node_id, action, vec![], &signing_key);
@@ -107,6 +113,8 @@ fn test_entry_postcard_roundtrip() {
         bucket: "photos".into(),
         key: "cat.jpg".into(),
         manifest_id: ObjectId::from([42u8; 32]),
+        total_size: 0,
+        created_at: 0,
     };
 
     let entry = LogEntry::new_signed(123456, node_id, action, vec![[7u8; 32]], &signing_key);
@@ -130,6 +138,8 @@ fn test_different_actions_produce_different_hashes() {
             bucket: "b".into(),
             key: "k".into(),
             manifest_id: ObjectId::from([1u8; 32]),
+            total_size: 0,
+            created_at: 0,
         },
         &parents,
     );

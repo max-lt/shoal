@@ -550,7 +550,13 @@ impl ShoalNode {
         // pulls) can serve the manifest immediately — this is required for
         // read-after-write consistency across nodes.
         self.meta.put_manifest(&manifest)?;
-        self.meta.put_object_key(bucket, key, &object_id)?;
+        self.meta.put_object_key(
+            bucket,
+            key,
+            &object_id,
+            manifest.total_size,
+            manifest.created_at,
+        )?;
 
         if let Some(log_tree) = &self.log_tree {
             // LogTree mode: append log entry + broadcast (metadata only).
@@ -946,7 +952,13 @@ impl ShoalNode {
             .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
 
         // Write destination key mapping + replicate.
-        self.meta.put_object_key(dst_bucket, dst_key, &object_id)?;
+        self.meta.put_object_key(
+            dst_bucket,
+            dst_key,
+            &object_id,
+            manifest.total_size,
+            manifest.created_at,
+        )?;
 
         // Increment refcount for all shards referenced by the copied manifest.
         for chunk in &manifest.chunks {
@@ -1384,6 +1396,7 @@ impl ShoalNode {
                                         bucket,
                                         key,
                                         manifest_id,
+                                        ..
                                     } = &entry.action
                                     {
                                         applied_put_entries.push((
@@ -1440,6 +1453,7 @@ impl ShoalNode {
                                                             bucket,
                                                             key,
                                                             manifest_id,
+                                                            ..
                                                         } = &entry.action
                                                             && manifest_id == oid
                                                         {
@@ -1447,6 +1461,8 @@ impl ShoalNode {
                                                                 bucket,
                                                                 key,
                                                                 &manifest.object_id,
+                                                                manifest.total_size,
+                                                                manifest.created_at,
                                                             );
                                                         }
                                                     }
@@ -1561,6 +1577,8 @@ impl ShoalNode {
                                                 bucket,
                                                 key,
                                                 &manifest.object_id,
+                                                manifest.total_size,
+                                                manifest.created_at,
                                             );
                                         }
                                     }
@@ -1771,7 +1789,13 @@ impl ShoalNode {
                                 );
                                 // Cache locally.
                                 let _ = self.meta.put_manifest(&manifest);
-                                let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+                                let _ = self.meta.put_object_key(
+                                    bucket,
+                                    key,
+                                    &manifest.object_id,
+                                    manifest.total_size,
+                                    manifest.created_at,
+                                );
 
                                 if let Some(log_tree) = &self.log_tree {
                                     let _ = log_tree.store().put_manifest(&manifest);
@@ -1819,7 +1843,13 @@ impl ShoalNode {
             {
                 // Cache locally.
                 let _ = self.meta.put_manifest(&manifest);
-                let _ = self.meta.put_object_key(bucket, key, &manifest.object_id);
+                let _ = self.meta.put_object_key(
+                    bucket,
+                    key,
+                    &manifest.object_id,
+                    manifest.total_size,
+                    manifest.created_at,
+                );
 
                 if let Some(log_tree) = &self.log_tree {
                     let _ = log_tree.store().put_manifest(&manifest);

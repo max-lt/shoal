@@ -253,6 +253,7 @@ fn handle_log_entry_broadcast(
                                             bucket,
                                             key,
                                             manifest_id,
+                                            ..
                                         } = &entry.action
                                             && manifest_id == oid
                                         {
@@ -260,6 +261,8 @@ fn handle_log_entry_broadcast(
                                                 bucket,
                                                 key,
                                                 &manifest.object_id,
+                                                manifest.total_size,
+                                                manifest.created_at,
                                             );
                                         }
                                     }

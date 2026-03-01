@@ -172,8 +172,14 @@ impl TestCluster {
             metadata: std::collections::BTreeMap::new(),
         };
         meta.put_manifest(&manifest).unwrap();
-        meta.put_object_key("__all__", "test-object", &manifest.object_id)
-            .unwrap();
+        meta.put_object_key(
+            "__all__",
+            "test-object",
+            &manifest.object_id,
+            manifest.total_size,
+            manifest.created_at,
+        )
+        .unwrap();
 
         Self {
             cluster,

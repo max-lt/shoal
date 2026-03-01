@@ -96,8 +96,14 @@ async fn write_object(
     .unwrap();
 
     meta.put_manifest(&manifest).unwrap();
-    meta.put_object_key(bucket, key, &manifest.object_id)
-        .unwrap();
+    meta.put_object_key(
+        bucket,
+        key,
+        &manifest.object_id,
+        manifest.total_size,
+        manifest.created_at,
+    )
+    .unwrap();
 }
 
 /// Read path: lookup manifest → fetch shards → erasure decode → concatenate.

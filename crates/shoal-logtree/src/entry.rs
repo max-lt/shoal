@@ -40,6 +40,10 @@ pub enum Action {
         key: String,
         /// ObjectId of the manifest.
         manifest_id: ObjectId,
+        /// Total object size in bytes.
+        total_size: u64,
+        /// Creation timestamp (unix seconds).
+        created_at: u64,
     },
     /// Delete an object.
     Delete {
@@ -110,6 +114,10 @@ pub struct Version {
     pub deleted: bool,
     /// NodeId of the author, used as tiebreak when HLCs match.
     pub node_id: NodeId,
+    /// Total object size in bytes.
+    pub total_size: u64,
+    /// Creation timestamp (unix seconds).
+    pub created_at: u64,
 }
 
 /// Hashable content of a [`LogEntry`] (excludes `hash` and `signature`).

@@ -40,6 +40,8 @@ fn make_entry(
         bucket: bucket.to_string(),
         key: obj_key.to_string(),
         manifest_id: oid,
+        total_size: 0,
+        created_at: 0,
     };
     LogEntry::new_signed(hlc, node_id, action, parents, key)
 }

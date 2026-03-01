@@ -45,8 +45,8 @@ enum Backend {
 
 /// Pure in-memory storage for zero disk I/O mode.
 struct MemoryBackend {
-    /// `bucket/key` → ObjectId bytes.
-    objects: RwLock<BTreeMap<String, [u8; 32]>>,
+    /// `bucket/key` → ObjectId (32) + total_size (8) + created_at (8).
+    objects: RwLock<BTreeMap<String, Vec<u8>>>,
     /// ObjectId bytes → serialized Manifest.
     manifests: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// ShardId bytes → serialized Vec<NodeId>.
@@ -173,22 +173,57 @@ impl MetaStore {
 
     // ----- Object key mapping (local cache) -----
 
-    /// Map a `bucket/key` pair to an [`ObjectId`].
-    ///
-    /// Also registers the bucket if it doesn't already exist.
-    pub fn put_object_key(&self, bucket: &str, key: &str, id: &ObjectId) -> Result<()> {
+    /// Encode an object value: ObjectId (32) + total_size LE (8) + created_at LE (8).
+    fn encode_object_value(id: &ObjectId, total_size: u64, created_at: u64) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(48);
+        buf.extend_from_slice(id.as_bytes());
+        buf.extend_from_slice(&total_size.to_le_bytes());
+        buf.extend_from_slice(&created_at.to_le_bytes());
+        buf
+    }
+
+    /// Decode an object value. Handles both 32-byte (legacy) and 48-byte formats.
+    fn decode_object_value(bytes: &[u8]) -> std::result::Result<(ObjectId, u64, u64), MetaError> {
+        if bytes.len() < 32 {
+            return Err(MetaError::CorruptData(format!(
+                "object value too short: {} bytes",
+                bytes.len()
+            )));
+        }
+
+        let arr: [u8; 32] = bytes[..32].try_into().unwrap();
+        let object_id = ObjectId::from(arr);
+
+        if bytes.len() >= 48 {
+            let total_size = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+            let created_at = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+            Ok((object_id, total_size, created_at))
+        } else {
+            Ok((object_id, 0, 0))
+        }
+    }
+
+    /// Map a `bucket/key` pair to an [`ObjectId`] with size and timestamp.
+    pub fn put_object_key(
+        &self,
+        bucket: &str,
+        key: &str,
+        id: &ObjectId,
+        total_size: u64,
+        created_at: u64,
+    ) -> Result<()> {
         let storage_key = object_storage_key(bucket, key);
+        let value = Self::encode_object_value(id, total_size, created_at);
+
         match &self.backend {
             Backend::Fjall { objects, .. } => {
-                objects.insert(storage_key.as_bytes(), id.as_bytes())?;
+                objects.insert(storage_key.as_bytes(), &value)?;
             }
             Backend::Memory(m) => {
-                m.objects
-                    .write()
-                    .unwrap()
-                    .insert(storage_key, *id.as_bytes());
+                m.objects.write().unwrap().insert(storage_key, value);
             }
         }
+
         debug!(bucket, key, object_id = %id, "stored object key mapping");
         Ok(())
     }
@@ -199,28 +234,25 @@ impl MetaStore {
         match &self.backend {
             Backend::Fjall { objects, .. } => match objects.get(storage_key.as_bytes())? {
                 Some(bytes) => {
-                    let arr: [u8; 32] = bytes[..32].try_into().map_err(|_| {
-                        MetaError::CorruptData(format!(
-                            "ObjectId expected 32 bytes, got {}",
-                            bytes.len()
-                        ))
-                    })?;
-                    Ok(Some(ObjectId::from(arr)))
+                    let (id, _, _) = Self::decode_object_value(&bytes)?;
+                    Ok(Some(id))
                 }
                 None => Ok(None),
             },
-            Backend::Memory(m) => Ok(m
-                .objects
-                .read()
-                .unwrap()
-                .get(&storage_key)
-                .map(|arr| ObjectId::from(*arr))),
+            Backend::Memory(m) => match m.objects.read().unwrap().get(&storage_key) {
+                Some(bytes) => {
+                    let (id, _, _) = Self::decode_object_value(bytes)?;
+                    Ok(Some(id))
+                }
+                None => Ok(None),
+            },
         }
     }
 
     /// List all object keys in a bucket that start with the given prefix.
     ///
-    /// Returns [`ObjectInfo`] with size, last_modified, etag resolved from manifests.
+    /// Returns [`ObjectInfo`] with size, last_modified, etag read directly
+    /// from the objects keyspace (no manifest lookup needed).
     pub fn list_objects(&self, bucket: &str, prefix: &str) -> Result<Vec<ObjectInfo>> {
         let scan_prefix = if prefix.is_empty() {
             format!("{bucket}/")
@@ -229,11 +261,10 @@ impl MetaStore {
         };
         let bucket_prefix = format!("{bucket}/");
 
-        // Phase 1: collect (key, ObjectId) pairs.
-        let pairs: Vec<(String, ObjectId)> = match &self.backend {
-            Backend::Fjall { objects, .. } => {
-                let mut out = Vec::new();
+        let mut result = Vec::new();
 
+        match &self.backend {
+            Backend::Fjall { objects, .. } => {
                 for guard in objects.prefix(scan_prefix.as_bytes()) {
                     let (k, v) = guard.into_inner()?;
                     let full_key = std::str::from_utf8(&k).map_err(|e| {
@@ -241,23 +272,22 @@ impl MetaStore {
                     })?;
 
                     if let Some(stripped) = full_key.strip_prefix(&bucket_prefix) {
-                        let arr: [u8; 32] = v[..32].try_into().map_err(|_| {
-                            MetaError::CorruptData(format!(
-                                "ObjectId expected 32 bytes, got {}",
-                                v.len()
-                            ))
-                        })?;
-                        out.push((stripped.to_string(), ObjectId::from(arr)));
+                        let (object_id, size, last_modified) = Self::decode_object_value(&v)?;
+
+                        result.push(ObjectInfo {
+                            key: stripped.to_string(),
+                            size,
+                            last_modified,
+                            etag: object_id.to_string(),
+                            object_id,
+                        });
                     }
                 }
-
-                out
             }
             Backend::Memory(m) => {
                 let map = m.objects.read().unwrap();
-                let mut out = Vec::new();
 
-                for (full_key, arr) in map.range(scan_prefix.clone()..) {
+                for (full_key, value) in map.range(scan_prefix.clone()..) {
                     let k = full_key.as_str();
 
                     if !k.starts_with(&scan_prefix) {
@@ -265,30 +295,18 @@ impl MetaStore {
                     }
 
                     if let Some(stripped) = k.strip_prefix(&bucket_prefix) {
-                        out.push((stripped.to_string(), ObjectId::from(*arr)));
+                        let (object_id, size, last_modified) = Self::decode_object_value(value)?;
+
+                        result.push(ObjectInfo {
+                            key: stripped.to_string(),
+                            size,
+                            last_modified,
+                            etag: object_id.to_string(),
+                            object_id,
+                        });
                     }
                 }
-
-                out
             }
-        };
-
-        // Phase 2: resolve manifests for metadata.
-        let mut result = Vec::with_capacity(pairs.len());
-
-        for (key, object_id) in pairs {
-            let (size, last_modified) = self
-                .get_manifest(&object_id)?
-                .map(|m| (m.total_size, m.created_at))
-                .unwrap_or((0, 0));
-
-            result.push(ObjectInfo {
-                key,
-                size,
-                last_modified,
-                etag: object_id.to_string(),
-                object_id,
-            });
         }
 
         Ok(result)
@@ -323,14 +341,9 @@ impl MetaStore {
                     let full_key = std::str::from_utf8(&k).map_err(|e| {
                         MetaError::CorruptData(format!("object key is not valid UTF-8: {e}"))
                     })?;
-                    let arr: [u8; 32] = v[..32].try_into().map_err(|_| {
-                        MetaError::CorruptData(format!(
-                            "ObjectId expected 32 bytes, got {}",
-                            v.len()
-                        ))
-                    })?;
+                    let (id, _, _) = Self::decode_object_value(&v)?;
                     if let Some((bucket, key)) = full_key.split_once('/') {
-                        entries.push((bucket.to_string(), key.to_string(), ObjectId::from(arr)));
+                        entries.push((bucket.to_string(), key.to_string(), id));
                     }
                 }
                 Ok(entries)
@@ -338,9 +351,10 @@ impl MetaStore {
             Backend::Memory(m) => {
                 let map = m.objects.read().unwrap();
                 let mut entries = Vec::new();
-                for (full_key, arr) in map.iter() {
+                for (full_key, value) in map.iter() {
+                    let (id, _, _) = Self::decode_object_value(value)?;
                     if let Some((bucket, key)) = full_key.split_once('/') {
-                        entries.push((bucket.to_string(), key.to_string(), ObjectId::from(*arr)));
+                        entries.push((bucket.to_string(), key.to_string(), id));
                     }
                 }
                 Ok(entries)
@@ -1042,7 +1056,7 @@ mod tests {
         with_both_backends(|store| {
             let id = ObjectId::from_data(b"my object");
             store
-                .put_object_key("mybucket", "photos/cat.jpg", &id)
+                .put_object_key("mybucket", "photos/cat.jpg", &id, 0, 0)
                 .unwrap();
             let retrieved = store.get_object_key("mybucket", "photos/cat.jpg").unwrap();
             assert_eq!(retrieved, Some(id));
@@ -1061,7 +1075,7 @@ mod tests {
     fn test_object_key_delete() {
         with_both_backends(|store| {
             let id = ObjectId::from_data(b"deleteme");
-            store.put_object_key("bucket", "key", &id).unwrap();
+            store.put_object_key("bucket", "key", &id, 0, 0).unwrap();
             assert!(store.get_object_key("bucket", "key").unwrap().is_some());
             store.delete_object_key("bucket", "key").unwrap();
             assert!(store.get_object_key("bucket", "key").unwrap().is_none());
@@ -1075,9 +1089,9 @@ mod tests {
             let id2 = ObjectId::from_data(b"obj2");
             let id3 = ObjectId::from_data(b"obj3");
 
-            store.put_object_key("bucket", "a.txt", &id1).unwrap();
-            store.put_object_key("bucket", "b.txt", &id2).unwrap();
-            store.put_object_key("bucket", "c.txt", &id3).unwrap();
+            store.put_object_key("bucket", "a.txt", &id1, 0, 0).unwrap();
+            store.put_object_key("bucket", "b.txt", &id2, 0, 0).unwrap();
+            store.put_object_key("bucket", "c.txt", &id3, 0, 0).unwrap();
 
             let mut keys: Vec<String> = store
                 .list_objects("bucket", "")
@@ -1098,12 +1112,14 @@ mod tests {
             let id3 = ObjectId::from_data(b"obj3");
 
             store
-                .put_object_key("bucket", "photos/a.jpg", &id1)
+                .put_object_key("bucket", "photos/a.jpg", &id1, 0, 0)
                 .unwrap();
             store
-                .put_object_key("bucket", "photos/b.jpg", &id2)
+                .put_object_key("bucket", "photos/b.jpg", &id2, 0, 0)
                 .unwrap();
-            store.put_object_key("bucket", "docs/c.pdf", &id3).unwrap();
+            store
+                .put_object_key("bucket", "docs/c.pdf", &id3, 0, 0)
+                .unwrap();
 
             let mut keys: Vec<String> = store
                 .list_objects("bucket", "photos/")
@@ -1136,8 +1152,12 @@ mod tests {
     fn test_list_objects_no_cross_bucket_leakage() {
         with_both_backends(|store| {
             let id = ObjectId::from_data(b"obj");
-            store.put_object_key("bucket1", "file.txt", &id).unwrap();
-            store.put_object_key("bucket2", "file.txt", &id).unwrap();
+            store
+                .put_object_key("bucket1", "file.txt", &id, 0, 0)
+                .unwrap();
+            store
+                .put_object_key("bucket2", "file.txt", &id, 0, 0)
+                .unwrap();
 
             let keys1: Vec<String> = store
                 .list_objects("bucket1", "")
@@ -1297,7 +1317,13 @@ mod tests {
             let manifest = test_manifest();
             store.put_manifest(&manifest).unwrap();
             store
-                .put_object_key("bucket", "key", &manifest.object_id)
+                .put_object_key(
+                    "bucket",
+                    "key",
+                    &manifest.object_id,
+                    manifest.total_size,
+                    manifest.created_at,
+                )
                 .unwrap();
             store.put_member(&test_member(b"node-1")).unwrap();
             store
@@ -1370,7 +1396,7 @@ mod tests {
                 handles.push(std::thread::spawn(move || {
                     let key = format!("key-{i}");
                     let id = ObjectId::from_data(key.as_bytes());
-                    s.put_object_key("bucket", &key, &id).unwrap();
+                    s.put_object_key("bucket", &key, &id, 0, 0).unwrap();
                     let got = s.get_object_key("bucket", &key).unwrap();
                     assert_eq!(got, Some(id));
                 }));
@@ -1446,10 +1472,10 @@ mod tests {
             let id1 = ObjectId::from_data(b"first");
             let id2 = ObjectId::from_data(b"second");
 
-            store.put_object_key("b", "k", &id1).unwrap();
+            store.put_object_key("b", "k", &id1, 0, 0).unwrap();
             assert_eq!(store.get_object_key("b", "k").unwrap(), Some(id1));
 
-            store.put_object_key("b", "k", &id2).unwrap();
+            store.put_object_key("b", "k", &id2, 0, 0).unwrap();
             assert_eq!(store.get_object_key("b", "k").unwrap(), Some(id2));
         });
     }
@@ -1551,7 +1577,7 @@ mod tests {
             for i in 0..count {
                 let key = format!("key-{i:04}");
                 let id = ObjectId::from_data(key.as_bytes());
-                store.put_object_key("bucket", &key, &id).unwrap();
+                store.put_object_key("bucket", &key, &id, 0, 0).unwrap();
             }
 
             let keys = store.list_objects("bucket", "").unwrap();
@@ -1604,10 +1630,10 @@ mod tests {
             let id = ObjectId::from_data(b"x");
 
             // "a" and "ab" should not match prefix "a/" (note trailing slash).
-            store.put_object_key("b", "a", &id).unwrap();
-            store.put_object_key("b", "ab", &id).unwrap();
-            store.put_object_key("b", "a/x", &id).unwrap();
-            store.put_object_key("b", "a/y", &id).unwrap();
+            store.put_object_key("b", "a", &id, 0, 0).unwrap();
+            store.put_object_key("b", "ab", &id, 0, 0).unwrap();
+            store.put_object_key("b", "a/x", &id, 0, 0).unwrap();
+            store.put_object_key("b", "a/y", &id, 0, 0).unwrap();
 
             let result: Vec<String> = store
                 .list_objects("b", "a/")

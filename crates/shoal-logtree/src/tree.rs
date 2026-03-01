@@ -55,6 +55,8 @@ impl LogTree {
             bucket: bucket.to_string(),
             key: key.to_string(),
             manifest_id,
+            total_size: manifest.total_size,
+            created_at: manifest.created_at,
         };
 
         let entry = self.append(action)?;
@@ -336,19 +338,12 @@ impl LogTree {
                 && let Some(latest) = versions.first()
                 && !latest.deleted
             {
-                let object_id = latest.manifest_id;
-                let (size, last_modified) = self
-                    .store
-                    .get_manifest(&object_id)?
-                    .map(|m| (m.total_size, m.created_at))
-                    .unwrap_or((0, 0));
-
                 result.push(ObjectInfo {
                     key,
-                    size,
-                    last_modified,
-                    etag: object_id.to_string(),
-                    object_id,
+                    size: latest.total_size,
+                    last_modified: latest.created_at,
+                    etag: latest.manifest_id.to_string(),
+                    object_id: latest.manifest_id,
                 });
             }
         }
@@ -718,12 +713,16 @@ impl LogTree {
                 bucket,
                 key,
                 manifest_id,
+                total_size,
+                created_at,
             } => {
                 let version = Version {
                     hlc: entry.hlc,
                     manifest_id: *manifest_id,
                     deleted: false,
                     node_id: entry.node_id,
+                    total_size: *total_size,
+                    created_at: *created_at,
                 };
                 self.insert_version(bucket, key, version)?;
             }
@@ -733,6 +732,8 @@ impl LogTree {
                     manifest_id: ObjectId::from([0u8; 32]),
                     deleted: true,
                     node_id: entry.node_id,
+                    total_size: 0,
+                    created_at: 0,
                 };
                 self.insert_version(bucket, key, version)?;
             }
