@@ -162,12 +162,10 @@ async fn test_shard_deletion_rs_reconstruction() {
     // For each chunk, identify the parity shards (index >= k) and delete them
     // from all stores.
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            if shard_meta.index >= 2 {
-                // Parity shard — delete from all nodes.
-                for node_idx in 0..5 {
-                    let _ = c.node(node_idx).store().delete(shard_meta.shard_id).await;
-                }
+        // Parity shards have index >= k (position in Vec).
+        for shard_id in &chunk_meta.shards[2..] {
+            for node_idx in 0..5 {
+                let _ = c.node(node_idx).store().delete(*shard_id).await;
             }
         }
     }
@@ -181,12 +179,10 @@ async fn test_shard_deletion_rs_reconstruction() {
     // across replication... actually we need to be careful. With replication=2,
     // each shard is on 2 nodes. Let's delete shard index 0 from ALL nodes.
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            if shard_meta.index == 0 {
-                for node_idx in 0..5 {
-                    let _ = c.node(node_idx).store().delete(shard_meta.shard_id).await;
-                }
-            }
+        // Delete shard index 0 from all nodes.
+        let shard_id = chunk_meta.shards[0];
+        for node_idx in 0..5 {
+            let _ = c.node(node_idx).store().delete(shard_id).await;
         }
     }
 

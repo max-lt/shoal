@@ -656,15 +656,12 @@ async fn test_writer_stores_shard_owners_in_meta() {
 
     let manifest = node_a.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            let owners = node_a
-                .meta()
-                .get_shard_owners(&shard_meta.shard_id)
-                .unwrap();
+        for shard_id in &chunk_meta.shards {
+            let owners = node_a.meta().get_shard_owners(shard_id).unwrap();
             assert!(
                 owners.is_some(),
                 "writer should store shard owners for {}",
-                shard_meta.shard_id
+                shard_id
             );
         }
     }
@@ -684,15 +681,12 @@ async fn test_manifest_broadcast_does_not_store_shard_owners() {
 
     let manifest = node_b.head_object("b", "k").await.unwrap();
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            let owners = node_b
-                .meta()
-                .get_shard_owners(&shard_meta.shard_id)
-                .unwrap();
+        for shard_id in &chunk_meta.shards {
+            let owners = node_b.meta().get_shard_owners(shard_id).unwrap();
             assert!(
                 owners.is_none(),
                 "broadcast receiver should NOT have shard owners for {}",
-                shard_meta.shard_id
+                shard_id
             );
         }
     }

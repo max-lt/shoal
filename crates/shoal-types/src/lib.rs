@@ -2,7 +2,7 @@
 //!
 //! This crate defines all core types used across the Shoal workspace:
 //! identifiers ([`ShardId`], [`ChunkId`], [`ObjectId`], [`NodeId`]),
-//! data structures ([`Manifest`], [`ChunkMeta`], [`ShardMeta`]),
+//! data structures ([`Manifest`], [`ChunkMeta`]),
 //! cluster types ([`Member`], [`MemberState`], [`ClusterEvent`]),
 //! and configuration ([`NodeConfig`], [`ErasureConfig`], [`StorageBackend`]).
 
@@ -118,6 +118,30 @@ pub struct ObjectInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle configuration
+// ---------------------------------------------------------------------------
+
+/// Bucket lifecycle configuration for object expiration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleConfiguration {
+    /// Lifecycle rules for the bucket.
+    pub rules: Vec<LifecycleRule>,
+}
+
+/// A single lifecycle rule controlling object expiration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleRule {
+    /// Rule identifier.
+    pub id: String,
+    /// Key prefix filter (empty string matches all objects).
+    pub prefix: String,
+    /// Whether the rule is active.
+    pub enabled: bool,
+    /// Number of days after creation before objects expire.
+    pub expiration_days: Option<u32>,
+}
+
+// ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------
 
@@ -172,19 +196,8 @@ pub struct ChunkMeta {
     pub stored_length: u32,
     /// Compression algorithm applied to this chunk before erasure coding.
     pub compression: Compression,
-    /// Reed-Solomon shards produced from the (possibly compressed) chunk data.
-    pub shards: Vec<ShardMeta>,
-}
-
-/// Metadata for a single erasure-coded shard.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShardMeta {
-    /// Content-addressed identifier for this shard.
-    pub shard_id: ShardId,
-    /// Position in the Reed-Solomon coding (0..k+m).
-    pub index: u8,
-    /// Size of this shard in bytes.
-    pub size: u32,
+    /// Reed-Solomon shard IDs (position in Vec = RS index 0..k+m).
+    pub shards: Vec<ShardId>,
 }
 
 // ---------------------------------------------------------------------------
@@ -665,16 +678,8 @@ mod tests {
                 stored_length: 1024,
                 compression: Compression::None,
                 shards: vec![
-                    ShardMeta {
-                        shard_id: ShardId::from_data(b"shard 0-0"),
-                        index: 0,
-                        size: 512,
-                    },
-                    ShardMeta {
-                        shard_id: ShardId::from_data(b"shard 0-1"),
-                        index: 1,
-                        size: 512,
-                    },
+                    ShardId::from_data(b"shard 0-0"),
+                    ShardId::from_data(b"shard 0-1"),
                 ],
             }],
             created_at: 1700000000,
@@ -705,15 +710,21 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_meta_roundtrip_postcard() {
-        let shard = ShardMeta {
-            shard_id: ShardId::from_data(b"shard"),
-            index: 3,
-            size: 512,
+    fn test_shard_id_roundtrip_in_chunk() {
+        let chunk = ChunkMeta {
+            chunk_id: ChunkId::from_data(b"chunk"),
+            offset: 0,
+            raw_length: 1024,
+            stored_length: 1024,
+            compression: Compression::None,
+            shards: vec![
+                ShardId::from_data(b"shard-0"),
+                ShardId::from_data(b"shard-1"),
+            ],
         };
-        let encoded = postcard::to_allocvec(&shard).unwrap();
-        let decoded: ShardMeta = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(shard, decoded);
+        let encoded = postcard::to_allocvec(&chunk).unwrap();
+        let decoded: ChunkMeta = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(chunk, decoded);
     }
 
     #[test]

@@ -175,13 +175,7 @@ async fn test_writer_stores_all_shards_locally_without_transport() {
     let mut local_count = 0;
     for chunk in &manifest.chunks {
         for shard in &chunk.shards {
-            if nodes[0]
-                .store()
-                .get(shard.shard_id)
-                .await
-                .unwrap()
-                .is_some()
-            {
+            if nodes[0].store().get(*shard).await.unwrap().is_some() {
                 local_count += 1;
             }
         }

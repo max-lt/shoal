@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use shoal_types::{BucketInfo, ObjectInfo};
+use shoal_types::{BucketInfo, LifecycleConfiguration, LifecycleRule, ObjectInfo};
 
 const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -447,6 +447,208 @@ pub(crate) fn list_parts(
             .collect(),
     })
     .expect("ListPartsResult contains only safe strings")
+}
+
+// -----------------------------------------------------------------------
+// LifecycleConfiguration (GetBucketLifecycle / PutBucketLifecycle)
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename = "LifecycleConfiguration")]
+struct LifecycleConfigurationXml {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Rule", default)]
+    rule: Vec<LifecycleRuleXml>,
+}
+
+#[derive(Serialize)]
+struct LifecycleRuleXml {
+    #[serde(rename = "ID")]
+    id: String,
+    #[serde(rename = "Filter")]
+    filter: LifecycleFilterXml,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Expiration", skip_serializing_if = "Option::is_none")]
+    expiration: Option<ExpirationXml>,
+}
+
+#[derive(Serialize)]
+struct LifecycleFilterXml {
+    #[serde(rename = "Prefix")]
+    prefix: String,
+}
+
+#[derive(Serialize)]
+struct ExpirationXml {
+    #[serde(rename = "Days")]
+    days: u32,
+}
+
+pub(crate) fn lifecycle_configuration_xml(config: &LifecycleConfiguration) -> String {
+    quick_xml::se::to_string(&LifecycleConfigurationXml {
+        xmlns: S3_XMLNS,
+        rule: config
+            .rules
+            .iter()
+            .map(|r| LifecycleRuleXml {
+                id: r.id.clone(),
+                filter: LifecycleFilterXml {
+                    prefix: r.prefix.clone(),
+                },
+                status: if r.enabled {
+                    "Enabled".to_string()
+                } else {
+                    "Disabled".to_string()
+                },
+                expiration: r.expiration_days.map(|days| ExpirationXml { days }),
+            })
+            .collect(),
+    })
+    .expect("LifecycleConfigurationXml contains only safe strings")
+}
+
+#[derive(Deserialize)]
+#[serde(rename = "LifecycleConfiguration")]
+struct LifecycleConfigurationRequest {
+    #[serde(rename = "Rule", default)]
+    rule: Vec<LifecycleRuleRequest>,
+}
+
+#[derive(Deserialize)]
+struct LifecycleRuleRequest {
+    #[serde(rename = "ID", default)]
+    id: String,
+    #[serde(rename = "Filter", default)]
+    filter: Option<LifecycleFilterRequest>,
+    #[serde(rename = "Prefix", default)]
+    prefix: Option<String>,
+    #[serde(rename = "Status")]
+    status: String,
+    #[serde(rename = "Expiration", default)]
+    expiration: Option<ExpirationRequest>,
+    #[serde(rename = "Transition", default)]
+    _transition: Option<serde::de::IgnoredAny>,
+}
+
+#[derive(Deserialize)]
+struct LifecycleFilterRequest {
+    #[serde(rename = "Prefix", default)]
+    prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ExpirationRequest {
+    #[serde(rename = "Days", default)]
+    days: Option<u32>,
+}
+
+/// Parse a `PutBucketLifecycle` XML request body into internal representation.
+pub(crate) fn parse_lifecycle_request(body: &str) -> Option<LifecycleConfiguration> {
+    let req = quick_xml::de::from_str::<LifecycleConfigurationRequest>(body).ok()?;
+
+    let rules = req
+        .rule
+        .into_iter()
+        .map(|r| {
+            let prefix = r
+                .filter
+                .and_then(|f| f.prefix)
+                .or(r.prefix)
+                .unwrap_or_default();
+
+            LifecycleRule {
+                id: r.id,
+                prefix,
+                enabled: r.status.eq_ignore_ascii_case("enabled"),
+                expiration_days: r.expiration.and_then(|e| e.days),
+            }
+        })
+        .collect();
+
+    Some(LifecycleConfiguration { rules })
+}
+
+// -----------------------------------------------------------------------
+// DeleteObjects (POST /{bucket}?delete)
+// -----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(rename = "Delete")]
+struct DeleteRequest {
+    #[serde(rename = "Quiet", default)]
+    quiet: Option<bool>,
+    #[serde(rename = "Object", default)]
+    object: Vec<DeleteObjectRequest>,
+}
+
+#[derive(Deserialize)]
+struct DeleteObjectRequest {
+    #[serde(rename = "Key")]
+    key: String,
+}
+
+/// Parse a `DeleteObjects` XML request body into a list of keys and quiet flag.
+pub(crate) fn parse_delete_request(body: &str) -> Option<(Vec<String>, bool)> {
+    let req = quick_xml::de::from_str::<DeleteRequest>(body).ok()?;
+    let quiet = req.quiet.unwrap_or(false);
+    let keys = req.object.into_iter().map(|o| o.key).collect();
+    Some((keys, quiet))
+}
+
+#[derive(Serialize)]
+#[serde(rename = "DeleteResult")]
+struct DeleteResultXml {
+    #[serde(rename = "@xmlns")]
+    xmlns: &'static str,
+    #[serde(rename = "Deleted", default, skip_serializing_if = "Vec::is_empty")]
+    deleted: Vec<DeletedXml>,
+    #[serde(rename = "Error", default, skip_serializing_if = "Vec::is_empty")]
+    error: Vec<DeleteErrorXml>,
+}
+
+#[derive(Serialize)]
+struct DeletedXml {
+    #[serde(rename = "Key")]
+    key: String,
+}
+
+#[derive(Serialize)]
+struct DeleteErrorXml {
+    #[serde(rename = "Key")]
+    key: String,
+    #[serde(rename = "Code")]
+    code: String,
+    #[serde(rename = "Message")]
+    message: String,
+}
+
+pub(crate) fn delete_result_xml(
+    deleted: &[String],
+    errors: &[(String, String, String)], // (key, code, message)
+    quiet: bool,
+) -> String {
+    quick_xml::se::to_string(&DeleteResultXml {
+        xmlns: S3_XMLNS,
+        deleted: if quiet {
+            Vec::new()
+        } else {
+            deleted
+                .iter()
+                .map(|k| DeletedXml { key: k.clone() })
+                .collect()
+        },
+        error: errors
+            .iter()
+            .map(|(k, c, m)| DeleteErrorXml {
+                key: k.clone(),
+                code: c.clone(),
+                message: m.clone(),
+            })
+            .collect(),
+    })
+    .expect("DeleteResult contains only safe strings")
 }
 
 /// Parse part numbers from a `CompleteMultipartUpload` XML request body.

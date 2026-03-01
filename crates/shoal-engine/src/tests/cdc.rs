@@ -40,12 +40,12 @@ async fn test_cdc_dedup_inter_version() {
     let shard_ids_v1: HashSet<_> = m1
         .chunks
         .iter()
-        .flat_map(|c| c.shards.iter().map(|s| s.shard_id))
+        .flat_map(|c| c.shards.iter().copied())
         .collect();
     let shard_ids_v2: HashSet<_> = m2
         .chunks
         .iter()
-        .flat_map(|c| c.shards.iter().map(|s| s.shard_id))
+        .flat_map(|c| c.shards.iter().copied())
         .collect();
 
     let shared = shard_ids_v1.intersection(&shard_ids_v2).count();
@@ -252,9 +252,7 @@ async fn test_cdc_deterministic() {
         assert_eq!(c1.raw_length, c2.raw_length);
         assert_eq!(c1.stored_length, c2.stored_length);
         assert_eq!(c1.compression, c2.compression);
-        for (s1, s2) in c1.shards.iter().zip(c2.shards.iter()) {
-            assert_eq!(s1.shard_id, s2.shard_id);
-        }
+        assert_eq!(c1.shards, c2.shards);
     }
 }
 

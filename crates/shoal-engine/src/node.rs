@@ -395,7 +395,7 @@ impl ShoalNode {
 
             let (shards, _original_size) = self.encoder.encode(&encode_input)?;
 
-            let mut shard_metas = Vec::with_capacity(shards.len());
+            let mut shard_ids = Vec::with_capacity(shards.len());
 
             for shard in &shards {
                 // Determine owners via placement ring.
@@ -413,6 +413,9 @@ impl ShoalNode {
                 self.store.put(shard.id, shard.data.clone()).await?;
 
                 if already_exists {
+                    // Shard already on disk (content-addressed dedup).
+                    // Increment refcount since a new manifest references it.
+                    let _ = self.store.increment_refcount(shard.id).await;
                     local_existing += 1;
                     debug!(
                         shard = %shard.id,
@@ -466,11 +469,7 @@ impl ShoalNode {
                 // Record shard owners in metadata.
                 self.meta.put_shard_owners(&shard.id, &owners)?;
 
-                shard_metas.push(ShardMeta {
-                    shard_id: shard.id,
-                    index: shard.index,
-                    size: shard.data.len() as u32,
-                });
+                shard_ids.push(shard.id);
             }
 
             chunk_metas.push(ChunkMeta {
@@ -479,7 +478,7 @@ impl ShoalNode {
                 raw_length,
                 stored_length,
                 compression,
-                shards: shard_metas,
+                shards: shard_ids,
             });
         }
 
@@ -539,6 +538,14 @@ impl ShoalNode {
 
         // Step 4: persist manifest and key mapping, then broadcast.
         //
+        // Check for an existing key mapping before overwriting — if the key
+        // already exists, we need to decrement refcounts on the old manifest's
+        // shards after writing the new one.
+        let old_manifest = self
+            .meta
+            .get_object_key(bucket, key)?
+            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+
         // Always write to MetaStore so that ManifestRequest handlers (peer
         // pulls) can serve the manifest immediately — this is required for
         // read-after-write consistency across nodes.
@@ -577,6 +584,18 @@ impl ShoalNode {
         });
 
         tracing::Span::current().record("object_id", tracing::field::display(&object_id));
+
+        // If overwriting an existing key, decrement refcounts on the old
+        // manifest's shards. Shards that reach refcount 0 are deleted.
+        if let Some(old) = old_manifest {
+            for chunk in &old.chunks {
+                for shard_id in &chunk.shards {
+                    if let Ok(0) = self.store.decrement_refcount(*shard_id).await {
+                        let _ = self.store.delete(*shard_id).await;
+                    }
+                }
+            }
+        }
 
         info!(
             bucket, key, %object_id,
@@ -627,20 +646,23 @@ impl ShoalNode {
         for (ci, chunk_meta) in manifest.chunks.iter().enumerate() {
             let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
 
-            for shard_meta in &chunk_meta.shards {
+            for (shard_idx, shard_id) in chunk_meta.shards.iter().enumerate() {
                 if collected.len() >= self.erasure_k {
                     break;
                 }
+
                 // Try local store first (owned shards).
-                if let Some(data) = self.store.get(shard_meta.shard_id).await? {
-                    collected.push((shard_meta.index, data.to_vec()));
+                if let Some(data) = self.store.get(*shard_id).await? {
+                    collected.push((shard_idx as u8, data.to_vec()));
                     continue;
                 }
+
                 // Try read-through cache (non-owned, previously pulled shards).
-                if let Some(data) = self.shard_cache.get(&shard_meta.shard_id) {
-                    collected.push((shard_meta.index, data.to_vec()));
+                if let Some(data) = self.shard_cache.get(shard_id) {
+                    collected.push((shard_idx as u8, data.to_vec()));
                     continue;
                 }
+
                 // Try remote if transport available.
                 if let Some(transport) = &self.transport {
                     // Build candidate list: start with known/computed owners,
@@ -648,11 +670,11 @@ impl ShoalNode {
                     // ring changes after node failures — the current ring
                     // may point to nodes that don't hold the shard because
                     // placement changed since write time.
-                    let owners = match self.meta.get_shard_owners(&shard_meta.shard_id)? {
+                    let owners = match self.meta.get_shard_owners(shard_id)? {
                         Some(owners) => owners,
                         None => {
                             let ring = self.cluster.ring().await;
-                            ring.owners(&shard_meta.shard_id, self.shard_replication)
+                            ring.owners(shard_id, self.shard_replication)
                         }
                     };
 
@@ -668,23 +690,25 @@ impl ShoalNode {
                         .collect();
 
                     let mut found = false;
+
                     for owner in owners.iter().chain(fallback.iter()) {
                         if *owner == self.node_id {
                             continue;
                         }
+
                         if let Some(addr) = self.resolve_addr(owner).await {
-                            match transport.pull_shard(addr, shard_meta.shard_id).await {
+                            match transport.pull_shard(addr, *shard_id).await {
                                 Ok(Some(data)) => {
                                     debug!(
-                                        shard_id = %shard_meta.shard_id,
+                                        %shard_id,
                                         from = %owner,
                                         "pulled shard from remote"
                                     );
                                     // Cache in bounded LRU (not the main store).
-                                    self.shard_cache.put(shard_meta.shard_id, data.clone());
-                                    collected.push((shard_meta.index, data.to_vec()));
+                                    self.shard_cache.put(*shard_id, data.clone());
+                                    collected.push((shard_idx as u8, data.to_vec()));
                                     self.event_bus.emit(ShardStored {
-                                        shard_id: shard_meta.shard_id,
+                                        shard_id: *shard_id,
                                         source: ShardSource::PeerPull,
                                     });
                                     found = true;
@@ -692,14 +716,14 @@ impl ShoalNode {
                                 }
                                 Ok(None) => {
                                     debug!(
-                                        shard_id = %shard_meta.shard_id,
+                                        %shard_id,
                                         from = %owner,
                                         "remote node does not have shard"
                                     );
                                 }
                                 Err(e) => {
                                     debug!(
-                                        shard_id = %shard_meta.shard_id,
+                                        %shard_id,
                                         from = %owner,
                                         %e,
                                         "failed to pull shard from remote"
@@ -708,10 +732,11 @@ impl ShoalNode {
                             }
                         }
                     }
+
                     if !found {
                         debug!(
-                            shard_id = %shard_meta.shard_id,
-                            index = shard_meta.index,
+                            %shard_id,
+                            shard_idx,
                             "shard not found on any node"
                         );
                     }
@@ -773,10 +798,16 @@ impl ShoalNode {
 
     /// Delete an object by removing its key mapping and manifest.
     ///
-    /// Shard data is left in place for now; a background GC pass would
-    /// clean up orphaned shards (post-milestone optimization).
+    /// Decrements shard refcounts and deletes shards that reach zero.
     #[tracing::instrument(skip(self))]
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
+        // Resolve the manifest before deleting the key mapping so we
+        // can decrement shard refcounts afterwards.
+        let manifest = self
+            .meta
+            .get_object_key(bucket, key)?
+            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+
         if let Some(log_tree) = &self.log_tree {
             // LogTree mode: append delete entry + broadcast.
             // Verify existence via LogTree resolve.
@@ -831,6 +862,17 @@ impl ShoalNode {
                 .insert((bucket.to_string(), key.to_string()));
 
             info!(bucket, key, %object_id, "delete_object: key mapping removed");
+        }
+
+        // Decrement shard refcounts. Delete shards that reach zero.
+        if let Some(m) = manifest {
+            for chunk in &m.chunks {
+                for shard_id in &chunk.shards {
+                    if let Ok(0) = self.store.decrement_refcount(*shard_id).await {
+                        let _ = self.store.delete(*shard_id).await;
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -897,8 +939,32 @@ impl ShoalNode {
         let manifest = self.head_object(src_bucket, src_key).await?;
         let object_id = manifest.object_id;
 
+        // Check if destination key already exists (overwrite case).
+        let old_manifest = self
+            .meta
+            .get_object_key(dst_bucket, dst_key)?
+            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+
         // Write destination key mapping + replicate.
         self.meta.put_object_key(dst_bucket, dst_key, &object_id)?;
+
+        // Increment refcount for all shards referenced by the copied manifest.
+        for chunk in &manifest.chunks {
+            for shard_id in &chunk.shards {
+                let _ = self.store.increment_refcount(*shard_id).await;
+            }
+        }
+
+        // If overwriting, decrement old manifest's shard refcounts.
+        if let Some(old) = old_manifest {
+            for chunk in &old.chunks {
+                for shard_id in &chunk.shards {
+                    if let Ok(0) = self.store.decrement_refcount(*shard_id).await {
+                        let _ = self.store.delete(*shard_id).await;
+                    }
+                }
+            }
+        }
 
         if let Some(log_tree) = &self.log_tree {
             let log_entry = log_tree.append_put(dst_bucket, dst_key, object_id, &manifest)?;
@@ -983,6 +1049,116 @@ impl ShoalNode {
         }
 
         Ok(())
+    }
+
+    /// Set lifecycle configuration on a bucket, replicating via LogTree+gossip.
+    pub async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        config: LifecycleConfiguration,
+    ) -> Result<(), EngineError> {
+        self.meta.put_bucket_lifecycle(bucket, &config)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let log_entry = log_tree.append_put_bucket_lifecycle(bucket, config)?;
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast put_bucket_lifecycle via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Retrieve lifecycle configuration for a bucket.
+    pub async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<LifecycleConfiguration>, EngineError> {
+        Ok(self.meta.get_bucket_lifecycle(bucket)?)
+    }
+
+    /// Delete lifecycle configuration from a bucket, replicating via LogTree+gossip.
+    pub async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), EngineError> {
+        self.meta.delete_bucket_lifecycle(bucket)?;
+
+        if let Some(log_tree) = &self.log_tree {
+            let log_entry = log_tree.append_delete_bucket_lifecycle(bucket)?;
+            let entry_bytes = postcard::to_allocvec(&log_entry).unwrap_or_default();
+
+            if let Some(gossip) = &self.gossip {
+                let payload = GossipPayload::LogEntry { entry_bytes };
+
+                if let Err(e) = gossip.broadcast_payload(&payload).await {
+                    warn!(%e, "failed to broadcast delete_bucket_lifecycle via gossip");
+                }
+            } else {
+                self.unicast_to_peers(&ShoalMessage::LogEntryBroadcast { entry_bytes })
+                    .await;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Expire objects based on lifecycle rules. Returns count of deleted objects.
+    pub async fn expire_lifecycle(&self) -> Result<usize, EngineError> {
+        let configs = self.meta.list_lifecycle_buckets()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut expired_count = 0;
+
+        for (bucket, config) in &configs {
+            for rule in &config.rules {
+                if !rule.enabled {
+                    continue;
+                }
+
+                let Some(days) = rule.expiration_days else {
+                    continue;
+                };
+
+                let cutoff = now.saturating_sub(days as u64 * 86400);
+                let objects = self.list_objects(bucket, &rule.prefix).await?;
+
+                for obj in &objects {
+                    if obj.last_modified <= cutoff {
+                        match self.delete_object(bucket, &obj.key).await {
+                            Ok(()) => {
+                                expired_count += 1;
+                                debug!(
+                                    bucket,
+                                    key = obj.key,
+                                    rule_id = rule.id,
+                                    "lifecycle: expired object"
+                                );
+                            }
+                            Err(EngineError::ObjectNotFound { .. }) => {}
+                            Err(e) => {
+                                warn!(
+                                    bucket,
+                                    key = obj.key,
+                                    %e,
+                                    "lifecycle: failed to delete expired object"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(expired_count)
     }
 
     /// Create a bucket with optional owner, replicating via LogTree+gossip.
@@ -1603,11 +1779,9 @@ impl ShoalNode {
 
                                 // Cache shard owners.
                                 for chunk in &manifest.chunks {
-                                    for shard_meta in &chunk.shards {
-                                        let _ = self.meta.put_shard_owners(
-                                            &shard_meta.shard_id,
-                                            &[peer.node_id],
-                                        );
+                                    for shard_id in &chunk.shards {
+                                        let _ =
+                                            self.meta.put_shard_owners(shard_id, &[peer.node_id]);
                                     }
                                 }
 
@@ -1888,6 +2062,29 @@ impl ShoalEngine for ShoalNode {
 
     async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
         ShoalNode::delete_object_tags(self, bucket, key).await
+    }
+
+    async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        config: LifecycleConfiguration,
+    ) -> Result<(), EngineError> {
+        ShoalNode::put_bucket_lifecycle(self, bucket, config).await
+    }
+
+    async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<LifecycleConfiguration>, EngineError> {
+        ShoalNode::get_bucket_lifecycle(self, bucket).await
+    }
+
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), EngineError> {
+        ShoalNode::delete_bucket_lifecycle(self, bucket).await
+    }
+
+    async fn expire_lifecycle(&self) -> Result<usize, EngineError> {
+        ShoalNode::expire_lifecycle(self).await
     }
 
     async fn create_bucket(&self, bucket: &str, owner: Option<&str>) -> Result<(), EngineError> {

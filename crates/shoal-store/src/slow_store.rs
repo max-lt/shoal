@@ -120,4 +120,14 @@ impl ShardStore for SlowStore {
         self.delay(self.read_latency_ms).await;
         self.inner.verify(id).await
     }
+
+    async fn increment_refcount(&self, id: ShardId) -> Result<u32, StoreError> {
+        self.delay(self.write_latency_ms).await;
+        self.inner.increment_refcount(id).await
+    }
+
+    async fn decrement_refcount(&self, id: ShardId) -> Result<u32, StoreError> {
+        self.delay(self.write_latency_ms).await;
+        self.inner.decrement_refcount(id).await
+    }
 }

@@ -79,6 +79,13 @@ pub enum S3Error {
         /// Description of the validation error.
         message: String,
     },
+
+    /// No lifecycle configuration exists for the bucket.
+    #[error("no lifecycle configuration: {bucket}")]
+    NoSuchLifecycleConfiguration {
+        /// Bucket name.
+        bucket: String,
+    },
 }
 
 impl S3Error {
@@ -101,6 +108,7 @@ impl S3Error {
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::NotImplemented { .. } => StatusCode::NOT_IMPLEMENTED,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::NoSuchLifecycleConfiguration { .. } => StatusCode::NOT_FOUND,
         }
     }
 
@@ -123,6 +131,7 @@ impl S3Error {
             Self::Internal { .. } => "InternalError",
             Self::NotImplemented { .. } => "NotImplemented",
             Self::BadRequest { .. } => "BadRequest",
+            Self::NoSuchLifecycleConfiguration { .. } => "NoSuchLifecycleConfiguration",
         }
     }
 }

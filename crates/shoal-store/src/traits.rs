@@ -5,6 +5,9 @@ use shoal_types::ShardId;
 
 use crate::error::StoreError;
 
+/// Size of the shard header in bytes: refcount (u32 LE) + payload size (u32 LE).
+pub const SHARD_HEADER_SIZE: usize = 8;
+
 /// Capacity information for a storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageCapacity {
@@ -46,4 +49,11 @@ pub trait ShardStore: Send + Sync {
 
     /// Verify shard integrity by re-hashing and comparing to the ID.
     async fn verify(&self, id: ShardId) -> Result<bool, StoreError>;
+
+    /// Increment the reference count for a shard. Returns the new count.
+    async fn increment_refcount(&self, id: ShardId) -> Result<u32, StoreError>;
+
+    /// Decrement the reference count for a shard (saturating at 0).
+    /// Returns the new count. Caller should delete the shard when it reaches 0.
+    async fn decrement_refcount(&self, id: ShardId) -> Result<u32, StoreError>;
 }

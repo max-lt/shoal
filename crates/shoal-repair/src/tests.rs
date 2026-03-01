@@ -139,7 +139,7 @@ impl TestCluster {
             let ring = cluster.ring().await;
             let replication_factor = k + m;
 
-            let mut shard_metas = Vec::new();
+            let mut shard_ids = Vec::new();
             for shard in &shards {
                 let owners = ring.owners(&shard.id, replication_factor);
                 for owner in &owners {
@@ -148,11 +148,7 @@ impl TestCluster {
                     }
                 }
                 meta.put_shard_owners(&shard.id, &owners).unwrap();
-                shard_metas.push(ShardMeta {
-                    shard_id: shard.id,
-                    index: shard.index,
-                    size: shard.data.len() as u32,
-                });
+                shard_ids.push(shard.id);
             }
 
             chunks.push(ChunkMeta {
@@ -161,7 +157,7 @@ impl TestCluster {
                 raw_length: chunk_data.len() as u32,
                 stored_length: chunk_data.len() as u32,
                 compression: shoal_types::Compression::None,
-                shards: shard_metas,
+                shards: shard_ids,
             });
             offset += chunk_data.len() as u64;
         }
@@ -279,8 +275,7 @@ async fn test_executor_repair_by_direct_fetch() {
     );
 
     // Pick a shard and delete it from node 1 to simulate loss.
-    let shard = &tc.manifest.chunks[0].shards[0];
-    let shard_id = shard.shard_id;
+    let shard_id = tc.manifest.chunks[0].shards[0];
 
     // Verify it exists on at least one other node.
     let owners = tc.meta.get_shard_owners(&shard_id).unwrap().unwrap();
@@ -317,25 +312,20 @@ async fn test_executor_repair_by_rs_reconstruction() {
 
     // Pick a shard and delete it from ALL stores to force RS reconstruction.
     let chunk = &tc.manifest.chunks[0];
-    let target_shard = &chunk.shards[0];
-    let shard_id = target_shard.shard_id;
+    let shard_id = chunk.shards[0];
 
     // Verify sibling shards exist before deletion of target.
-    let sibling_count = chunk
-        .shards
-        .iter()
-        .filter(|s| s.shard_id != shard_id)
-        .count();
+    let sibling_count = chunk.shards.iter().filter(|s| **s != shard_id).count();
     assert_eq!(sibling_count, 2, "should have k+m-1=2 sibling shards");
 
     // Verify sibling shards are accessible on local store.
-    for s in &chunk.shards {
-        if s.shard_id != shard_id {
+    for (idx, sid) in chunk.shards.iter().enumerate() {
+        if *sid != shard_id {
             assert!(
-                local_store.contains(s.shard_id).await.unwrap(),
+                local_store.contains(*sid).await.unwrap(),
                 "sibling shard {} (index {}) should exist on local store",
-                s.shard_id,
-                s.index,
+                sid,
+                idx,
             );
         }
     }
@@ -349,12 +339,11 @@ async fn test_executor_repair_by_rs_reconstruction() {
     tc.meta.put_shard_owners(&shard_id, &[]).unwrap();
 
     // Test the RS reconstruction path via repair_shard_with_context.
-    let sibling_metas: Vec<_> = chunk.shards.clone();
     let repair_result = executor
         .repair_shard_with_context(
             shard_id,
-            target_shard,
-            &sibling_metas,
+            0, // shard index
+            &chunk.shards,
             chunk.stored_length,
             &throttle,
         )
@@ -647,8 +636,8 @@ async fn test_full_repair_after_node_death() {
     // Enqueue all shards from the manifest for repair.
     let mut repair_count = 0;
     for chunk in &tc.manifest.chunks {
-        for shard_meta in &chunk.shards {
-            tc.meta.enqueue_repair(&shard_meta.shard_id, 1).unwrap();
+        for shard_id in &chunk.shards {
+            tc.meta.enqueue_repair(shard_id, 1).unwrap();
             repair_count += 1;
         }
     }
@@ -669,13 +658,9 @@ async fn test_full_repair_after_node_death() {
     // After repair, verify data shards are available on at least k=2 nodes.
     for chunk in &tc.manifest.chunks {
         let mut available = 0;
-        for shard_meta in &chunk.shards {
+        for shard_id in &chunk.shards {
             for n in [1u8, 2] {
-                if tc.stores[&node_id(n)]
-                    .contains(shard_meta.shard_id)
-                    .await
-                    .unwrap()
-                {
+                if tc.stores[&node_id(n)].contains(*shard_id).await.unwrap() {
                     available += 1;
                     break;
                 }

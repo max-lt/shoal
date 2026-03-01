@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use shoal_meta::MetaStore;
-use shoal_types::{BucketInfo, Manifest, ObjectId, ObjectInfo};
+use shoal_types::{BucketInfo, LifecycleConfiguration, Manifest, ObjectId, ObjectInfo};
 
 use crate::error::EngineError;
 
@@ -104,6 +104,25 @@ pub trait ShoalEngine: Send + Sync {
 
     /// Delete all tags from an object, replicating via LogTree+gossip.
     async fn delete_object_tags(&self, bucket: &str, key: &str) -> Result<(), EngineError>;
+
+    /// Set lifecycle configuration on a bucket, replicating via LogTree+gossip.
+    async fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        config: LifecycleConfiguration,
+    ) -> Result<(), EngineError>;
+
+    /// Retrieve lifecycle configuration for a bucket.
+    async fn get_bucket_lifecycle(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<LifecycleConfiguration>, EngineError>;
+
+    /// Delete lifecycle configuration from a bucket, replicating via LogTree+gossip.
+    async fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<(), EngineError>;
+
+    /// Expire objects based on lifecycle rules. Returns count of deleted objects.
+    async fn expire_lifecycle(&self) -> Result<usize, EngineError>;
 
     /// Return a reference to the metadata store.
     ///

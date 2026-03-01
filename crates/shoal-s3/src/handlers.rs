@@ -289,12 +289,19 @@ pub(crate) async fn create_bucket(
     Extension(caller): Extension<AuthenticatedCaller>,
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
+    body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
     // PUT /{bucket}?versioning → reject (we don't support enabling versioning)
     if params.contains_key("versioning") {
         return Err(S3Error::NotImplemented {
             message: "bucket versioning is not supported".to_string(),
         });
+    }
+
+    // PUT /{bucket}?lifecycle → PutBucketLifecycleConfiguration
+    if params.contains_key("lifecycle") {
+        check_bucket_access(&state, &caller, &bucket).await?;
+        return put_bucket_lifecycle(&state, &bucket, &body).await;
     }
 
     for &op in UNSUPPORTED_BUCKET_OPS {
@@ -328,6 +335,12 @@ pub(crate) async fn delete_bucket_handler(
     Path(bucket): Path<String>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // DELETE /{bucket}?lifecycle → DeleteBucketLifecycleConfiguration
+    if params.contains_key("lifecycle") {
+        check_bucket_access(&state, &caller, &bucket).await?;
+        return delete_bucket_lifecycle(&state, &bucket).await;
+    }
+
     for &op in UNSUPPORTED_BUCKET_OPS {
         if params.contains_key(op) {
             return Err(S3Error::NotImplemented {
@@ -386,7 +399,6 @@ const UNSUPPORTED_OBJECT_OPS: &[&str] = &[
 /// Bucket-level sub-resources that we don't implement.
 const UNSUPPORTED_BUCKET_OPS: &[&str] = &[
     "policy",
-    "lifecycle",
     "cors",
     "encryption",
     "replication",
@@ -431,6 +443,11 @@ pub(crate) async fn list_objects(
             .header("content-type", "application/xml")
             .body(Body::from(body))
             .unwrap());
+    }
+
+    // GET /{bucket}?lifecycle → GetBucketLifecycleConfiguration
+    if params.contains_key("lifecycle") {
+        return get_bucket_lifecycle(&state, &bucket).await;
     }
 
     // GET /{bucket}?uploads → ListMultipartUploads
@@ -866,6 +883,87 @@ async fn delete_object_tagging(
 }
 
 // -----------------------------------------------------------------------
+// GET /{bucket}?lifecycle — GetBucketLifecycleConfiguration
+// -----------------------------------------------------------------------
+
+async fn get_bucket_lifecycle(
+    state: &AppState,
+    bucket: &str,
+) -> Result<axum::response::Response, S3Error> {
+    let config = state
+        .engine
+        .get_bucket_lifecycle(bucket)
+        .await
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to get lifecycle config: {e}"),
+        })?;
+
+    match config {
+        Some(config) => {
+            let body = xml::lifecycle_configuration_xml(&config);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header("content-type", "application/xml")
+                .body(Body::from(body))
+                .unwrap())
+        }
+        None => Err(S3Error::NoSuchLifecycleConfiguration {
+            bucket: bucket.to_string(),
+        }),
+    }
+}
+
+// -----------------------------------------------------------------------
+// PUT /{bucket}?lifecycle — PutBucketLifecycleConfiguration
+// -----------------------------------------------------------------------
+
+async fn put_bucket_lifecycle(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+) -> Result<axum::response::Response, S3Error> {
+    let body_str = String::from_utf8_lossy(body);
+    let config = xml::parse_lifecycle_request(&body_str).ok_or_else(|| S3Error::BadRequest {
+        message: "invalid lifecycle configuration XML".to_string(),
+    })?;
+
+    state
+        .engine
+        .put_bucket_lifecycle(bucket, config)
+        .await
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to put lifecycle config: {e}"),
+        })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// DELETE /{bucket}?lifecycle — DeleteBucketLifecycleConfiguration
+// -----------------------------------------------------------------------
+
+async fn delete_bucket_lifecycle(
+    state: &AppState,
+    bucket: &str,
+) -> Result<axum::response::Response, S3Error> {
+    state
+        .engine
+        .delete_bucket_lifecycle(bucket)
+        .await
+        .map_err(|e| S3Error::Internal {
+            message: format!("failed to delete lifecycle config: {e}"),
+        })?;
+
+    Ok(Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Body::empty())
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
 // DELETE /{bucket}/{*key}?uploadId=... — AbortMultipartUpload
 // -----------------------------------------------------------------------
 
@@ -934,6 +1032,71 @@ async fn list_parts(
         .status(StatusCode::OK)
         .header("content-type", "application/xml")
         .body(Body::from(body))
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// POST /{bucket}?delete — DeleteObjects
+// -----------------------------------------------------------------------
+
+/// Handle POST on a bucket — dispatches to DeleteObjects.
+pub(crate) async fn post_bucket_handler(
+    State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
+    Path(bucket): Path<String>,
+    Query(params): Query<BTreeMap<String, String>>,
+    body: bytes::Bytes,
+) -> Result<axum::response::Response, S3Error> {
+    if params.contains_key("delete") {
+        check_bucket_access(&state, &caller, &bucket).await?;
+        return delete_objects(&state, &bucket, &body).await;
+    }
+
+    Err(S3Error::InvalidRequest {
+        message: "unsupported POST operation on bucket".to_string(),
+    })
+}
+
+/// Batch-delete objects (POST /{bucket}?delete).
+async fn delete_objects(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+) -> Result<axum::response::Response, S3Error> {
+    let body_str = String::from_utf8_lossy(body);
+    let (keys, quiet) =
+        xml::parse_delete_request(&body_str).ok_or_else(|| S3Error::BadRequest {
+            message: "invalid Delete XML".to_string(),
+        })?;
+
+    let mut deleted = Vec::new();
+    let mut errors: Vec<(String, String, String)> = Vec::new();
+
+    for key in &keys {
+        match state.engine.delete_object(bucket, key).await {
+            Ok(()) => deleted.push(key.clone()),
+            Err(shoal_engine::EngineError::ObjectNotFound { .. }) => {
+                // S3 spec: deleting non-existent keys counts as success.
+                deleted.push(key.clone());
+            }
+            Err(e) => {
+                errors.push((key.clone(), "InternalError".to_string(), e.to_string()));
+            }
+        }
+    }
+
+    info!(
+        bucket,
+        deleted = deleted.len(),
+        errors = errors.len(),
+        "delete_objects"
+    );
+
+    let response_body = xml::delete_result_xml(&deleted, &errors, quiet);
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(Body::from(response_body))
         .unwrap())
 }
 

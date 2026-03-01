@@ -11,7 +11,7 @@ use shoal_erasure::{ErasureEncoder, decode};
 use shoal_meta::MetaStore;
 use shoal_placement::Ring;
 use shoal_store::{MemoryStore, ShardStore};
-use shoal_types::{ChunkMeta, NodeId, NodeTopology, ShardMeta};
+use shoal_types::{ChunkMeta, NodeId, NodeTopology};
 
 /// Create 3 simulated nodes with MemoryStores and a Ring.
 fn setup_cluster() -> (HashMap<NodeId, Arc<MemoryStore>>, Ring, Vec<NodeId>) {
@@ -62,7 +62,7 @@ async fn write_object(
     for chunk in &chunks {
         let (shards, original_size) = encoder.encode(&chunk.data).unwrap();
 
-        let mut shard_metas = Vec::new();
+        let mut shard_ids = Vec::new();
 
         for shard in &shards {
             // Determine owner via ring placement.
@@ -73,11 +73,7 @@ async fn write_object(
             let store = stores.get(&owner).unwrap();
             store.put(shard.id, shard.data.clone()).await.unwrap();
 
-            shard_metas.push(ShardMeta {
-                shard_id: shard.id,
-                index: shard.index,
-                size: shard.data.len() as u32,
-            });
+            shard_ids.push(shard.id);
         }
 
         chunk_metas.push(ChunkMeta {
@@ -86,7 +82,7 @@ async fn write_object(
             raw_length: original_size as u32,
             stored_length: original_size as u32,
             compression: shoal_types::Compression::None,
-            shards: shard_metas,
+            shards: shard_ids,
         });
     }
 
@@ -126,10 +122,10 @@ async fn read_object(
         // Fetch available shards from all stores.
         let mut available_shards: Vec<(u8, Vec<u8>)> = Vec::new();
 
-        for shard_meta in &chunk_meta.shards {
+        for (shard_idx, shard_id) in chunk_meta.shards.iter().enumerate() {
             for store in stores.values() {
-                if let Ok(Some(data)) = store.get(shard_meta.shard_id).await {
-                    available_shards.push((shard_meta.index, data.to_vec()));
+                if let Ok(Some(data)) = store.get(*shard_id).await {
+                    available_shards.push((shard_idx as u8, data.to_vec()));
                     break;
                 }
             }
@@ -263,10 +259,10 @@ async fn test_single_shard_loss_per_chunk_read_succeeds() {
     let manifest = meta.get_manifest(&oid).unwrap().unwrap();
 
     for chunk_meta in &manifest.chunks {
-        let shard_to_delete = &chunk_meta.shards[0];
+        let shard_to_delete = chunk_meta.shards[0];
         for store in stores.values() {
-            if store.contains(shard_to_delete.shard_id).await.unwrap() {
-                store.delete(shard_to_delete.shard_id).await.unwrap();
+            if store.contains(shard_to_delete).await.unwrap() {
+                store.delete(shard_to_delete).await.unwrap();
                 break;
             }
         }
@@ -311,10 +307,10 @@ async fn test_two_shard_loss_per_chunk_read_fails() {
     let manifest = meta.get_manifest(&oid).unwrap().unwrap();
 
     for chunk_meta in &manifest.chunks {
-        for shard_meta in chunk_meta.shards.iter().take(2) {
+        for shard_id in chunk_meta.shards.iter().take(2) {
             for store in stores.values() {
-                if store.contains(shard_meta.shard_id).await.unwrap() {
-                    store.delete(shard_meta.shard_id).await.unwrap();
+                if store.contains(*shard_id).await.unwrap() {
+                    store.delete(*shard_id).await.unwrap();
                     break;
                 }
             }
@@ -477,11 +473,11 @@ async fn test_parity_shard_reconstruction() {
 
     // Delete shard index 0 (data shard) from each chunk, forcing parity decode.
     for chunk_meta in &manifest.chunks {
-        let shard = &chunk_meta.shards[0];
-        assert_eq!(shard.index, 0, "first shard should be index 0");
+        let shard_id = chunk_meta.shards[0];
+        // Index 0 is implicit (first element in the Vec).
         for store in stores.values() {
-            if store.contains(shard.shard_id).await.unwrap() {
-                store.delete(shard.shard_id).await.unwrap();
+            if store.contains(shard_id).await.unwrap() {
+                store.delete(shard_id).await.unwrap();
                 break;
             }
         }

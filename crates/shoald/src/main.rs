@@ -783,6 +783,20 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                         warn!(%e, "failed to apply gossiped bucket deletion");
                                                     }
                                                 }
+                                                Action::PutBucketLifecycle { bucket, config } => {
+                                                    if let Err(e) =
+                                                        meta_bg.put_bucket_lifecycle(bucket, config)
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped put_bucket_lifecycle");
+                                                    }
+                                                }
+                                                Action::DeleteBucketLifecycle { bucket } => {
+                                                    if let Err(e) =
+                                                        meta_bg.delete_bucket_lifecycle(bucket)
+                                                    {
+                                                        warn!(%e, "failed to apply gossiped delete_bucket_lifecycle");
+                                                    }
+                                                }
                                                 _ => {} // Merge, Snapshot — no key-level event
                                             }
                                         });
@@ -1057,6 +1071,33 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                 }
             });
         }
+    }
+
+    // --- Lifecycle expiration worker ---
+    {
+        let engine_lifecycle = engine_dyn.clone();
+        let mut shutdown_rx_lifecycle = shutdown_rx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            info!("lifecycle expiration worker started");
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = shutdown_rx_lifecycle.changed() => {
+                        info!("lifecycle expiration worker interrupted by shutdown");
+                        break;
+                    }
+                }
+
+                match engine_lifecycle.expire_lifecycle().await {
+                    Ok(0) => {}
+                    Ok(n) => info!(expired = n, "lifecycle expiration: deleted objects"),
+                    Err(e) => warn!(%e, "lifecycle expiration failed"),
+                }
+            }
+        });
     }
 
     // --- S3 HTTP API ---
