@@ -159,7 +159,8 @@ impl S3Server {
                 put(handlers::create_bucket)
                     .get(handlers::list_objects)
                     .delete(handlers::delete_bucket_handler)
-                    .head(handlers::head_bucket_handler),
+                    .head(handlers::head_bucket_handler)
+                    .post(handlers::post_bucket_handler),
             )
             // Trailing-slash variant — S3 clients often send GET /bucket/.
             .route(
@@ -167,7 +168,8 @@ impl S3Server {
                 put(handlers::create_bucket)
                     .get(handlers::list_objects)
                     .delete(handlers::delete_bucket_handler)
-                    .head(handlers::head_bucket_handler),
+                    .head(handlers::head_bucket_handler)
+                    .post(handlers::post_bucket_handler),
             )
             // Object-level operations (key may contain slashes).
             .route(

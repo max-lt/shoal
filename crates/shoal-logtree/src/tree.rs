@@ -137,6 +137,29 @@ impl LogTree {
         self.append(action)
     }
 
+    /// Append a PutBucketLifecycle action. Returns the new LogEntry.
+    pub fn append_put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        config: shoal_types::LifecycleConfiguration,
+    ) -> Result<LogEntry> {
+        let action = Action::PutBucketLifecycle {
+            bucket: bucket.to_string(),
+            config,
+        };
+
+        self.append(action)
+    }
+
+    /// Append a DeleteBucketLifecycle action. Returns the new LogEntry.
+    pub fn append_delete_bucket_lifecycle(&self, bucket: &str) -> Result<LogEntry> {
+        let action = Action::DeleteBucketLifecycle {
+            bucket: bucket.to_string(),
+        };
+
+        self.append(action)
+    }
+
     /// Append a Delete action. Returns the new LogEntry.
     pub fn append_delete(&self, bucket: &str, key: &str) -> Result<LogEntry> {
         let action = Action::Delete {
@@ -721,7 +744,9 @@ impl LogTree {
             | Action::DeleteTags { .. }
             | Action::CreateBucket { .. }
             | Action::CreateBucketV2 { .. }
-            | Action::DeleteBucket { .. } => {
+            | Action::DeleteBucket { .. }
+            | Action::PutBucketLifecycle { .. }
+            | Action::DeleteBucketLifecycle { .. } => {
                 // No LogTree-internal state change. These actions are
                 // applied to MetaStore externally by the engine / gossip receiver.
             }

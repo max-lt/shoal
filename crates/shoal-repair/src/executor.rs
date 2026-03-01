@@ -14,7 +14,7 @@ use shoal_cluster::ClusterState;
 use shoal_meta::MetaStore;
 use shoal_store::ShardStore;
 use shoal_types::events::{EventBus, RepairCompleted, RepairStarted, ShardSource, ShardStored};
-use shoal_types::{Manifest, NodeId, ShardId, ShardMeta};
+use shoal_types::{Manifest, NodeId, ShardId};
 use tracing::{debug, warn};
 
 use crate::error::RepairError;
@@ -225,16 +225,16 @@ impl RepairExecutor {
 
         // Fetch as many sibling shards as we can.
         let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
-        for shard_meta in &chunk_meta.shards {
+        for (shard_idx, sid) in chunk_meta.shards.iter().enumerate() {
             if collected.len() >= k {
                 break;
             }
-            if shard_meta.shard_id == shard_id {
+            if *sid == shard_id {
                 // This is the one we're trying to reconstruct — skip.
                 continue;
             }
-            if let Some(data) = self.try_direct_fetch(shard_meta.shard_id).await {
-                collected.push((shard_meta.index, data.to_vec()));
+            if let Some(data) = self.try_direct_fetch(*sid).await {
+                collected.push((shard_idx as u8, data.to_vec()));
             }
         }
 
@@ -290,10 +290,9 @@ impl RepairExecutor {
         for obj in &objects {
             if let Ok(Some(manifest)) = self.meta.get_manifest(&obj.object_id) {
                 for (ci, chunk) in manifest.chunks.iter().enumerate() {
-                    for shard_meta in &chunk.shards {
-                        if shard_meta.shard_id == shard_id {
-                            let index = shard_meta.index;
-                            return Ok(Some((manifest, ci, index)));
+                    for (shard_idx, sid) in chunk.shards.iter().enumerate() {
+                        if *sid == shard_id {
+                            return Ok(Some((manifest, ci, shard_idx as u8)));
                         }
                     }
                 }
@@ -309,8 +308,8 @@ impl RepairExecutor {
     pub async fn repair_shard_with_context(
         &self,
         shard_id: ShardId,
-        shard_meta: &ShardMeta,
-        sibling_shards: &[ShardMeta],
+        shard_index: u8,
+        sibling_shards: &[ShardId],
         original_chunk_size: u32,
         throttle: &Throttle,
     ) -> Result<Bytes, RepairError> {
@@ -324,15 +323,15 @@ impl RepairExecutor {
         let m = self.erasure_m;
         let mut collected: Vec<(u8, Vec<u8>)> = Vec::new();
 
-        for sibling in sibling_shards {
+        for (idx, sid) in sibling_shards.iter().enumerate() {
             if collected.len() >= k {
                 break;
             }
-            if sibling.shard_id == shard_id {
+            if *sid == shard_id {
                 continue;
             }
-            if let Some(data) = self.try_direct_fetch(sibling.shard_id).await {
-                collected.push((sibling.index, data.to_vec()));
+            if let Some(data) = self.try_direct_fetch(*sid).await {
+                collected.push((idx as u8, data.to_vec()));
             }
         }
 
@@ -348,14 +347,13 @@ impl RepairExecutor {
         let encoder = shoal_erasure::ErasureEncoder::new(k, m);
         let (shards, _) = encoder.encode(&chunk_data)?;
 
-        let target = shards
-            .into_iter()
-            .find(|s| s.index == shard_meta.index)
-            .ok_or(RepairError::InsufficientShards {
+        let target = shards.into_iter().find(|s| s.index == shard_index).ok_or(
+            RepairError::InsufficientShards {
                 shard_id,
                 needed: k,
                 found: 0,
-            })?;
+            },
+        )?;
 
         throttle.acquire(target.data.len() as u64).await;
         Ok(target.data)

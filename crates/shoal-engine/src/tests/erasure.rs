@@ -77,9 +77,8 @@ async fn test_shard_indices_correct() {
     let manifest = node.head_object("b", "k").await.unwrap();
     for chunk in &manifest.chunks {
         assert_eq!(chunk.shards.len(), 6); // k=4, m=2
-        for (i, shard) in chunk.shards.iter().enumerate() {
-            assert_eq!(shard.index, i as u8, "shard index mismatch");
-        }
+        // Index is implicit: position in the Vec.
+        assert_eq!(chunk.shards.len(), 6);
     }
 }
 
@@ -102,11 +101,9 @@ async fn test_read_with_missing_parity_shards() {
 
     // Delete parity shard(s) for each chunk -- should still read via k data shards.
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            // Parity shards have index >= k
-            if shard_meta.index >= 2 {
-                node.store().delete(shard_meta.shard_id).await.unwrap();
-            }
+        // Parity shards have index >= k (position in Vec).
+        for shard_id in &chunk_meta.shards[2..] {
+            node.store().delete(*shard_id).await.unwrap();
         }
     }
 
@@ -129,11 +126,8 @@ async fn test_read_with_missing_data_shard() {
     // Delete first data shard (index 0) for each chunk.
     // With k=2, m=1 we still have index 1 (data) + index 2 (parity) = 2 >= k.
     for chunk_meta in &manifest.chunks {
-        for shard_meta in &chunk_meta.shards {
-            if shard_meta.index == 0 {
-                node.store().delete(shard_meta.shard_id).await.unwrap();
-            }
-        }
+        // Delete first data shard (index 0).
+        node.store().delete(chunk_meta.shards[0]).await.unwrap();
     }
 
     let (got, _) = node.get_object("b", "k").await.unwrap();
@@ -154,12 +148,8 @@ async fn test_read_fails_too_many_missing() {
 
     // Delete 2 out of 3 shards for each chunk -> only 1 shard left, need 2 (k=2).
     for chunk_meta in &manifest.chunks {
-        let mut deleted = 0;
-        for shard_meta in &chunk_meta.shards {
-            if deleted < 2 {
-                node.store().delete(shard_meta.shard_id).await.unwrap();
-                deleted += 1;
-            }
+        for shard_id in chunk_meta.shards.iter().take(2) {
+            node.store().delete(*shard_id).await.unwrap();
         }
     }
 
@@ -195,9 +185,7 @@ async fn test_identical_data_same_shard_ids() {
 
     for (c1, c2) in m1.chunks.iter().zip(m2.chunks.iter()) {
         assert_eq!(c1.chunk_id, c2.chunk_id);
-        for (s1, s2) in c1.shards.iter().zip(c2.shards.iter()) {
-            assert_eq!(s1.shard_id, s2.shard_id);
-        }
+        assert_eq!(c1.shards, c2.shards);
     }
 }
 

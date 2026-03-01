@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use shoal_types::{NodeId, ObjectId};
+use shoal_types::{LifecycleConfiguration, NodeId, ObjectId};
 
 /// A single entry in the LogTree DAG.
 ///
@@ -87,6 +87,13 @@ pub enum Action {
     },
     /// Delete a bucket.
     DeleteBucket { bucket: String },
+    /// Set lifecycle configuration on a bucket.
+    PutBucketLifecycle {
+        bucket: String,
+        config: LifecycleConfiguration,
+    },
+    /// Delete lifecycle configuration from a bucket.
+    DeleteBucketLifecycle { bucket: String },
 }
 
 /// A versioned record for a specific `(bucket, key)` pair.

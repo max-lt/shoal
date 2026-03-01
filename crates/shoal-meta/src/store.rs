@@ -6,7 +6,9 @@ use std::path::Path;
 use std::sync::RwLock;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
-use shoal_types::{BucketInfo, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId};
+use shoal_types::{
+    BucketInfo, LifecycleConfiguration, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId,
+};
 use tracing::debug;
 
 use serde::{Deserialize, Serialize};
@@ -36,6 +38,7 @@ enum Backend {
         api_keys: Keyspace,
         buckets: Keyspace,
         tags: Keyspace,
+        lifecycle: Keyspace,
     },
     Memory(Box<MemoryBackend>),
 }
@@ -60,6 +63,8 @@ struct MemoryBackend {
     buckets: RwLock<HashMap<String, BucketMeta>>,
     /// `bucket/key` → serialized BTreeMap<String, String> (tags).
     tags: RwLock<HashMap<String, Vec<u8>>>,
+    /// bucket_name → serialized LifecycleConfiguration.
+    lifecycle: RwLock<HashMap<String, Vec<u8>>>,
 }
 
 /// Metadata store with Fjall (disk) or pure in-memory backend.
@@ -101,6 +106,7 @@ impl MetaStore {
                 api_keys: RwLock::new(HashMap::new()),
                 buckets: RwLock::new(HashMap::new()),
                 tags: RwLock::new(HashMap::new()),
+                lifecycle: RwLock::new(HashMap::new()),
             })),
         }
     }
@@ -115,6 +121,7 @@ impl MetaStore {
         let api_keys = db.keyspace("api_keys", KeyspaceCreateOptions::default)?;
         let buckets = db.keyspace("buckets", KeyspaceCreateOptions::default)?;
         let tags = db.keyspace("tags", KeyspaceCreateOptions::default)?;
+        let lifecycle = db.keyspace("lifecycle", KeyspaceCreateOptions::default)?;
         Ok(Backend::Fjall {
             db,
             objects,
@@ -126,6 +133,7 @@ impl MetaStore {
             api_keys,
             buckets,
             tags,
+            lifecycle,
         })
     }
 
@@ -788,6 +796,92 @@ impl MetaStore {
         Ok(())
     }
 
+    // ----- Lifecycle configuration (bucket-level) -----
+
+    /// Store a lifecycle configuration for a bucket.
+    pub fn put_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        config: &LifecycleConfiguration,
+    ) -> Result<()> {
+        let value = postcard::to_allocvec(config)?;
+
+        match &self.backend {
+            Backend::Fjall { lifecycle, .. } => {
+                lifecycle.insert(bucket.as_bytes(), value.as_slice())?;
+            }
+            Backend::Memory(m) => {
+                m.lifecycle
+                    .write()
+                    .unwrap()
+                    .insert(bucket.to_string(), value);
+            }
+        }
+
+        debug!(
+            bucket,
+            rules = config.rules.len(),
+            "stored bucket lifecycle"
+        );
+        Ok(())
+    }
+
+    /// Retrieve the lifecycle configuration for a bucket.
+    pub fn get_bucket_lifecycle(&self, bucket: &str) -> Result<Option<LifecycleConfiguration>> {
+        match &self.backend {
+            Backend::Fjall { lifecycle, .. } => match lifecycle.get(bucket.as_bytes())? {
+                Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
+                None => Ok(None),
+            },
+            Backend::Memory(m) => match m.lifecycle.read().unwrap().get(bucket) {
+                Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
+                None => Ok(None),
+            },
+        }
+    }
+
+    /// Delete the lifecycle configuration for a bucket.
+    pub fn delete_bucket_lifecycle(&self, bucket: &str) -> Result<()> {
+        match &self.backend {
+            Backend::Fjall { lifecycle, .. } => {
+                lifecycle.remove(bucket.as_bytes())?;
+            }
+            Backend::Memory(m) => {
+                m.lifecycle.write().unwrap().remove(bucket);
+            }
+        }
+
+        debug!(bucket, "deleted bucket lifecycle");
+        Ok(())
+    }
+
+    /// List all buckets that have a lifecycle configuration.
+    pub fn list_lifecycle_buckets(&self) -> Result<Vec<(String, LifecycleConfiguration)>> {
+        let mut result = Vec::new();
+
+        match &self.backend {
+            Backend::Fjall { lifecycle, .. } => {
+                for guard in lifecycle.iter() {
+                    let (k, v) = guard.into_inner()?;
+                    let bucket = String::from_utf8_lossy(&k).to_string();
+
+                    if let Ok(config) = postcard::from_bytes(&v) {
+                        result.push((bucket, config));
+                    }
+                }
+            }
+            Backend::Memory(m) => {
+                for (bucket, bytes) in m.lifecycle.read().unwrap().iter() {
+                    if let Ok(config) = postcard::from_bytes(bytes) {
+                        result.push((bucket.clone(), config));
+                    }
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
     // ----- Repair queue (local, transient) -----
 
     /// Enqueue a shard for repair with the given priority (lower = more urgent).
@@ -880,7 +974,7 @@ fn repair_queue_key(priority: u64, shard_id: &ShardId) -> Vec<u8> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use shoal_types::{ChunkMeta, MANIFEST_VERSION, MemberState, NodeTopology, ShardMeta};
+    use shoal_types::{ChunkMeta, MANIFEST_VERSION, MemberState, NodeTopology};
 
     use super::*;
 
@@ -896,11 +990,7 @@ mod tests {
                 raw_length: 1024,
                 stored_length: 1024,
                 compression: shoal_types::Compression::None,
-                shards: vec![ShardMeta {
-                    shard_id: ShardId::from_data(b"shard 0"),
-                    index: 0,
-                    size: 512,
-                }],
+                shards: vec![ShardId::from_data(b"shard 0")],
             }],
             created_at: 1700000000,
             metadata: BTreeMap::from([(
@@ -1587,13 +1677,7 @@ mod tests {
                     raw_length: 1024,
                     stored_length: 1024,
                     compression: shoal_types::Compression::None,
-                    shards: (0..6)
-                        .map(|j| ShardMeta {
-                            shard_id: ShardId::from_data(&[i as u8, j]),
-                            index: j,
-                            size: 512,
-                        })
-                        .collect(),
+                    shards: (0..6).map(|j| ShardId::from_data(&[i as u8, j])).collect(),
                 })
                 .collect();
 

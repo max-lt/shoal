@@ -137,6 +137,12 @@ fn handle_log_entry_broadcast(
                     shoal_logtree::Action::CreateBucketV2 { bucket, owner } => {
                         let _ = meta.create_bucket(bucket, owner.as_deref());
                     }
+                    shoal_logtree::Action::PutBucketLifecycle { bucket, config } => {
+                        let _ = meta.put_bucket_lifecycle(bucket, config);
+                    }
+                    shoal_logtree::Action::DeleteBucketLifecycle { bucket } => {
+                        let _ = meta.delete_bucket_lifecycle(bucket);
+                    }
                     _ => {}
                 }
 
@@ -296,6 +302,12 @@ fn handle_log_entry_broadcast(
                                 }
                                 shoal_logtree::Action::CreateBucketV2 { bucket, owner } => {
                                     let _ = meta.create_bucket(bucket, owner.as_deref());
+                                }
+                                shoal_logtree::Action::PutBucketLifecycle { bucket, config } => {
+                                    let _ = meta.put_bucket_lifecycle(bucket, config);
+                                }
+                                shoal_logtree::Action::DeleteBucketLifecycle { bucket } => {
+                                    let _ = meta.delete_bucket_lifecycle(bucket);
                                 }
                                 _ => {}
                             }
