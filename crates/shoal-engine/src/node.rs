@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 use crate::cache::ShardCache;
 use crate::engine::ShoalEngine;
 use crate::error::EngineError;
+use crate::manifest_store;
 use crate::pending::{self, PendingBuffer};
 
 /// A shard that failed to push to its ring owner and needs retry.
@@ -541,15 +542,14 @@ impl ShoalNode {
         // Check for an existing key mapping before overwriting — if the key
         // already exists, we need to decrement refcounts on the old manifest's
         // shards after writing the new one.
-        let old_manifest = self
-            .meta
-            .get_object_key(bucket, key)?
-            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+        let old_oid = self.meta.get_object_key(bucket, key)?;
+        let old_manifest = match old_oid {
+            Some(oid) => manifest_store::get_manifest(&*self.store, &oid).await?,
+            None => None,
+        };
 
-        // Always write to MetaStore so that ManifestRequest handlers (peer
-        // pulls) can serve the manifest immediately — this is required for
-        // read-after-write consistency across nodes.
-        self.meta.put_manifest(&manifest)?;
+        // Store manifest in ShardStore and cache key mapping in MetaStore.
+        manifest_store::put_manifest(&*self.store, &manifest).await?;
         self.meta.put_object_key(
             bucket,
             key,
@@ -809,10 +809,11 @@ impl ShoalNode {
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), EngineError> {
         // Resolve the manifest before deleting the key mapping so we
         // can decrement shard refcounts afterwards.
-        let manifest = self
-            .meta
-            .get_object_key(bucket, key)?
-            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+        let old_oid = self.meta.get_object_key(bucket, key)?;
+        let manifest = match old_oid {
+            Some(oid) => manifest_store::get_manifest(&*self.store, &oid).await?,
+            None => None,
+        };
 
         if let Some(log_tree) = &self.log_tree {
             // LogTree mode: append delete entry + broadcast.
@@ -946,10 +947,11 @@ impl ShoalNode {
         let object_id = manifest.object_id;
 
         // Check if destination key already exists (overwrite case).
-        let old_manifest = self
-            .meta
-            .get_object_key(dst_bucket, dst_key)?
-            .and_then(|oid| self.meta.get_manifest(&oid).ok().flatten());
+        let old_oid = self.meta.get_object_key(dst_bucket, dst_key)?;
+        let old_manifest = match old_oid {
+            Some(oid) => manifest_store::get_manifest(&*self.store, &oid).await?,
+            None => None,
+        };
 
         // Write destination key mapping + replicate.
         self.meta.put_object_key(
@@ -1261,13 +1263,13 @@ impl ShoalNode {
     /// from the entry's author and retries.
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
         // Fast path: try local.
-        if let Ok(m) = self.head_object_local(bucket, key) {
+        if let Ok(m) = self.head_object_local(bucket, key).await {
             return Ok(m);
         }
 
         // Check pending buffer and targeted pull.
         if self.targeted_pull_for_key(bucket, key).await?
-            && let Ok(m) = self.head_object_local(bucket, key)
+            && let Ok(m) = self.head_object_local(bucket, key).await
         {
             return Ok(m);
         }
@@ -1279,18 +1281,18 @@ impl ShoalNode {
     }
 
     /// Local-only head_object without network.
-    fn head_object_local(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
-        // LogTree mode.
+    async fn head_object_local(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+        // LogTree mode: resolve the ObjectId from the DAG.
         if let Some(log_tree) = &self.log_tree
             && let Some(object_id) = log_tree.resolve(bucket, key)?
-            && let Some(m) = log_tree.get_manifest(&object_id)?
+            && let Some(m) = manifest_store::get_manifest(&*self.store, &object_id).await?
         {
             return Ok(m);
         }
 
-        // MetaStore fallback.
+        // MetaStore key mapping fallback (ObjectId from key cache).
         if let Some(object_id) = self.meta.get_object_key(bucket, key)?
-            && let Some(manifest) = self.meta.get_manifest(&object_id)?
+            && let Some(manifest) = manifest_store::get_manifest(&*self.store, &object_id).await?
         {
             return Ok(manifest);
         }
@@ -1408,30 +1410,20 @@ impl ShoalNode {
                                 }
 
                                 // Batch-pull missing manifests from this peer.
-                                let missing_manifest_ids: Vec<ObjectId> = entries
-                                    .iter()
-                                    .filter_map(|e| match &e.action {
-                                        shoal_logtree::Action::Put { manifest_id, .. } => {
-                                            if log_tree
-                                                .get_manifest(manifest_id)
-                                                .ok()
-                                                .flatten()
-                                                .is_none()
-                                                && self
-                                                    .meta
-                                                    .get_manifest(manifest_id)
-                                                    .ok()
-                                                    .flatten()
-                                                    .is_none()
-                                            {
-                                                Some(*manifest_id)
-                                            } else {
-                                                None
-                                            }
-                                        }
-                                        _ => None,
-                                    })
-                                    .collect();
+                                let mut missing_manifest_ids = Vec::new();
+
+                                for e in &entries {
+                                    if let shoal_logtree::Action::Put { manifest_id, .. } =
+                                        &e.action
+                                        && manifest_store::get_manifest(&*self.store, manifest_id)
+                                            .await
+                                            .ok()
+                                            .flatten()
+                                            .is_none()
+                                    {
+                                        missing_manifest_ids.push(*manifest_id);
+                                    }
+                                }
 
                                 if !missing_manifest_ids.is_empty() {
                                     match transport
@@ -1443,9 +1435,11 @@ impl ShoalNode {
                                                 if let Ok(manifest) =
                                                     postcard::from_bytes::<Manifest>(mb)
                                                 {
-                                                    let _ = self.meta.put_manifest(&manifest);
-                                                    let _ =
-                                                        log_tree.store().put_manifest(&manifest);
+                                                    let _ = manifest_store::put_manifest(
+                                                        &*self.store,
+                                                        &manifest,
+                                                    )
+                                                    .await;
 
                                                     // Cache the key mapping from entries.
                                                     for entry in &entries {
@@ -1542,16 +1536,20 @@ impl ShoalNode {
         // that provided the log entries (e.g. the entry was broadcast without
         // the manifest, and the writer peer was synced second with applied=0).
         if !applied_put_entries.is_empty() {
-            let still_missing: Vec<ObjectId> = applied_put_entries
-                .iter()
-                .filter(|(_, _, mid)| {
-                    log_tree.get_manifest(mid).ok().flatten().is_none()
-                        && self.meta.get_manifest(mid).ok().flatten().is_none()
-                })
-                .map(|(_, _, mid)| *mid)
-                .collect::<std::collections::HashSet<_>>()
-                .into_iter()
-                .collect();
+            let mut still_missing_set = std::collections::HashSet::new();
+
+            for (_, _, mid) in &applied_put_entries {
+                if manifest_store::get_manifest(&*self.store, mid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
+                    still_missing_set.insert(*mid);
+                }
+            }
+
+            let still_missing: Vec<ObjectId> = still_missing_set.into_iter().collect();
 
             if !still_missing.is_empty() {
                 debug!(
@@ -1568,8 +1566,8 @@ impl ShoalNode {
                         Ok(manifest_pairs) => {
                             for (oid, mb) in &manifest_pairs {
                                 if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
-                                    let _ = self.meta.put_manifest(&manifest);
-                                    let _ = log_tree.store().put_manifest(&manifest);
+                                    let _ =
+                                        manifest_store::put_manifest(&*self.store, &manifest).await;
 
                                     for (bucket, key, mid) in &applied_put_entries {
                                         if mid == oid {
@@ -1676,21 +1674,19 @@ impl ShoalNode {
                 }
 
                 // Batch-pull missing manifests.
-                let missing_manifest_ids: Vec<ObjectId> = entries
-                    .iter()
-                    .filter_map(|e| match &e.action {
-                        shoal_logtree::Action::Put { manifest_id, .. } => {
-                            if log_tree.get_manifest(manifest_id).ok().flatten().is_none()
-                                && self.meta.get_manifest(manifest_id).ok().flatten().is_none()
-                            {
-                                Some(*manifest_id)
-                            } else {
-                                None
-                            }
-                        }
-                        _ => None,
-                    })
-                    .collect();
+                let mut missing_manifest_ids = Vec::new();
+
+                for e in &entries {
+                    if let shoal_logtree::Action::Put { manifest_id, .. } = &e.action
+                        && manifest_store::get_manifest(&*self.store, manifest_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .is_none()
+                    {
+                        missing_manifest_ids.push(*manifest_id);
+                    }
+                }
 
                 if !missing_manifest_ids.is_empty()
                     && let Ok(manifest_pairs) =
@@ -1698,8 +1694,7 @@ impl ShoalNode {
                 {
                     for (_oid, mb) in &manifest_pairs {
                         if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
-                            let _ = self.meta.put_manifest(&manifest);
-                            let _ = log_tree.store().put_manifest(&manifest);
+                            let _ = manifest_store::put_manifest(&*self.store, &manifest).await;
                         }
                     }
                 }
@@ -1730,20 +1725,18 @@ impl ShoalNode {
             None
         };
 
-        // Check LogTree manifest cache.
+        // Check ShardStore for manifest by DAG ObjectId.
         if let Some(oid) = &object_id_from_dag
-            && let Some(log_tree) = &self.log_tree
-            && let Some(m) = log_tree.get_manifest(oid)?
+            && let Some(m) = manifest_store::get_manifest(&*self.store, oid).await?
         {
             return Ok(Some(m));
         }
 
-        // Fallback: check MetaStore cache (populated by gossip receiver
-        // even when LogTree entries can't be applied yet).
+        // Fallback: resolve ObjectId from MetaStore key cache and check ShardStore.
         let object_id_from_meta = self.meta.get_object_key(bucket, key)?;
 
         if let Some(oid) = &object_id_from_meta
-            && let Some(manifest) = self.meta.get_manifest(oid)?
+            && let Some(manifest) = manifest_store::get_manifest(&*self.store, oid).await?
         {
             return Ok(Some(manifest));
         }
@@ -1787,8 +1780,8 @@ impl ShoalNode {
                                     from = %peer.node_id,
                                     "fetched manifest from peer"
                                 );
-                                // Cache locally.
-                                let _ = self.meta.put_manifest(&manifest);
+                                // Cache in ShardStore and MetaStore key mapping.
+                                let _ = manifest_store::put_manifest(&*self.store, &manifest).await;
                                 let _ = self.meta.put_object_key(
                                     bucket,
                                     key,
@@ -1796,10 +1789,6 @@ impl ShoalNode {
                                     manifest.total_size,
                                     manifest.created_at,
                                 );
-
-                                if let Some(log_tree) = &self.log_tree {
-                                    let _ = log_tree.store().put_manifest(&manifest);
-                                }
 
                                 // Cache shard owners.
                                 for chunk in &manifest.chunks {
@@ -1841,8 +1830,8 @@ impl ShoalNode {
             if let Ok(Ok(Some(bytes))) = result
                 && let Ok(manifest) = postcard::from_bytes::<Manifest>(&bytes)
             {
-                // Cache locally.
-                let _ = self.meta.put_manifest(&manifest);
+                // Cache in ShardStore and MetaStore key mapping.
+                let _ = manifest_store::put_manifest(&*self.store, &manifest).await;
                 let _ = self.meta.put_object_key(
                     bucket,
                     key,
@@ -1850,10 +1839,6 @@ impl ShoalNode {
                     manifest.total_size,
                     manifest.created_at,
                 );
-
-                if let Some(log_tree) = &self.log_tree {
-                    let _ = log_tree.store().put_manifest(&manifest);
-                }
 
                 return Ok(Some(manifest));
             }

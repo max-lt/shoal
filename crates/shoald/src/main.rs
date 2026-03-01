@@ -603,6 +603,7 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
     // are guaranteed to be Some (--no-logtree requires --standalone).
     if let Some(mut payload_rx) = gossip_payload_rx {
         let meta_gossip = meta.clone();
+        let store_gossip = store.clone();
         let log_tree_gossip = log_tree
             .clone()
             .expect("log_tree must be set in cluster mode");
@@ -629,7 +630,7 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
 
                                         // Pull missing data via QUIC in background.
                                         let meta_bg = meta_gossip.clone();
-                                        let log_tree_bg = log_tree_gossip.clone();
+                                        let store_bg = store_gossip.clone();
                                         let transport_bg = transport_gossip.clone();
                                         let address_book_bg = address_book_gossip.clone();
                                         let entry_bg = entry.clone();
@@ -663,16 +664,14 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                     });
 
                                                     // Pull manifest if not cached locally.
-                                                    if log_tree_bg
-                                                        .get_manifest(manifest_id)
-                                                        .ok()
-                                                        .flatten()
-                                                        .is_none()
-                                                        && meta_bg
-                                                            .get_manifest(manifest_id)
-                                                            .ok()
-                                                            .flatten()
-                                                            .is_none()
+                                                    if shoal_engine::manifest_store::get_manifest(
+                                                        &*store_bg,
+                                                        manifest_id,
+                                                    )
+                                                    .await
+                                                    .ok()
+                                                    .flatten()
+                                                    .is_none()
                                                         && let Some(addr) = addr.clone()
                                                     {
                                                         match transport_bg
@@ -691,10 +690,11 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                                             mb
                                                                         )
                                                                     {
-                                                                        let _ = meta_bg
-                                                                            .put_manifest(
-                                                                                &manifest,
-                                                                            );
+                                                                        let _ = shoal_engine::manifest_store::put_manifest(
+                                                                            &*store_bg,
+                                                                            &manifest,
+                                                                        )
+                                                                        .await;
                                                                         let _ = meta_bg
                                                                             .put_object_key(
                                                                                 bucket,
@@ -702,11 +702,6 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                                                 &manifest.object_id,
                                                                                 manifest.total_size,
                                                                                 manifest.created_at,
-                                                                            );
-                                                                        let _ = log_tree_bg
-                                                                            .store()
-                                                                            .put_manifest(
-                                                                                &manifest,
                                                                             );
                                                                     }
                                                                 }

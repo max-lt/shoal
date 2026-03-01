@@ -4,11 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::RwLock;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions};
-use shoal_types::{Manifest, ObjectId};
-
 use crate::entry::{LogEntry, Version};
 use crate::error::LogTreeError;
+use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 
 type Result<T> = std::result::Result<T, LogTreeError>;
 
@@ -19,7 +17,6 @@ enum Backend {
         db: Database,
         entries: Keyspace,
         tips: Keyspace,
-        manifests: Keyspace,
         state: Keyspace,
         snapshots: Keyspace,
     },
@@ -32,8 +29,6 @@ struct MemoryBackend {
     entries: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// Set of current DAG tip hashes.
     tips: RwLock<HashSet<[u8; 32]>>,
-    /// ObjectId → serialized Manifest.
-    manifests: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// "bucket/key" → serialized Vec<Version>.
     state: RwLock<BTreeMap<String, Vec<u8>>>,
     /// state_hash → serialized snapshot blob.
@@ -74,7 +69,6 @@ impl LogTreeStore {
             backend: Backend::Memory(Box::new(MemoryBackend {
                 entries: RwLock::new(HashMap::new()),
                 tips: RwLock::new(HashSet::new()),
-                manifests: RwLock::new(HashMap::new()),
                 state: RwLock::new(BTreeMap::new()),
                 snapshots: RwLock::new(HashMap::new()),
             })),
@@ -88,9 +82,6 @@ impl LogTreeStore {
         let tips = db
             .keyspace("lt_tips", KeyspaceCreateOptions::default)
             .map_err(storage_err)?;
-        let manifests = db
-            .keyspace("lt_manifests", KeyspaceCreateOptions::default)
-            .map_err(storage_err)?;
         let state = db
             .keyspace("lt_state", KeyspaceCreateOptions::default)
             .map_err(storage_err)?;
@@ -101,7 +92,6 @@ impl LogTreeStore {
             db,
             entries,
             tips,
-            manifests,
             state,
             snapshots,
         })
@@ -204,40 +194,6 @@ impl LogTreeStore {
                 Ok(result)
             }
             Backend::Memory(m) => Ok(m.tips.read().unwrap().iter().copied().collect()),
-        }
-    }
-
-    // ----- Manifests -----
-
-    /// Cache a manifest by its ObjectId.
-    pub fn put_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let bytes = postcard::to_allocvec(manifest)?;
-        let key = *manifest.object_id.as_bytes();
-
-        match &self.backend {
-            Backend::Fjall { manifests, .. } => {
-                manifests.insert(key, bytes).map_err(storage_err)?;
-            }
-            Backend::Memory(m) => {
-                m.manifests.write().unwrap().insert(key, bytes);
-            }
-        }
-        Ok(())
-    }
-
-    /// Retrieve a cached manifest by ObjectId.
-    pub fn get_manifest(&self, id: &ObjectId) -> Result<Option<Manifest>> {
-        let key = id.as_bytes();
-        let bytes = match &self.backend {
-            Backend::Fjall { manifests, .. } => {
-                manifests.get(key).map_err(storage_err)?.map(|v| v.to_vec())
-            }
-            Backend::Memory(m) => m.manifests.read().unwrap().get(key).cloned(),
-        };
-
-        match bytes {
-            Some(b) => Ok(Some(postcard::from_bytes(&b)?)),
-            None => Ok(None),
         }
     }
 

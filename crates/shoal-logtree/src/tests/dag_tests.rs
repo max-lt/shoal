@@ -74,12 +74,11 @@ fn test_compute_delta_diamond_dag() {
     let tree = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
+    let _manifest = test_manifest(oid);
 
     // A: root entry.
     let a = make_entry(1, node_id, &signing_key, "b", "k1", oid, vec![]);
     tree.store().put_entry(&a).unwrap();
-    tree.store().put_manifest(&manifest).unwrap();
 
     // B: child of A.
     let b = make_entry(2, node_id, &signing_key, "b", "k2", oid, vec![a.hash]);
@@ -125,15 +124,12 @@ fn test_apply_sync_entries_diamond_dag() {
     // Build diamond: A → (B, C) → D(merge).
     let a = make_entry(1, node_id, &signing_key, "b", "k1", oid1, vec![]);
     source.store().put_entry(&a).unwrap();
-    source.store().put_manifest(&m1).unwrap();
 
     let b = make_entry(2, node_id, &signing_key, "b", "k2", oid2, vec![a.hash]);
     source.store().put_entry(&b).unwrap();
-    source.store().put_manifest(&m2).unwrap();
 
     let c = make_entry(3, node_id, &signing_key, "b", "k3", oid3, vec![a.hash]);
     source.store().put_entry(&c).unwrap();
-    source.store().put_manifest(&m3).unwrap();
 
     let d = make_merge(4, node_id, &signing_key, vec![b.hash, c.hash]);
     source.store().put_entry(&d).unwrap();
@@ -199,8 +195,7 @@ fn test_compute_delta_deep_chain_100() {
     let tree = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
-    tree.store().put_manifest(&manifest).unwrap();
+    let _manifest = test_manifest(oid);
 
     let mut prev_hash: Option<[u8; 32]> = None;
     let mut hashes = Vec::new();
@@ -246,8 +241,7 @@ fn test_apply_sync_entries_deep_chain() {
     let source = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
-    source.store().put_manifest(&manifest).unwrap();
+    let _manifest = test_manifest(oid);
 
     let mut prev_hash: Option<[u8; 32]> = None;
     for i in 0..100u64 {
@@ -284,8 +278,7 @@ fn test_compute_delta_partial_chain() {
     let tree = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
-    tree.store().put_manifest(&manifest).unwrap();
+    let _manifest = test_manifest(oid);
 
     let mut hashes = Vec::new();
     let mut prev_hash: Option<[u8; 32]> = None;
@@ -378,8 +371,7 @@ fn test_apply_sync_entries_wide_merge() {
     let source = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
-    source.store().put_manifest(&manifest).unwrap();
+    let _manifest = test_manifest(oid);
 
     let mut roots = Vec::new();
     for i in 0..10u64 {
@@ -597,8 +589,7 @@ fn test_apply_sync_entries_double_diamond() {
     let source = LogTree::new(store, node_id, signing_key.clone());
 
     let oid = ObjectId::from([1u8; 32]);
-    let manifest = test_manifest(oid);
-    source.store().put_manifest(&manifest).unwrap();
+    let _manifest = test_manifest(oid);
 
     let a = make_entry(1, node_id, &signing_key, "b", "k1", oid, vec![]);
     source.store().put_entry(&a).unwrap();
@@ -759,10 +750,8 @@ fn test_apply_sync_entries_missing_manifest() {
     let applied = target.apply_sync_entries(&[a]).unwrap();
     assert_eq!(applied, 1, "entry should apply even without manifest");
 
-    // Key should resolve (versions are tracked), but manifest isn't cached.
+    // Key should resolve (versions are tracked).
     assert_eq!(target.resolve("b", "k1").unwrap(), Some(oid));
-    // Manifest lookup returns None.
-    assert!(target.get_manifest(&oid).unwrap().is_none());
 }
 
 // =========================================================================

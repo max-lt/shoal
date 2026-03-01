@@ -59,9 +59,7 @@ impl LogTree {
             created_at: manifest.created_at,
         };
 
-        let entry = self.append(action)?;
-        self.store.put_manifest(manifest)?;
-        Ok(entry)
+        self.append(action)
     }
 
     /// Append a CreateApiKey action. Returns the new LogEntry.
@@ -204,7 +202,7 @@ impl LogTree {
     ///
     /// Returns `true` if the entry was new (not already known).
     /// Returns `Err(MissingParents)` if parents are unknown.
-    pub fn receive_entry(&self, entry: &LogEntry, manifest: Option<&Manifest>) -> Result<bool> {
+    pub fn receive_entry(&self, entry: &LogEntry, _manifest: Option<&Manifest>) -> Result<bool> {
         // Already known?
         if self.store.has_entry(&entry.hash)? {
             return Ok(false);
@@ -234,11 +232,6 @@ impl LogTree {
 
         // Witness the remote HLC.
         self.clock.witness(entry.hlc);
-
-        // Store manifest if provided.
-        if let Some(m) = manifest {
-            self.store.put_manifest(m)?;
-        }
 
         // Remove parents from tips (they now have a child), add this entry as tip.
         for parent in &entry.parents {
@@ -349,11 +342,6 @@ impl LogTree {
         }
 
         Ok(result)
-    }
-
-    /// Get a cached manifest.
-    pub fn get_manifest(&self, id: &ObjectId) -> Result<Option<Manifest>> {
-        self.store.get_manifest(id)
     }
 
     /// Create a snapshot entry recording the current materialized state hash.

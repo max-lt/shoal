@@ -84,7 +84,9 @@ async fn test_network_partition_and_heal() {
             .unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
-                c.node(target).meta().put_manifest(&manifest).unwrap();
+                shoal_engine::manifest_store::put_manifest(&**c.node(target).store(), &manifest)
+                    .await
+                    .unwrap();
                 c.node(target)
                     .meta()
                     .put_object_key(
@@ -168,7 +170,9 @@ async fn test_split_brain_writes_both_sides() {
             .unwrap();
         for target in 0..3 {
             if target != i as usize % 3 {
-                c.node(target).meta().put_manifest(&manifest).unwrap();
+                shoal_engine::manifest_store::put_manifest(&**c.node(target).store(), &manifest)
+                    .await
+                    .unwrap();
                 c.node(target)
                     .meta()
                     .put_object_key(
@@ -201,7 +205,9 @@ async fn test_split_brain_writes_both_sides() {
             .unwrap();
         for target in 3..6 {
             if target != 3 + i as usize % 3 {
-                c.node(target).meta().put_manifest(&manifest).unwrap();
+                shoal_engine::manifest_store::put_manifest(&**c.node(target).store(), &manifest)
+                    .await
+                    .unwrap();
                 c.node(target)
                     .meta()
                     .put_object_key(

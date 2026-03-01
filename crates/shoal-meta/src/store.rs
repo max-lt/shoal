@@ -7,7 +7,7 @@ use std::sync::RwLock;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use shoal_types::{
-    BucketInfo, LifecycleConfiguration, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId,
+    BucketInfo, LifecycleConfiguration, Member, NodeId, ObjectId, ObjectInfo, ShardId,
 };
 use tracing::debug;
 
@@ -30,7 +30,6 @@ enum Backend {
         #[allow(dead_code)]
         db: Database,
         objects: Keyspace,
-        manifests: Keyspace,
         shardmap: Keyspace,
         membership: Keyspace,
         repair_queue: Keyspace,
@@ -47,8 +46,6 @@ enum Backend {
 struct MemoryBackend {
     /// `bucket/key` → ObjectId (32) + total_size (8) + created_at (8).
     objects: RwLock<BTreeMap<String, Vec<u8>>>,
-    /// ObjectId bytes → serialized Manifest.
-    manifests: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// ShardId bytes → serialized Vec<NodeId>.
     shardmap: RwLock<HashMap<[u8; 32], Vec<u8>>>,
     /// NodeId bytes → serialized Member.
@@ -98,7 +95,6 @@ impl MetaStore {
         Self {
             backend: Backend::Memory(Box::new(MemoryBackend {
                 objects: RwLock::new(BTreeMap::new()),
-                manifests: RwLock::new(HashMap::new()),
                 shardmap: RwLock::new(HashMap::new()),
                 membership: RwLock::new(HashMap::new()),
                 repair_queue: RwLock::new(BTreeMap::new()),
@@ -113,7 +109,6 @@ impl MetaStore {
 
     fn init_fjall(db: Database) -> Result<Backend> {
         let objects = db.keyspace("objects", KeyspaceCreateOptions::default)?;
-        let manifests = db.keyspace("manifests", KeyspaceCreateOptions::default)?;
         let shardmap = db.keyspace("shardmap", KeyspaceCreateOptions::default)?;
         let membership = db.keyspace("membership", KeyspaceCreateOptions::default)?;
         let repair_queue = db.keyspace("repair_queue", KeyspaceCreateOptions::default)?;
@@ -125,7 +120,6 @@ impl MetaStore {
         Ok(Backend::Fjall {
             db,
             objects,
-            manifests,
             shardmap,
             membership,
             repair_queue,
@@ -135,40 +129,6 @@ impl MetaStore {
             tags,
             lifecycle,
         })
-    }
-
-    // ----- Manifests (local cache) -----
-
-    /// Store a manifest, keyed by its `object_id`.
-    pub fn put_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let value = postcard::to_allocvec(manifest)?;
-        match &self.backend {
-            Backend::Fjall { manifests, .. } => {
-                manifests.insert(manifest.object_id.as_bytes(), value.as_slice())?;
-            }
-            Backend::Memory(m) => {
-                m.manifests
-                    .write()
-                    .unwrap()
-                    .insert(*manifest.object_id.as_bytes(), value);
-            }
-        }
-        debug!(object_id = %manifest.object_id, "stored manifest");
-        Ok(())
-    }
-
-    /// Retrieve a manifest by its [`ObjectId`].
-    pub fn get_manifest(&self, id: &ObjectId) -> Result<Option<Manifest>> {
-        match &self.backend {
-            Backend::Fjall { manifests, .. } => match manifests.get(id.as_bytes())? {
-                Some(bytes) => Ok(Some(postcard::from_bytes(&bytes)?)),
-                None => Ok(None),
-            },
-            Backend::Memory(m) => match m.manifests.read().unwrap().get(id.as_bytes()) {
-                Some(bytes) => Ok(Some(postcard::from_bytes(bytes)?)),
-                None => Ok(None),
-            },
-        }
     }
 
     // ----- Object key mapping (local cache) -----
@@ -986,33 +946,9 @@ fn repair_queue_key(priority: u64, shard_id: &ShardId) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
-    use shoal_types::{ChunkMeta, MANIFEST_VERSION, MemberState, NodeTopology};
+    use shoal_types::{MemberState, NodeTopology};
 
     use super::*;
-
-    fn test_manifest() -> Manifest {
-        Manifest {
-            version: MANIFEST_VERSION,
-            object_id: ObjectId::from_data(b"test object"),
-            total_size: 5000,
-            chunk_size: 1024,
-            chunks: vec![ChunkMeta {
-                chunk_id: shoal_types::ChunkId::from_data(b"chunk 0"),
-                offset: 0,
-                raw_length: 1024,
-                stored_length: 1024,
-                compression: shoal_types::Compression::None,
-                shards: vec![ShardId::from_data(b"shard 0")],
-            }],
-            created_at: 1700000000,
-            metadata: BTreeMap::from([(
-                "content-type".to_string(),
-                "application/octet-stream".to_string(),
-            )]),
-        }
-    }
 
     fn test_member(name: &[u8]) -> Member {
         Member {
@@ -1030,25 +966,6 @@ mod tests {
         f(MetaStore::open_temporary().unwrap());
         // Pure in-memory.
         f(MetaStore::in_memory());
-    }
-
-    #[test]
-    fn test_manifest_put_get_roundtrip() {
-        with_both_backends(|store| {
-            let manifest = test_manifest();
-            store.put_manifest(&manifest).unwrap();
-            let retrieved = store.get_manifest(&manifest.object_id).unwrap();
-            assert_eq!(retrieved, Some(manifest));
-        });
-    }
-
-    #[test]
-    fn test_manifest_get_nonexistent() {
-        with_both_backends(|store| {
-            let id = ObjectId::from_data(b"nonexistent");
-            let result = store.get_manifest(&id).unwrap();
-            assert!(result.is_none());
-        });
     }
 
     #[test]
@@ -1311,19 +1228,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().to_path_buf();
 
+        let oid = ObjectId::from_data(b"test object");
+
         // Write data.
         {
             let store = MetaStore::open(&path).unwrap();
-            let manifest = test_manifest();
-            store.put_manifest(&manifest).unwrap();
             store
-                .put_object_key(
-                    "bucket",
-                    "key",
-                    &manifest.object_id,
-                    manifest.total_size,
-                    manifest.created_at,
-                )
+                .put_object_key("bucket", "key", &oid, 5000, 1700000000)
                 .unwrap();
             store.put_member(&test_member(b"node-1")).unwrap();
             store
@@ -1338,12 +1249,8 @@ mod tests {
         {
             let store = MetaStore::open(&path).unwrap();
 
-            let manifest = test_manifest();
-            let retrieved = store.get_manifest(&manifest.object_id).unwrap();
-            assert_eq!(retrieved, Some(manifest.clone()));
-
             let obj_id = store.get_object_key("bucket", "key").unwrap();
-            assert_eq!(obj_id, Some(manifest.object_id));
+            assert_eq!(obj_id, Some(oid));
 
             let member = store.get_member(&NodeId::from_data(b"node-1")).unwrap();
             assert!(member.is_some());
@@ -1358,32 +1265,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Concurrent access from multiple threads
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_concurrent_manifest_put_get() {
-        with_both_backends(|store| {
-            let store = std::sync::Arc::new(store);
-            let mut handles = Vec::new();
-
-            for i in 0..20u32 {
-                let s = store.clone();
-                handles.push(std::thread::spawn(move || {
-                    let mut manifest = test_manifest();
-                    // Each thread creates a distinct manifest.
-                    manifest.object_id = ObjectId::from_data(&i.to_le_bytes());
-                    manifest.total_size = i as u64 * 1000;
-                    s.put_manifest(&manifest).unwrap();
-
-                    let got = s.get_manifest(&manifest.object_id).unwrap().unwrap();
-                    assert_eq!(got.total_size, i as u64 * 1000);
-                }));
-            }
-
-            for h in handles {
-                h.join().unwrap();
-            }
-        });
-    }
 
     #[test]
     fn test_concurrent_object_key_operations() {
@@ -1451,20 +1332,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // Overwrite behavior
     // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_manifest_overwrite() {
-        with_both_backends(|store| {
-            let mut manifest = test_manifest();
-            store.put_manifest(&manifest).unwrap();
-
-            manifest.total_size = 99999;
-            store.put_manifest(&manifest).unwrap();
-
-            let got = store.get_manifest(&manifest.object_id).unwrap().unwrap();
-            assert_eq!(got.total_size, 99999);
-        });
-    }
 
     #[test]
     fn test_object_key_overwrite() {
@@ -1686,41 +1553,6 @@ mod tests {
 
             // List should be empty now.
             assert!(store.list_members().unwrap().is_empty());
-        });
-    }
-
-    // -----------------------------------------------------------------------
-    // Manifest with many chunks
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_manifest_with_many_chunks() {
-        with_both_backends(|store| {
-            let chunks: Vec<ChunkMeta> = (0..50)
-                .map(|i| ChunkMeta {
-                    chunk_id: shoal_types::ChunkId::from_data(&[i as u8]),
-                    offset: i as u64 * 1024,
-                    raw_length: 1024,
-                    stored_length: 1024,
-                    compression: shoal_types::Compression::None,
-                    shards: (0..6).map(|j| ShardId::from_data(&[i as u8, j])).collect(),
-                })
-                .collect();
-
-            let manifest = Manifest {
-                version: MANIFEST_VERSION,
-                object_id: ObjectId::from_data(b"big manifest"),
-                total_size: 50 * 1024,
-                chunk_size: 1024,
-                chunks,
-                created_at: 1700000000,
-                metadata: BTreeMap::new(),
-            };
-
-            store.put_manifest(&manifest).unwrap();
-            let got = store.get_manifest(&manifest.object_id).unwrap().unwrap();
-            assert_eq!(got.chunks.len(), 50);
-            assert_eq!(got.chunks[0].shards.len(), 6);
         });
     }
 

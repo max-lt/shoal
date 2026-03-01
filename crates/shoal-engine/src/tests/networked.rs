@@ -109,16 +109,15 @@ impl Transport for FailableMockTransport {
             return Err(NetError::Endpoint("node is down".into()));
         }
 
-        let Some(meta) = self.metas.get(&node_id) else {
+        let Some(store) = self.stores.get(&node_id) else {
             return Ok(vec![]);
         };
 
         let mut result = Vec::new();
         for oid in manifest_ids {
-            if let Ok(Some(manifest)) = meta.get_manifest(oid) {
-                if let Ok(bytes) = postcard::to_allocvec(&manifest) {
-                    result.push((*oid, bytes));
-                }
+            let sid = ShardId::from(*oid);
+            if let Ok(Some(bytes)) = store.get(sid).await {
+                result.push((*oid, bytes.to_vec()));
             }
         }
         Ok(result)
@@ -187,17 +186,20 @@ impl Transport for FailableMockTransport {
             return Err(NetError::Endpoint("node is down".into()));
         }
 
-        let Some(meta) = self.metas.get(&node_id) else {
+        let (Some(meta), Some(store)) = (self.metas.get(&node_id), self.stores.get(&node_id))
+        else {
             return Ok(None);
         };
 
-        let manifest = meta
-            .get_object_key(bucket, key)
-            .ok()
-            .flatten()
-            .and_then(|oid| meta.get_manifest(&oid).ok().flatten());
+        let Some(oid) = meta.get_object_key(bucket, key).ok().flatten() else {
+            return Ok(None);
+        };
 
-        Ok(manifest.and_then(|m| postcard::to_allocvec(&m).ok()))
+        let sid = ShardId::from(oid);
+        match store.get(sid).await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            _ => Ok(None),
+        }
     }
 
     async fn request_response(
@@ -441,7 +443,7 @@ impl TestCluster {
     /// Simulate manifest broadcast from one node to all others.
     ///
     /// Syncs the LogTree entries from `from` to every other node and
-    /// caches the manifest in both the LogTree store and MetaStore.
+    /// caches the manifest in ShardStore and MetaStore key mapping.
     async fn broadcast_manifest(&self, from: usize, bucket: &str, key: &str) {
         let manifest = self.nodes[from].head_object(bucket, key).await.unwrap();
         let src_lt = &self.log_trees[from];
@@ -455,9 +457,10 @@ impl TestCluster {
             let tips = dst_lt.tips().unwrap_or_default();
             let delta = src_lt.compute_delta(&tips).unwrap_or_default();
             let _ = dst_lt.apply_sync_entries(&delta);
-            dst_lt.store().put_manifest(&manifest).unwrap();
 
-            self.nodes[i].meta().put_manifest(&manifest).unwrap();
+            crate::manifest_store::put_manifest(&*self.stores[i], &manifest)
+                .await
+                .unwrap();
             self.nodes[i]
                 .meta()
                 .put_object_key(
@@ -524,7 +527,9 @@ async fn simulate_manifest_broadcast(
     key: &str,
 ) {
     let manifest = source.head_object(bucket, key).await.unwrap();
-    target.meta().put_manifest(&manifest).unwrap();
+    crate::manifest_store::put_manifest(&**target.store(), &manifest)
+        .await
+        .unwrap();
     target
         .meta()
         .put_object_key(
@@ -1788,8 +1793,8 @@ async fn test_logtree_put_also_writes_metastore() {
         .await
         .unwrap();
 
-    // The manifest must be in MetaStore (not just LogTree) so the
-    // ManifestRequest handler can serve it to peers.
+    // The manifest must be in ShardStore so the ManifestRequest handler
+    // can serve it to peers, and in MetaStore's key mapping.
     let meta = c.node(0).meta();
     let got_oid = meta.get_object_key("b", "k").unwrap();
     assert_eq!(
@@ -1798,10 +1803,12 @@ async fn test_logtree_put_also_writes_metastore() {
         "MetaStore should have object key after LogTree put"
     );
 
-    let got_manifest = meta.get_manifest(&oid).unwrap();
+    let got_manifest = crate::manifest_store::get_manifest(&**c.node(0).store(), &oid)
+        .await
+        .unwrap();
     assert!(
         got_manifest.is_some(),
-        "MetaStore should have manifest after LogTree put"
+        "ShardStore should have manifest after LogTree put"
     );
 }
 
@@ -1953,12 +1960,14 @@ async fn test_write_with_disconnected_peers_then_read_from_other() {
 
     // Verify: the writer should have stored ALL shards locally because
     // every push failed (nothing was ACK'd and cleaned up).
+    // +1 for the manifest shard now stored alongside data shards.
     let writer_shards = c.local_shard_count(0).await;
     let manifest = c.node(0).head_object("b", "k").await.unwrap();
     let total_shards: usize = manifest.chunks.iter().map(|ch| ch.shards.len()).sum();
     assert_eq!(
-        writer_shards, total_shards,
-        "writer must store ALL {total_shards} shards locally when all pushes fail, but only has {writer_shards}"
+        writer_shards,
+        total_shards + 1,
+        "writer must store ALL {total_shards} data shards + 1 manifest shard locally when all pushes fail, but has {writer_shards}"
     );
 
     // Reconnect nodes and propagate manifest.

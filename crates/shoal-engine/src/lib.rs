@@ -10,6 +10,7 @@
 pub mod cache;
 pub mod engine;
 pub mod error;
+pub mod manifest_store;
 pub mod node;
 pub mod pending;
 

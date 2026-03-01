@@ -96,17 +96,16 @@ impl Transport for MockTransport {
             return Err(NetError::Endpoint("node is down".into()));
         }
 
-        let Some(meta) = self.metas.get(&node_id) else {
+        let Some(store) = self.stores.get(&node_id) else {
             return Ok(vec![]);
         };
 
         let mut result = Vec::new();
 
         for oid in manifest_ids {
-            if let Ok(Some(manifest)) = meta.get_manifest(oid)
-                && let Ok(bytes) = postcard::to_allocvec(&manifest)
-            {
-                result.push((*oid, bytes));
+            let sid = ShardId::from(*oid);
+            if let Ok(Some(bytes)) = store.get(sid).await {
+                result.push((*oid, bytes.to_vec()));
             }
         }
 
@@ -151,17 +150,20 @@ impl Transport for MockTransport {
             return Err(NetError::Endpoint("node is down".into()));
         }
 
-        let Some(meta) = self.metas.get(&node_id) else {
+        let (Some(meta), Some(store)) = (self.metas.get(&node_id), self.stores.get(&node_id))
+        else {
             return Ok(None);
         };
 
-        let manifest = meta
-            .get_object_key(bucket, key)
-            .ok()
-            .flatten()
-            .and_then(|oid| meta.get_manifest(&oid).ok().flatten());
+        let Some(oid) = meta.get_object_key(bucket, key).ok().flatten() else {
+            return Ok(None);
+        };
 
-        Ok(manifest.and_then(|m| postcard::to_allocvec(&m).ok()))
+        let sid = ShardId::from(oid);
+        match store.get(sid).await {
+            Ok(Some(bytes)) => Ok(Some(bytes.to_vec())),
+            _ => Ok(None),
+        }
     }
 
     async fn request_response(
@@ -355,7 +357,9 @@ impl IntegrationCluster {
             if i == from {
                 continue;
             }
-            node.meta().put_manifest(&manifest).unwrap();
+            shoal_engine::manifest_store::put_manifest(&**node.store(), &manifest)
+                .await
+                .unwrap();
             node.meta()
                 .put_object_key(
                     bucket,

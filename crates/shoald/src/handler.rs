@@ -19,7 +19,7 @@ use shoal_meta::MetaStore;
 use shoal_net::{ShoalMessage, ShoalTransport, Transport};
 use shoal_store::ShardStore;
 use shoal_types::events::{EventBus, ShardSource, ShardStored};
-use shoal_types::{Manifest, NodeId, ObjectId};
+use shoal_types::{Manifest, NodeId};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -104,6 +104,7 @@ fn handle_log_entry_broadcast(
     entry_bytes_list: Vec<Vec<u8>>,
     log_tree: Option<&Arc<LogTree>>,
     meta: &Arc<MetaStore>,
+    store: &Arc<dyn ShardStore>,
     pending_buf: &PendingBuffer,
     transport: Option<&Arc<dyn Transport>>,
     address_book: &Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>>,
@@ -179,6 +180,7 @@ fn handle_log_entry_broadcast(
         let transport = transport.clone();
         let log_tree = log_tree.clone();
         let meta = meta.clone();
+        let store = store.clone();
         let pending_buf = pending_buf.clone();
         let address_book = address_book.clone();
 
@@ -221,21 +223,19 @@ fn handle_log_entry_broadcast(
                         let _ = log_tree.apply_sync_entries(&entries);
 
                         // Batch-pull missing manifests.
-                        let missing_manifest_ids: Vec<ObjectId> = entries
-                            .iter()
-                            .filter_map(|e| match &e.action {
-                                shoal_logtree::Action::Put { manifest_id, .. } => {
-                                    if log_tree.get_manifest(manifest_id).ok().flatten().is_none()
-                                        && meta.get_manifest(manifest_id).ok().flatten().is_none()
-                                    {
-                                        Some(*manifest_id)
-                                    } else {
-                                        None
-                                    }
-                                }
-                                _ => None,
-                            })
-                            .collect();
+                        let mut missing_manifest_ids = Vec::new();
+
+                        for e in &entries {
+                            if let shoal_logtree::Action::Put { manifest_id, .. } = &e.action
+                                && shoal_engine::manifest_store::get_manifest(&*store, manifest_id)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                                    .is_none()
+                            {
+                                missing_manifest_ids.push(*manifest_id);
+                            }
+                        }
 
                         if !missing_manifest_ids.is_empty()
                             && let Ok(manifest_pairs) = transport
@@ -244,8 +244,10 @@ fn handle_log_entry_broadcast(
                         {
                             for (oid, mb) in &manifest_pairs {
                                 if let Ok(manifest) = postcard::from_bytes::<Manifest>(mb) {
-                                    let _ = meta.put_manifest(&manifest);
-                                    let _ = log_tree.store().put_manifest(&manifest);
+                                    let _ = shoal_engine::manifest_store::put_manifest(
+                                        &*store, &manifest,
+                                    )
+                                    .await;
 
                                     // Cache key mappings.
                                     for entry in &entries {
@@ -343,6 +345,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
         let conn_uni = conn.clone();
         let log_tree_uni = self.log_tree.clone();
         let meta_uni = self.meta.clone();
+        let store_uni = self.store.clone();
         let pending_uni = self.pending_entries.clone();
         let transport_uni = self.transport.clone();
         let address_book_uni = self.address_book.clone();
@@ -350,6 +353,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
             ShoalTransport::handle_connection(conn_uni, move |msg, _conn| {
                 let log_tree = log_tree_uni.clone();
                 let meta = meta_uni.clone();
+                let store = store_uni.clone();
                 let pending = pending_uni.clone();
                 let transport = transport_uni.clone();
                 let address_book = address_book_uni.clone();
@@ -360,6 +364,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                 vec![entry_bytes],
                                 log_tree.as_ref(),
                                 &meta,
+                                &store,
                                 &pending,
                                 transport.as_ref(),
                                 &address_book,
@@ -431,19 +436,18 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             })
                         }
                         ShoalMessage::ManifestRequest { manifest_ids } => {
-                            // Batch lookup: check MetaStore and LogTree for each ID.
-                            let manifests: Vec<(ObjectId, Vec<u8>)> = manifest_ids
-                                .iter()
-                                .filter_map(|oid| {
-                                    let manifest =
-                                        meta.get_manifest(oid).ok().flatten().or_else(|| {
-                                            let lt = log_tree.as_ref()?;
-                                            lt.get_manifest(oid).ok()?
-                                        })?;
-                                    let bytes = postcard::to_allocvec(&manifest).ok()?;
-                                    Some((*oid, bytes))
-                                })
-                                .collect();
+                            // Batch lookup: read manifests from ShardStore.
+                            let mut manifests = Vec::new();
+
+                            for oid in &manifest_ids {
+                                if let Ok(Some(manifest)) =
+                                    shoal_engine::manifest_store::get_manifest(&*store, oid).await
+                                    && let Ok(bytes) = postcard::to_allocvec(&manifest)
+                                {
+                                    manifests.push((*oid, bytes));
+                                }
+                            }
+
                             Some(ShoalMessage::ManifestResponse { manifests })
                         }
                         ShoalMessage::LogSyncRequest { tips } => {
@@ -492,16 +496,25 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                             Some(ShoalMessage::ApiKeyResponse { keys })
                         }
                         ShoalMessage::KeyLookupRequest { bucket, key } => {
-                            let manifest = meta
-                                .get_object_key(&bucket, &key)
-                                .ok()
-                                .flatten()
-                                .and_then(|oid| meta.get_manifest(&oid).ok().flatten())
-                                .or_else(|| {
-                                    let lt = log_tree.as_ref()?;
-                                    let oid = lt.resolve(&bucket, &key).ok()??;
-                                    lt.get_manifest(&oid).ok()?
-                                });
+                            // Resolve ObjectId from MetaStore key cache or LogTree DAG,
+                            // then read manifest from ShardStore.
+                            let oid =
+                                meta.get_object_key(&bucket, &key)
+                                    .ok()
+                                    .flatten()
+                                    .or_else(|| {
+                                        let lt = log_tree.as_ref()?;
+                                        lt.resolve(&bucket, &key).ok()?
+                                    });
+                            let manifest = match oid {
+                                Some(oid) => {
+                                    shoal_engine::manifest_store::get_manifest(&*store, &oid)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                }
+                                None => None,
+                            };
                             let bytes = manifest.and_then(|m| postcard::to_allocvec(&m).ok());
                             Some(ShoalMessage::KeyLookupResponse { manifest: bytes })
                         }
@@ -549,6 +562,8 @@ mod tests {
         let receiver_tree = Arc::new(LogTree::new(receiver_store, receiver_node, receiver_key));
 
         let meta = Arc::new(MetaStore::open_temporary().unwrap());
+        let shard_store: Arc<dyn ShardStore> =
+            Arc::new(shoal_store::MemoryStore::new(1024 * 1024 * 1024));
         let pending_buf: PendingBuffer = Arc::new(std::sync::Mutex::new(Vec::new()));
         let address_book: Arc<RwLock<HashMap<NodeId, iroh::EndpointAddr>>> =
             Arc::new(RwLock::new(HashMap::new()));
@@ -565,6 +580,7 @@ mod tests {
             vec![entry_bytes],
             Some(&receiver_tree),
             &meta,
+            &shard_store,
             &pending_buf,
             None, // no transport needed for this test
             &address_book,

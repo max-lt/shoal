@@ -181,18 +181,6 @@ fn test_versions_returns_all_sorted() {
 }
 
 #[test]
-fn test_manifest_cache() {
-    let tree = test_tree(1);
-    let oid = ObjectId::from([42u8; 32]);
-    let manifest = test_manifest(oid);
-
-    tree.append_put("b", "k", oid, &manifest).unwrap();
-
-    let cached = tree.get_manifest(&oid).unwrap();
-    assert_eq!(cached, Some(manifest));
-}
-
-#[test]
 fn test_list_keys_filters_deleted() {
     let tree = test_tree(1);
     let oid = ObjectId::from([1u8; 32]);

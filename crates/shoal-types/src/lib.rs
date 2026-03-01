@@ -87,6 +87,22 @@ define_id!(
 );
 
 // ---------------------------------------------------------------------------
+// Cross-ID conversions
+// ---------------------------------------------------------------------------
+
+impl From<ObjectId> for ShardId {
+    fn from(oid: ObjectId) -> Self {
+        ShardId::from(*oid.as_bytes())
+    }
+}
+
+impl From<ShardId> for ObjectId {
+    fn from(sid: ShardId) -> Self {
+        ObjectId::from(*sid.as_bytes())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // List API result types
 // ---------------------------------------------------------------------------
 

@@ -367,14 +367,13 @@ fn spawn_protocol_handler(
                                 })
                             }
                             ShoalMessage::ManifestRequest { manifest_ids } => {
-                                let manifests: Vec<(ObjectId, Vec<u8>)> = manifest_ids
-                                    .iter()
-                                    .filter_map(|oid| {
-                                        let manifest = meta.get_manifest(oid).ok().flatten()?;
-                                        let bytes = postcard::to_allocvec(&manifest).ok()?;
-                                        Some((*oid, bytes))
-                                    })
-                                    .collect();
+                                let mut manifests: Vec<(ObjectId, Vec<u8>)> = Vec::new();
+                                for oid in &manifest_ids {
+                                    let sid = ShardId::from(*oid);
+                                    if let Ok(Some(bytes)) = store.get(sid).await {
+                                        manifests.push((*oid, bytes.to_vec()));
+                                    }
+                                }
                                 Some(ShoalMessage::ManifestResponse { manifests })
                             }
                             ShoalMessage::ApiKeyRequest { access_key_ids } => {
@@ -590,7 +589,9 @@ impl QuicTestCluster {
             if i == from {
                 continue;
             }
-            node.meta().put_manifest(&manifest).unwrap();
+            crate::manifest_store::put_manifest(&**node.store(), &manifest)
+                .await
+                .unwrap();
             node.meta()
                 .put_object_key(
                     bucket,

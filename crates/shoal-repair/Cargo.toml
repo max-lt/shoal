@@ -12,6 +12,7 @@ shoal-placement = { workspace = true }
 shoal-net = { workspace = true }
 shoal-cluster = { workspace = true }
 bytes = { workspace = true }
+postcard = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

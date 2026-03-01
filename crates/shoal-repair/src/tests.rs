@@ -171,7 +171,18 @@ impl TestCluster {
             created_at: 1700000000,
             metadata: std::collections::BTreeMap::new(),
         };
-        meta.put_manifest(&manifest).unwrap();
+
+        // Store manifest as a regular shard in all stores.
+        let manifest_sid = ShardId::from(manifest.object_id);
+        let manifest_bytes = postcard::to_allocvec(&manifest).unwrap();
+
+        for store in stores.values() {
+            store
+                .put(manifest_sid, Bytes::from(manifest_bytes.clone()))
+                .await
+                .unwrap();
+        }
+
         meta.put_object_key(
             "__all__",
             "test-object",

@@ -216,7 +216,8 @@ impl RepairExecutor {
     async fn try_rs_reconstruct(&self, shard_id: ShardId) -> Result<Bytes, RepairError> {
         // Find the manifest that contains this shard.
         let (manifest, chunk_idx, shard_idx) = self
-            .find_manifest_for_shard(shard_id)?
+            .find_manifest_for_shard(shard_id)
+            .await?
             .ok_or(RepairError::ManifestNotFound(shard_id))?;
 
         let chunk_meta = &manifest.chunks[chunk_idx];
@@ -275,7 +276,7 @@ impl RepairExecutor {
     /// Scan manifests to find which one contains the given shard.
     ///
     /// Returns `(manifest, chunk_index, shard_index)`.
-    fn find_manifest_for_shard(
+    async fn find_manifest_for_shard(
         &self,
         shard_id: ShardId,
     ) -> Result<Option<(Manifest, usize, u8)>, RepairError> {
@@ -287,17 +288,23 @@ impl RepairExecutor {
         // For now, we rely on the caller to have stored manifests and use a
         // linear scan approach through the objects keyspace.
         let objects = self.meta.list_objects("__all__", "")?;
+
         for obj in &objects {
-            if let Ok(Some(manifest)) = self.meta.get_manifest(&obj.object_id) {
+            let sid = ShardId::from(obj.object_id);
+
+            if let Ok(Some(bytes)) = self.local_store.get(sid).await
+                && let Ok(manifest) = postcard::from_bytes::<Manifest>(&bytes)
+            {
                 for (ci, chunk) in manifest.chunks.iter().enumerate() {
-                    for (shard_idx, sid) in chunk.shards.iter().enumerate() {
-                        if *sid == shard_id {
+                    for (shard_idx, s) in chunk.shards.iter().enumerate() {
+                        if *s == shard_id {
                             return Ok(Some((manifest, ci, shard_idx as u8)));
                         }
                     }
                 }
             }
         }
+
         Ok(None)
     }
 

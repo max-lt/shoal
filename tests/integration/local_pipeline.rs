@@ -6,12 +6,13 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use shoal_cas::{Chunker, build_manifest_with_timestamp};
 use shoal_erasure::{ErasureEncoder, decode};
 use shoal_meta::MetaStore;
 use shoal_placement::Ring;
 use shoal_store::{MemoryStore, ShardStore};
-use shoal_types::{ChunkMeta, NodeId, NodeTopology};
+use shoal_types::{ChunkMeta, Manifest, NodeId, NodeTopology, ShardId};
 
 /// Create 3 simulated nodes with MemoryStores and a Ring.
 fn setup_cluster() -> (HashMap<NodeId, Arc<MemoryStore>>, Ring, Vec<NodeId>) {
@@ -95,7 +96,17 @@ async fn write_object(
     )
     .unwrap();
 
-    meta.put_manifest(&manifest).unwrap();
+    // Store manifest as a regular shard.
+    let manifest_bytes = postcard::to_allocvec(&manifest).unwrap();
+    let manifest_sid = ShardId::from(manifest.object_id);
+    stores
+        .values()
+        .next()
+        .unwrap()
+        .put(manifest_sid, Bytes::from(manifest_bytes))
+        .await
+        .unwrap();
+
     meta.put_object_key(
         bucket,
         key,
@@ -118,7 +129,18 @@ async fn read_object(
     meta: &MetaStore,
 ) -> Option<Vec<u8>> {
     let object_id = meta.get_object_key(bucket, key).unwrap()?;
-    let manifest = meta.get_manifest(&object_id).unwrap()?;
+    let manifest_sid = ShardId::from(object_id);
+    let manifest_bytes = {
+        let mut found = None;
+        for store in stores.values() {
+            if let Ok(Some(b)) = store.get(manifest_sid).await {
+                found = Some(b);
+                break;
+            }
+        }
+        found?
+    };
+    let manifest: Manifest = postcard::from_bytes(&manifest_bytes).ok()?;
 
     let mut result = Vec::with_capacity(manifest.total_size as usize);
 
@@ -144,6 +166,23 @@ async fn read_object(
     }
 
     Some(result)
+}
+
+/// Fetch a manifest from whichever store holds it.
+async fn get_manifest_from_stores(
+    stores: &HashMap<NodeId, Arc<MemoryStore>>,
+    meta: &MetaStore,
+    bucket: &str,
+    key: &str,
+) -> Manifest {
+    let oid = meta.get_object_key(bucket, key).unwrap().unwrap();
+    let sid = ShardId::from(oid);
+    for store in stores.values() {
+        if let Ok(Some(bytes)) = store.get(sid).await {
+            return postcard::from_bytes(&bytes).unwrap();
+        }
+    }
+    panic!("manifest not found in any store");
 }
 
 // ---------------------------------------------------------------------------
@@ -189,11 +228,7 @@ async fn test_chunking_produces_expected_count() {
     )
     .await;
 
-    let oid = meta
-        .get_object_key("bucket", "chunks.bin")
-        .unwrap()
-        .unwrap();
-    let manifest = meta.get_manifest(&oid).unwrap().unwrap();
+    let manifest = get_manifest_from_stores(&stores, &meta, "bucket", "chunks.bin").await;
     assert_eq!(manifest.chunks.len(), 5);
     assert_eq!(manifest.total_size, 5000);
 
@@ -258,11 +293,7 @@ async fn test_single_shard_loss_per_chunk_read_succeeds() {
     .await;
 
     // Delete the first shard (index 0) of each chunk.
-    let oid = meta
-        .get_object_key("bucket", "resilient.bin")
-        .unwrap()
-        .unwrap();
-    let manifest = meta.get_manifest(&oid).unwrap().unwrap();
+    let manifest = get_manifest_from_stores(&stores, &meta, "bucket", "resilient.bin").await;
 
     for chunk_meta in &manifest.chunks {
         let shard_to_delete = chunk_meta.shards[0];
@@ -306,11 +337,7 @@ async fn test_two_shard_loss_per_chunk_read_fails() {
     .await;
 
     // Delete shards at indices 0 and 1 of each chunk.
-    let oid = meta
-        .get_object_key("bucket", "fragile.bin")
-        .unwrap()
-        .unwrap();
-    let manifest = meta.get_manifest(&oid).unwrap().unwrap();
+    let manifest = get_manifest_from_stores(&stores, &meta, "bucket", "fragile.bin").await;
 
     for chunk_meta in &manifest.chunks {
         for shard_id in chunk_meta.shards.iter().take(2) {
@@ -471,11 +498,7 @@ async fn test_parity_shard_reconstruction() {
     )
     .await;
 
-    let oid = meta
-        .get_object_key("bucket", "parity.bin")
-        .unwrap()
-        .unwrap();
-    let manifest = meta.get_manifest(&oid).unwrap().unwrap();
+    let manifest = get_manifest_from_stores(&stores, &meta, "bucket", "parity.bin").await;
 
     // Delete shard index 0 (data shard) from each chunk, forcing parity decode.
     for chunk_meta in &manifest.chunks {
