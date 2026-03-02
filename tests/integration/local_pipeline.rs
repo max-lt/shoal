@@ -11,7 +11,7 @@ use shoal_cas::{Chunker, build_manifest_with_timestamp};
 use shoal_erasure::{ErasureEncoder, decode};
 use shoal_meta::MetaStore;
 use shoal_placement::Ring;
-use shoal_store::{MemoryStore, ShardStore};
+use shoal_store::{MemoryStore, SHARD_TYPE_MANIFEST, ShardStore};
 use shoal_types::{ChunkMeta, Manifest, NodeId, NodeTopology, ShardId};
 
 /// Create 3 simulated nodes with MemoryStores and a Ring.
@@ -103,7 +103,11 @@ async fn write_object(
         .values()
         .next()
         .unwrap()
-        .put(manifest_sid, Bytes::from(manifest_bytes))
+        .put_typed(
+            manifest_sid,
+            Bytes::from(manifest_bytes),
+            SHARD_TYPE_MANIFEST,
+        )
         .await
         .unwrap();
 
@@ -259,8 +263,11 @@ async fn test_shards_distributed_across_nodes() {
         total += list.len();
     }
 
-    // With unique data: 5 chunks × 3 shards = 15 unique shards.
-    assert_eq!(total, 15, "expected 5 chunks × 3 shards = 15 unique shards");
+    // With unique data: 5 chunks × 3 shards = 15 data shards + 1 manifest shard.
+    assert_eq!(
+        total, 16,
+        "expected 5 chunks × 3 shards + 1 manifest = 16 unique shards"
+    );
 
     // Each node should have at least 1 shard.
     for &nid in &nodes {
@@ -467,6 +474,7 @@ async fn test_shard_integrity_verified() {
 
     for store in stores.values() {
         let shard_ids = store.list().await.unwrap();
+
         for sid in shard_ids {
             assert!(
                 store.verify(sid).await.unwrap(),

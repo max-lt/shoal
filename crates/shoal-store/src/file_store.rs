@@ -3,7 +3,8 @@
 //! Stores one file per shard with a 2-level fan-out directory structure:
 //! `{base_dir}/{hex[0..2]}/{hex[2..4]}/{hex}`.
 //!
-//! Each shard file has an 8-byte header: refcount (u32 LE) + payload size (u32 LE),
+//! Each shard file has a 12-byte header:
+//! refcount (u32 LE) + payload size (u32 LE) + shard type (u32 LE),
 //! followed by the raw shard payload.
 
 use std::path::{Path, PathBuf};
@@ -17,21 +18,32 @@ use tracing::{debug, error, warn};
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::error::StoreError;
-use crate::traits::{SHARD_HEADER_SIZE, ShardStore, StorageCapacity};
+use crate::traits::{SHARD_HEADER_SIZE, SHARD_TYPE_DATA, ShardStore, StorageCapacity};
 
-/// Encode an 8-byte shard header: refcount (u32 LE) + payload size (u32 LE).
-fn encode_header(refcount: u32, payload_size: u32) -> [u8; SHARD_HEADER_SIZE] {
+/// Encode a 12-byte shard header.
+fn encode_header(refcount: u32, payload_size: u32, shard_type: u32) -> [u8; SHARD_HEADER_SIZE] {
     let mut buf = [0u8; SHARD_HEADER_SIZE];
     buf[0..4].copy_from_slice(&refcount.to_le_bytes());
     buf[4..8].copy_from_slice(&payload_size.to_le_bytes());
+    buf[8..12].copy_from_slice(&shard_type.to_le_bytes());
     buf
 }
 
-/// Decode refcount and payload size from an 8-byte header.
-fn decode_header(buf: &[u8]) -> (u32, u32) {
+/// Decode refcount, payload size, and shard type from a header.
+///
+/// Handles old 8-byte headers (missing shard_type) by defaulting to
+/// [`SHARD_TYPE_DATA`].
+fn decode_header(buf: &[u8]) -> (u32, u32, u32) {
     let refcount = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let payload_size = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-    (refcount, payload_size)
+
+    let shard_type = if buf.len() >= 12 {
+        u32::from_le_bytes(buf[8..12].try_into().unwrap())
+    } else {
+        SHARD_TYPE_DATA
+    };
+
+    (refcount, payload_size, shard_type)
 }
 
 /// File-based shard store with 2-level fan-out directory layout.
@@ -65,10 +77,13 @@ impl FileStore {
 #[async_trait::async_trait]
 impl ShardStore for FileStore {
     async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
+        self.put_typed(id, data, SHARD_TYPE_DATA).await
+    }
+
+    async fn put_typed(&self, id: ShardId, data: Bytes, shard_type: u32) -> Result<(), StoreError> {
         let path = self.shard_path(&id);
 
-        // Content-addressed: if the shard file already exists, the data is
-        // identical (same blake3 hash → same ShardId). Skip the write.
+        // If the shard file already exists, skip the write.
         if tokio::fs::metadata(&path).await.is_ok() {
             debug!(%id, "shard already on disk, skipping write");
             return Ok(());
@@ -87,7 +102,7 @@ impl ShardStore for FileStore {
         {
             use tokio::io::AsyncWriteExt;
 
-            let header = encode_header(1, data.len() as u32);
+            let header = encode_header(1, data.len() as u32, shard_type);
             let mut f = tokio::fs::File::create(&tmp_path).await?;
             f.write_all(&header).await?;
             f.write_all(&data).await?;
@@ -107,7 +122,7 @@ impl ShardStore for FileStore {
             let _ = dir.sync_all().await;
         }
 
-        debug!(%id, path = %path.display(), size = data.len(), "stored shard to file");
+        debug!(%id, shard_type, path = %path.display(), size = data.len(), "stored shard to file");
         Ok(())
     }
 
@@ -116,7 +131,10 @@ impl ShardStore for FileStore {
 
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                if data.len() < SHARD_HEADER_SIZE {
+                // Accept both old 8-byte and new 12-byte headers.
+                let min_header = 8;
+
+                if data.len() < min_header {
                     error!(%id, len = data.len(), "shard file too small for header");
                     return Err(StoreError::CorruptShard {
                         expected: id,
@@ -124,17 +142,25 @@ impl ShardStore for FileStore {
                     });
                 }
 
-                let payload = &data[SHARD_HEADER_SIZE..];
+                let (_, _, shard_type) = decode_header(&data);
+                let header_len = if data.len() >= SHARD_HEADER_SIZE {
+                    SHARD_HEADER_SIZE
+                } else {
+                    8
+                };
+                let payload = &data[header_len..];
 
-                // Verify-on-read: re-hash the payload and compare to the ShardId.
-                let actual_id = ShardId::from_data(payload);
+                // Only verify data shards (content-addressed).
+                if shard_type == SHARD_TYPE_DATA {
+                    let actual_id = ShardId::from_data(payload);
 
-                if actual_id != id {
-                    error!(expected = %id, actual = %actual_id, "shard corruption detected on read");
-                    return Err(StoreError::CorruptShard {
-                        expected: id,
-                        actual: actual_id,
-                    });
+                    if actual_id != id {
+                        error!(expected = %id, actual = %actual_id, "shard corruption detected on read");
+                        return Err(StoreError::CorruptShard {
+                            expected: id,
+                            actual: actual_id,
+                        });
+                    }
                 }
 
                 Ok(Some(Bytes::copy_from_slice(payload)))
@@ -218,11 +244,23 @@ impl ShardStore for FileStore {
 
         match tokio::fs::read(&path).await {
             Ok(data) => {
-                if data.len() < SHARD_HEADER_SIZE {
+                if data.len() < 8 {
                     return Ok(false);
                 }
 
-                let payload = &data[SHARD_HEADER_SIZE..];
+                let (_, _, shard_type) = decode_header(&data);
+                let header_len = if data.len() >= SHARD_HEADER_SIZE {
+                    SHARD_HEADER_SIZE
+                } else {
+                    8
+                };
+
+                // Non-data shards are not content-addressed — skip verify.
+                if shard_type != SHARD_TYPE_DATA {
+                    return Ok(true);
+                }
+
+                let payload = &data[header_len..];
                 let computed = ShardId::from_data(payload);
                 Ok(computed == id)
             }
@@ -231,10 +269,28 @@ impl ShardStore for FileStore {
         }
     }
 
+    async fn shard_type(&self, id: ShardId) -> Result<Option<u32>, StoreError> {
+        let path = self.shard_path(&id);
+
+        // Read just enough for the header.
+        match tokio::fs::read(&path).await {
+            Ok(data) => {
+                if data.len() < 8 {
+                    return Ok(None);
+                }
+
+                let (_, _, shard_type) = decode_header(&data);
+                Ok(Some(shard_type))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(StoreError::Io(e)),
+        }
+    }
+
     async fn increment_refcount(&self, id: ShardId) -> Result<u32, StoreError> {
         let path = self.shard_path(&id);
 
-        let mut data = tokio::fs::read(&path).await.map_err(|e| {
+        let data = tokio::fs::read(&path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound(id)
             } else {
@@ -246,12 +302,10 @@ impl ShardStore for FileStore {
             return Err(StoreError::NotFound(id));
         }
 
-        let (refcount, payload_size) = decode_header(&data[..SHARD_HEADER_SIZE]);
+        let (refcount, payload_size, shard_type) = decode_header(&data[..SHARD_HEADER_SIZE]);
         let new_refcount = refcount.saturating_add(1);
-        let header = encode_header(new_refcount, payload_size);
-        data[..SHARD_HEADER_SIZE].copy_from_slice(&header);
+        let header = encode_header(new_refcount, payload_size, shard_type);
 
-        // Rewrite only the header bytes.
         use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new()
             .write(true)
@@ -279,9 +333,9 @@ impl ShardStore for FileStore {
             return Err(StoreError::NotFound(id));
         }
 
-        let (refcount, payload_size) = decode_header(&data[..SHARD_HEADER_SIZE]);
+        let (refcount, payload_size, shard_type) = decode_header(&data[..SHARD_HEADER_SIZE]);
         let new_refcount = refcount.saturating_sub(1);
-        let header = encode_header(new_refcount, payload_size);
+        let header = encode_header(new_refcount, payload_size, shard_type);
 
         use tokio::io::AsyncWriteExt;
         let mut f = tokio::fs::OpenOptions::new()
@@ -526,14 +580,15 @@ mod tests {
             expected_path.display()
         );
 
-        // Verify the file content: header (8 bytes) + payload.
+        // Verify the file content: header (12 bytes) + payload.
         let stored = std::fs::read(&expected_path).unwrap();
         assert_eq!(stored.len(), SHARD_HEADER_SIZE + data.len());
         assert_eq!(&stored[SHARD_HEADER_SIZE..], data.as_ref());
 
-        let (refcount, payload_size) = decode_header(&stored[..SHARD_HEADER_SIZE]);
+        let (refcount, payload_size, shard_type) = decode_header(&stored[..SHARD_HEADER_SIZE]);
         assert_eq!(refcount, 1);
         assert_eq!(payload_size, data.len() as u32);
+        assert_eq!(shard_type, SHARD_TYPE_DATA);
     }
 
     #[tokio::test]

@@ -9,11 +9,12 @@ use shoal_types::ShardId;
 use tracing::debug;
 
 use crate::error::StoreError;
-use crate::traits::{SHARD_HEADER_SIZE, ShardStore, StorageCapacity};
+use crate::traits::{SHARD_HEADER_SIZE, SHARD_TYPE_DATA, ShardStore, StorageCapacity};
 
-/// In-memory shard entry: refcount + payload.
+/// In-memory shard entry: refcount + type + payload.
 struct ShardEntry {
     refcount: u32,
+    shard_type: u32,
     data: Bytes,
 }
 
@@ -42,10 +43,12 @@ impl MemoryStore {
 #[async_trait::async_trait]
 impl ShardStore for MemoryStore {
     async fn put(&self, id: ShardId, data: Bytes) -> Result<(), StoreError> {
+        self.put_typed(id, data, SHARD_TYPE_DATA).await
+    }
+
+    async fn put_typed(&self, id: ShardId, data: Bytes, shard_type: u32) -> Result<(), StoreError> {
         let mut map = self.shards.write().expect("lock poisoned");
 
-        // Content-addressed: if the shard already exists, the data is
-        // identical (same blake3 hash → same ShardId). Skip the insert.
         if map.contains_key(&id) {
             debug!(%id, "shard already in memory, skipping write");
             return Ok(());
@@ -53,7 +56,6 @@ impl ShardStore for MemoryStore {
 
         let data_len = data.len() as u64;
         let used = self.used_bytes.load(Ordering::Relaxed);
-        // Account for the header overhead in capacity tracking.
         let total_len = data_len + SHARD_HEADER_SIZE as u64;
 
         if used + total_len > self.max_bytes {
@@ -63,8 +65,15 @@ impl ShardStore for MemoryStore {
             });
         }
 
-        debug!(%id, size = data.len(), "storing shard in memory");
-        map.insert(id, ShardEntry { refcount: 1, data });
+        debug!(%id, size = data.len(), shard_type, "storing shard in memory");
+        map.insert(
+            id,
+            ShardEntry {
+                refcount: 1,
+                data,
+                shard_type,
+            },
+        );
         self.used_bytes.store(used + total_len, Ordering::Relaxed);
         Ok(())
     }
@@ -112,11 +121,20 @@ impl ShardStore for MemoryStore {
 
         match map.get(&id) {
             Some(entry) => {
+                if entry.shard_type != SHARD_TYPE_DATA {
+                    return Ok(true);
+                }
+
                 let computed = ShardId::from_data(&entry.data);
                 Ok(computed == id)
             }
             None => Err(StoreError::NotFound(id)),
         }
+    }
+
+    async fn shard_type(&self, id: ShardId) -> Result<Option<u32>, StoreError> {
+        let map = self.shards.read().expect("lock poisoned");
+        Ok(map.get(&id).map(|entry| entry.shard_type))
     }
 
     async fn increment_refcount(&self, id: ShardId) -> Result<u32, StoreError> {
@@ -246,9 +264,9 @@ mod tests {
 
         let cap = store.capacity().await.unwrap();
         assert_eq!(cap.total_bytes, 1024);
-        // 14 bytes payload + 8 bytes header
-        assert_eq!(cap.used_bytes, 22);
-        assert_eq!(cap.available_bytes, 1002);
+        // 14 bytes payload + 12 bytes header
+        assert_eq!(cap.used_bytes, 26);
+        assert_eq!(cap.available_bytes, 998);
     }
 
     #[tokio::test]
@@ -272,8 +290,8 @@ mod tests {
         let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
-        // 8 payload + 8 header = 16
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 16);
+        // 8 payload + 12 header = 20
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 20);
 
         store.delete(id).await.unwrap();
         assert_eq!(store.capacity().await.unwrap().used_bytes, 0);
@@ -355,13 +373,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_capacity_exact_boundary() {
-        // 10 bytes payload + 8 bytes header = 18 total
-        let store = MemoryStore::new(18);
+        // 10 bytes payload + 12 bytes header = 22 total
+        let store = MemoryStore::new(22);
         let data = Bytes::from(vec![0u8; 10]);
         let id = ShardId::from_data(&data);
 
         store.put(id, data).await.unwrap();
-        assert_eq!(store.capacity().await.unwrap().used_bytes, 18);
+        assert_eq!(store.capacity().await.unwrap().used_bytes, 22);
         assert_eq!(store.capacity().await.unwrap().available_bytes, 0);
 
         // Any additional data should fail.

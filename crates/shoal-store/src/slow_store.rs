@@ -93,6 +93,11 @@ impl ShardStore for SlowStore {
         self.inner.put(id, data).await
     }
 
+    async fn put_typed(&self, id: ShardId, data: Bytes, shard_type: u32) -> Result<(), StoreError> {
+        self.delay(self.write_latency_ms).await;
+        self.inner.put_typed(id, data, shard_type).await
+    }
+
     async fn get(&self, id: ShardId) -> Result<Option<Bytes>, StoreError> {
         self.delay(self.read_latency_ms).await;
         self.inner.get(id).await
@@ -119,6 +124,10 @@ impl ShardStore for SlowStore {
     async fn verify(&self, id: ShardId) -> Result<bool, StoreError> {
         self.delay(self.read_latency_ms).await;
         self.inner.verify(id).await
+    }
+
+    async fn shard_type(&self, id: ShardId) -> Result<Option<u32>, StoreError> {
+        self.inner.shard_type(id).await
     }
 
     async fn increment_refcount(&self, id: ShardId) -> Result<u32, StoreError> {

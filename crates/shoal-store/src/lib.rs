@@ -16,4 +16,6 @@ pub use error::StoreError;
 pub use file_store::FileStore;
 pub use memory_store::MemoryStore;
 pub use slow_store::SlowStore;
-pub use traits::{SHARD_HEADER_SIZE, ShardStore, StorageCapacity};
+pub use traits::{
+    SHARD_HEADER_SIZE, SHARD_TYPE_DATA, SHARD_TYPE_MANIFEST, ShardStore, StorageCapacity,
+};

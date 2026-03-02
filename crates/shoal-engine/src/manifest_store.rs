@@ -1,10 +1,10 @@
 //! Manifest storage helpers backed by [`ShardStore`].
 //!
-//! Manifests are serialized with postcard and stored as regular shards,
-//! keyed by `ShardId::from(manifest.object_id)`.
+//! Manifests are serialized with postcard and stored as typed shards
+//! (`SHARD_TYPE_MANIFEST`), keyed by `ShardId::from(manifest.object_id)`.
 
 use bytes::Bytes;
-use shoal_store::ShardStore;
+use shoal_store::{SHARD_TYPE_MANIFEST, ShardStore};
 use shoal_types::{Manifest, ObjectId, ShardId};
 
 use crate::error::EngineError;
@@ -14,7 +14,9 @@ pub async fn put_manifest(store: &dyn ShardStore, manifest: &Manifest) -> Result
     let sid = ShardId::from(manifest.object_id);
     let bytes = postcard::to_allocvec(manifest)
         .map_err(|e| shoal_store::StoreError::Io(std::io::Error::other(e.to_string())))?;
-    store.put(sid, Bytes::from(bytes)).await?;
+    store
+        .put_typed(sid, Bytes::from(bytes), SHARD_TYPE_MANIFEST)
+        .await?;
     Ok(())
 }
 
