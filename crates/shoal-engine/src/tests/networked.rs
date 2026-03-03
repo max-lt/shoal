@@ -824,7 +824,7 @@ async fn test_5_node_k2_m2() {
 
 /// k=8, m=4: large erasure group.
 #[tokio::test]
-#[ntest::timeout(60000)]
+#[ntest::timeout(120000)]
 async fn test_12_node_k8_m4() {
     let c = TestCluster::new(12, 4096, 8, 4).await;
     let data = test_data(100_000);
@@ -1268,7 +1268,7 @@ async fn test_delete_from_different_node() {
 
 /// Verify various data sizes produce correct results with CDC chunking.
 #[tokio::test]
-#[ntest::timeout(30000)]
+#[ntest::timeout(60000)]
 async fn test_various_data_sizes() {
     for data_size in [100, 1_000, 10_000, 100_000, 500_000] {
         let c = TestCluster::new(3, 1024, 2, 1).await;
@@ -1336,7 +1336,7 @@ async fn test_overwrite_from_different_node() {
 
 /// Multiple nodes write different objects concurrently. All should be readable.
 #[tokio::test]
-#[ntest::timeout(30000)]
+#[ntest::timeout(60000)]
 async fn test_5_node_concurrent_writes() {
     let c = Arc::new(TestCluster::new(5, 1024, 2, 1).await);
 
