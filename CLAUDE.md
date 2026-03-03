@@ -27,7 +27,7 @@ crates/
   shoal-meta/        Metadata persistence (wraps Fjall)
   shoal-erasure/     Reed-Solomon erasure coding (wraps reed-solomon-simd)
   shoal-placement/   Consistent hashing ring (hand-written, ~150 lines)
-  shoal-cluster/     Membership (foca SWIM) + gossip (iroh-gossip)
+  shoal-cluster/     Membership (QUIC ping) + gossip (iroh-gossip)
   shoal-repair/      Auto-repair, rebalancing, throttling
   shoal-net/         Network protocol on iroh QUIC
   shoal-engine/      Node orchestrator, write/read pipelines
@@ -55,7 +55,7 @@ crates/
 | Erasure coding | `reed-solomon-simd` v3                            |
 | Networking     | `iroh` 0.96                                       |
 | Gossip         | `iroh-gossip` 0.96                                |
-| Membership     | `foca` (SWIM protocol)                            |
+| Membership     | QUIC PeerManager (custom)                         |
 | CDC            | `fastcdc` v3 (content-defined chunking)           |
 | Compression    | `zstd` 0.13 (per-chunk, level 3)                  |
 | Signing        | `ed25519-dalek` v2 (LogTree entry signatures)     |

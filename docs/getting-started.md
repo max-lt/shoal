@@ -89,14 +89,14 @@ peers = ["<node1-id>@192.168.1.10:4820"]
 
 Node 2 will:
 1. Connect to node 1 via iroh QUIC
-2. Join the cluster via foca SWIM protocol
+2. Join the cluster via QUIC PeerManager
 3. Receive existing manifests via gossip
 4. Start serving reads and accepting writes
 
 ### Node 3+
 
 Same pattern. Only one seed peer is needed; nodes discover each other
-transitively via the SWIM protocol.
+transitively via the QUIC membership protocol.
 
 ## Cluster Status
 

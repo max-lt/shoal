@@ -273,7 +273,7 @@ pub struct Member {
     pub topology: NodeTopology,
 }
 
-/// Membership state of a cluster node as determined by the SWIM protocol.
+/// Membership state of a cluster node as determined by QUIC health checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemberState {
     /// Node is responsive and healthy.
@@ -299,7 +299,7 @@ pub enum ClusterEvent {
     RepairNeeded(ShardId),
     /// The local node is now active in the cluster.
     ///
-    /// Emitted once the SWIM protocol has confirmed this node's membership.
+    /// Emitted once the membership protocol has confirmed this node's membership.
     /// Components can wait for this event before starting work that depends
     /// on cluster participation (e.g. rebalancing, shard transfers).
     NodeReady(NodeId),

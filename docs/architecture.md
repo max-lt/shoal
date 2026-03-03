@@ -39,7 +39,7 @@ Each layer is a separate Rust crate. Dependencies flow strictly downward.
 | `shoal-meta` | Metadata persistence via Fjall (LSM-tree). Five keyspaces: objects, manifests, shardmap, membership, repair_queue. All keyspaces are caches reconstructible from the cluster |
 | `shoal-erasure` | Reed-Solomon wrapper around `reed-solomon-simd`. Encode/decode with automatic padding, fast-path when all data shards present |
 | `shoal-placement` | Hand-written consistent hash ring (~150 lines). Weighted vnodes, topology-aware placement, ring diff for rebalancing |
-| `shoal-cluster` | Membership via foca (SWIM protocol) over iroh transport. Gossip via iroh-gossip (HyParView + PlumTree). `ClusterState` recomputes the ring on membership changes |
+| `shoal-cluster` | Membership via QUIC PeerManager with ping/pong health checks. Gossip via iroh-gossip (HyParView + PlumTree). `ClusterState` recomputes the ring on membership changes |
 | `shoal-repair` | `RepairDetector` (subscribes to cluster events), `RepairScheduler` (priority queue), `RepairExecutor` (fetch + RS reconstruct + redistribute), `Throttle` (token bucket), circuit breaker |
 | `shoal-net` | Protocol on iroh QUIC. Connection pooling, shard push/pull with blake3 integrity verification, ALPN-based cluster isolation |
 | `shoal-engine` | `ShoalNode` orchestrator: `put_object`, `get_object`, `delete_object`. Ties all layers together. Background tasks for repair |
@@ -109,7 +109,7 @@ concatenation).
 
 ### Node Failure
 
-1. foca SWIM detects the node is unresponsive (ping → indirect ping → suspect → dead)
+1. QUIC health checks detect the node is unresponsive (ping → suspect → dead)
 2. Membership change propagated via gossip to all nodes
 3. All nodes recompute the placement ring
 4. `RepairDetector` identifies under-replicated shards
@@ -142,7 +142,7 @@ reconstructible from the cluster:
 | `objects` | `bucket/key` → `ObjectId` | Manifest gossip |
 | `manifests` | `ObjectId` → serialized `Manifest` | Manifest gossip |
 | `shardmap` | `ShardId` → `Vec<NodeId>` | Placement ring computation |
-| `membership` | `NodeId` → `Member` | foca SWIM protocol |
+| `membership` | `NodeId` → `Member` | QUIC PeerManager |
 | `repair_queue` | `ShardId` → priority | Local, rebuilt by anti-entropy scan |
 
 If Fjall is lost (disk failure), the node can reconstruct its entire index

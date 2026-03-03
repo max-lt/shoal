@@ -35,7 +35,7 @@ two-level fan-out directory structure:
 8-byte header (refcount + payload size) followed by the raw
 payload. Writes are atomic (temp file → fsync → rename). Reads
 re-hash the payload and compare to the ShardId; a mismatch
-means corruption and the shard is treated as missing.
+is reported as corruption.
 
 **MetaStore** (Fjall LSM-tree) stores everything else: object
 key mappings, manifests, shard placement map, membership state,
@@ -57,8 +57,10 @@ for.
 
 2. The engine splits the body into chunks using FastCDC
    (content-defined chunking, ~64 KB average, 256 KB max).
-   Each chunk is Reed-Solomon encoded into `k` data shards +
-   `m` parity shards.
+   Each chunk is compressed with zstd (level 3). If compression
+   would increase the size, the raw data is kept. The chunk is
+   then Reed-Solomon encoded into `k` data shards + `m` parity
+   shards.
 
 3. Every shard is written to the local FileStore first. The
    consistent hash ring determines which node owns each shard,
@@ -79,15 +81,16 @@ see the object once gossip delivers the log entry.
 
 ## Read Path
 
-1. Look up `bucket/key` in MetaStore to get the ObjectId,
-   then fetch the manifest.
+1. Look up `bucket/key` in the local stores (LogTree when
+   enabled, MetaStore otherwise) to get the ObjectId, then
+   fetch the manifest.
 
 2. For each chunk, the engine needs any `k` of the `k + m`
    shards. It checks the local FileStore first, then fetches
    missing shards from peers over QUIC.
 
-3. Each chunk is Reed-Solomon decoded and the original data is
-   reconstructed.
+3. Each chunk is Reed-Solomon decoded, decompressed if needed,
+   and the original data is reconstructed.
 
 4. Chunks are concatenated and streamed back to the client.
 
@@ -173,7 +176,7 @@ resets when enough nodes return.
 
 ## Deep Scrub
 
-Periodically, the deep scrubber verifies shard integrity using
+The deep scrubber verifies shard integrity using
 majority vote:
 
 1. Compute the local blake3 hash.

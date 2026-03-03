@@ -60,7 +60,7 @@ All dependencies are pure Rust:
 | Erasure coding   | `reed-solomon-simd` v3 | Reed-Solomon with runtime SIMD detection             |
 | Networking       | `iroh` 0.96            | QUIC connections, hole punching, relay fallback      |
 | Gossip/broadcast | `iroh-gossip` 0.96     | HyParView + PlumTree epidemic broadcast              |
-| Membership       | `foca`                 | SWIM protocol for failure detection                  |
+| Membership       | QUIC PeerManager       | Ping/pong health checks for failure detection        |
 | CDC              | `fastcdc` v3           | Content-defined chunking for deduplication           |
 | Compression      | `zstd` 0.13            | Per-chunk zstd compression (level 3)                 |
 | Signing          | `ed25519-dalek` v2     | Cryptographic signatures for LogTree entries         |
@@ -73,8 +73,8 @@ All dependencies are pure Rust:
 ### Why these choices?
 
 - **Fjall over redb**: LSM-tree is write-optimized — critical during rebalancing. Fjall is a local cache/index, not source of truth.
-- **foca over custom SWIM**: Production-grade SWIM+Inf.+Susp., `no_std` compatible, pluggable transport over iroh.
-- **iroh-gossip over foca for broadcast**: foca = membership/failure detection; iroh-gossip = event dissemination.
+- **QUIC PeerManager**: Custom ping/pong health checks over iroh QUIC, replacing the previous foca SWIM implementation.
+- **iroh-gossip for broadcast**: PeerManager = membership/failure detection; iroh-gossip = event dissemination.
 - **Custom shard transfer over iroh-blobs**: Simple protocol on iroh QUIC streams.
 - **Hand-written consistent hash ring**: ~150 lines. No crate handles ring diff computation for rebalancing.
 
@@ -165,14 +165,14 @@ pub struct RepairCircuitBreaker {
 ### Node Join
 
 1. New node connects to seed nodes via iroh
-2. foca SWIM propagates membership change
+2. QUIC PeerManager propagates membership change
 3. All nodes recompute placement ring
 4. Ring diff → rebalancing transfers shards gradually (throttled)
 5. Node fully operational once rebalancing completes
 
 ### Node Failure
 
-1. foca detects (ping → indirect ping → suspect → dead)
+1. QUIC health checks detect (ping → suspect → dead)
 2. Membership change propagated via gossip, ring recomputed
 3. Repair scheduler prioritizes shards with fewest remaining copies
 4. Repair executor fetches/reconstructs shards, writes to new owners

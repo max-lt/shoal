@@ -18,9 +18,6 @@ together, self-organize, and reform when members disappear.
 **3-node minimum.** MinIO distributed mode requires at least 4 nodes.
 Shoal forms a functional erasure-coded cluster with 3.
 
-**Fast reads.** In benchmarks against MinIO on the same hardware,
-Shoal serves 5-7x more concurrent read operations per second.
-
 **Content-addressed dedup.** Every shard is identified by its BLAKE3
 hash. Identical data is stored once, regardless of how many objects
 reference it. Re-uploading a slightly modified file only stores the
@@ -59,10 +56,10 @@ See [Getting Started](docs/getting-started.md) for multi-node setup.
 ## How It Works
 
 **Write path.** Object data is split into content-defined chunks. Each
-chunk is Reed-Solomon encoded into `k` data shards + `m` parity
-shards. Shards are placed on nodes via the consistent hash ring.
-A manifest mapping chunks to shards is built and gossiped to the
-cluster.
+chunk is compressed with zstd and Reed-Solomon encoded into `k` data
+shards + `m` parity shards. Shards are placed on nodes via the
+consistent hash ring. A manifest mapping chunks to shards is built
+and gossiped to the cluster.
 
 **Read path.** Look up the manifest, fetch any `k` shards per chunk
 from the ring, erasure-decode, concatenate, and stream back to the
@@ -127,7 +124,6 @@ many nodes are down simultaneously to prevent cascade failures.
 | Erasure coding | `reed-solomon-simd`  |
 | Networking     | `iroh`               |
 | Gossip         | `iroh-gossip`        |
-| Membership     | QUIC ping/pong       |
 | Serialization  | `postcard` + `serde` |
 | HTTP           | `axum`               |
 | Async          | `tokio`              |
