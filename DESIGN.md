@@ -234,3 +234,46 @@ deployments, not hyperscale.
 coding. Replication is faster for writes but costs 3x storage.
 With k=2 m=1, Shoal provides the same fault tolerance at 1.5x
 storage.
+
+## Cluster Resizing
+
+Shoal supports adding and removing nodes from a running cluster.
+The ring is recomputed on every membership change and new writes
+immediately use the updated topology. However, existing shards
+are not proactively rebalanced — they stay on their current
+nodes until repair moves them.
+
+### Scale-up
+
+When new nodes join, the ring includes them and new writes are
+distributed across all nodes. Old data remains on the original
+nodes. Over time, new writes naturally balance the cluster. For
+workloads that are mostly write-once, the imbalance is
+negligible after a moderate volume of new writes.
+
+`Ring::diff()` can compute exactly which shards should move to
+restore perfect balance, but no background rebalancer is wired
+up yet. This is planned future work.
+
+### Scale-down
+
+Nodes must be removed one at a time. After each removal, wait
+for the repair queue to drain before removing the next node.
+This ensures every shard has enough surviving copies before
+another node disappears.
+
+Removing multiple nodes simultaneously is dangerous. With
+`replication_factor=2`, any shard whose two copies both lived
+on removed nodes is permanently lost. The circuit breaker
+(default 50%) suspends repair when too many nodes are down at
+once, which prevents cascade failures but also means
+under-replicated shards cannot be fixed until nodes return.
+
+Safe procedure for removing N nodes from a cluster:
+
+1. Remove one node (graceful leave or shutdown).
+2. Monitor the repair queue until it is empty.
+3. Repeat for the next node.
+
+This guarantees at most one node is missing at any time, which
+is within the fault tolerance of any configuration where m >= 1.
