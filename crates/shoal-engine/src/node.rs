@@ -621,6 +621,14 @@ impl ShoalNode {
         bucket: &str,
         key: &str,
     ) -> Result<(Vec<u8>, Manifest), EngineError> {
+        // The bucket must exist; otherwise report BucketNotFound rather
+        // than the misleading ObjectNotFound that lookup_manifest returns.
+        if !self.meta.bucket_exists(bucket)? {
+            return Err(EngineError::BucketNotFound {
+                bucket: bucket.to_string(),
+            });
+        }
+
         // Step 1: look up manifest — try local first, then ask peers.
         let manifest = match self.lookup_manifest(bucket, key).await? {
             Some(m) => m,
@@ -1248,6 +1256,12 @@ impl ShoalNode {
     /// are pending log entries for this key, triggers a targeted pull
     /// from the entry's author and retries.
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Manifest, EngineError> {
+        if !self.meta.bucket_exists(bucket)? {
+            return Err(EngineError::BucketNotFound {
+                bucket: bucket.to_string(),
+            });
+        }
+
         // Fast path: try local.
         if let Ok(m) = self.head_object_local(bucket, key) {
             return Ok(m);

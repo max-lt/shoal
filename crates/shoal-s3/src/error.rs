@@ -73,6 +73,13 @@ pub enum S3Error {
         message: String,
     },
 
+    /// The requested byte range is not satisfiable.
+    #[error("invalid range: {message}")]
+    InvalidRange {
+        /// Description of the range error.
+        message: String,
+    },
+
     /// Bad request (e.g. exceeded tag limit).
     #[error("bad request: {message}")]
     BadRequest {
@@ -97,6 +104,7 @@ impl S3Error {
             Self::NoSuchKey { .. } => StatusCode::NOT_FOUND,
             Self::NoSuchUpload { .. } => StatusCode::NOT_FOUND,
             Self::InvalidPartNumber { .. } => StatusCode::BAD_REQUEST,
+            Self::InvalidRange { .. } => StatusCode::RANGE_NOT_SATISFIABLE,
             Self::InvalidRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Engine(e) => match e {
                 shoal_engine::EngineError::ObjectNotFound { .. } => StatusCode::NOT_FOUND,
@@ -120,6 +128,7 @@ impl S3Error {
             Self::NoSuchKey { .. } => "NoSuchKey",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
             Self::InvalidPartNumber { .. } => "InvalidArgument",
+            Self::InvalidRange { .. } => "InvalidRange",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::Engine(e) => match e {
                 shoal_engine::EngineError::ObjectNotFound { .. } => "NoSuchKey",

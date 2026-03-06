@@ -219,6 +219,9 @@ fn engine_to_s3(e: shoal_engine::EngineError, bucket: &str, key: &str) -> S3Erro
             bucket: bucket.to_string(),
             key: key.to_string(),
         },
+        shoal_engine::EngineError::BucketNotFound { .. } => S3Error::NoSuchBucket {
+            bucket: bucket.to_string(),
+        },
         other => S3Error::Engine(other),
     }
 }
@@ -431,6 +434,13 @@ pub(crate) async fn list_objects(
                 message: format!("bucket operation '{op}' is not supported"),
             });
         }
+    }
+
+    // Bucket must exist (standard S3 behavior).
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
     }
 
     check_bucket_access(&state, &caller, &bucket).await?;
@@ -693,12 +703,13 @@ async fn copy_object(
 // -----------------------------------------------------------------------
 
 /// Dispatch GET on an object: GetObjectTagging, ListParts, or GetObject.
-#[tracing::instrument(skip(state, caller, params), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
+#[tracing::instrument(skip(state, caller, params, headers), fields(response_status = tracing::field::Empty, content_length = tracing::field::Empty))]
 pub(crate) async fn get_object_handler(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<axum::response::Response, S3Error> {
     check_bucket_access(&state, &caller, &bucket).await?;
 
@@ -727,16 +738,44 @@ pub(crate) async fn get_object_handler(
         .await
         .map_err(|e| engine_to_s3(e, &bucket, &key))?;
 
+    let total_len = data.len();
     let etag = format!("\"{0}\"", manifest.object_id);
 
+    // Handle Range header (RFC 7233).
+    let range = if let Some(range_hdr) = headers.get("range") {
+        let range_str = range_hdr.to_str().unwrap_or("");
+
+        if let Some(spec) = range_str.strip_prefix("bytes=") {
+            Some(parse_byte_range(spec, total_len)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let (status, body_data, content_range): (StatusCode, Vec<u8>, Option<String>) =
+        if let Some((start, end)) = range {
+            let slice = data[start..=end].to_vec();
+            let cr = format!("bytes {start}-{end}/{total_len}");
+            (StatusCode::PARTIAL_CONTENT, slice, Some(cr))
+        } else {
+            (StatusCode::OK, data, None)
+        };
+
     let span = tracing::Span::current();
-    span.record("response_status", 200u16);
-    span.record("content_length", data.len() as u64);
+    span.record("response_status", status.as_u16());
+    span.record("content_length", body_data.len() as u64);
 
     let mut builder = Response::builder()
-        .status(StatusCode::OK)
+        .status(status)
         .header("etag", &etag)
-        .header("content-length", data.len().to_string());
+        .header("content-length", body_data.len().to_string())
+        .header("accept-ranges", "bytes");
+
+    if let Some(ref cr) = content_range {
+        builder = builder.header("content-range", cr);
+    }
 
     // Return standard HTTP headers stored in metadata.
     for &header in PASSTHROUGH_HEADERS {
@@ -752,7 +791,50 @@ pub(crate) async fn get_object_handler(
         }
     }
 
-    Ok(builder.body(Body::from(data)).unwrap())
+    Ok(builder.body(Body::from(body_data)).unwrap())
+}
+
+/// Parse a single byte-range spec (e.g. "0-499", "500-", "-100") and return
+/// inclusive (start, end) indices. Returns `S3Error::InvalidRange` if the
+/// range is not satisfiable.
+fn parse_byte_range(spec: &str, total: usize) -> Result<(usize, usize), S3Error> {
+    let invalid = |detail: &str| S3Error::InvalidRange {
+        message: detail.to_string(),
+    };
+
+    let spec = spec.trim();
+
+    if let Some(suffix) = spec.strip_prefix('-') {
+        // Suffix range: last N bytes.
+        let n: usize = suffix.parse().map_err(|_| invalid(spec))?;
+
+        if n == 0 || n > total {
+            return Err(invalid(spec));
+        }
+
+        Ok((total - n, total - 1))
+    } else if let Some((start_s, end_s)) = spec.split_once('-') {
+        let start: usize = start_s.parse().map_err(|_| invalid(spec))?;
+
+        if end_s.is_empty() {
+            // Open-ended range: start to EOF.
+            if start >= total {
+                return Err(invalid(spec));
+            }
+
+            Ok((start, total - 1))
+        } else {
+            let end: usize = end_s.parse().map_err(|_| invalid(spec))?;
+
+            if start > end || start >= total {
+                return Err(invalid(spec));
+            }
+
+            Ok((start, end.min(total - 1)))
+        }
+    } else {
+        Err(invalid(spec))
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -769,6 +851,13 @@ pub(crate) async fn delete_object_handler(
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<BTreeMap<String, String>>,
 ) -> Result<axum::response::Response, S3Error> {
+    // Bucket must exist (standard S3 behavior).
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
+    }
+
     check_bucket_access(&state, &caller, &bucket).await?;
 
     // Reject unsupported object sub-resources early.
