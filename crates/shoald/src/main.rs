@@ -409,27 +409,53 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
             address_book.clone(),
         ));
 
-        // --- Load persisted peers from previous runs ---
+        // --- Rejoin cluster via persisted peers from previous runs ---
         match meta.list_peer_addrs() {
             Ok(peers) if !peers.is_empty() => {
                 info!(count = peers.len(), "loading persisted peers");
 
+                let mut joined = false;
+
                 for (peer_node_id, addrs) in &peers {
                     if *peer_node_id == node_id {
-                        continue; // Skip self.
+                        continue;
                     }
 
-                    if let Ok(eid) = iroh::EndpointId::from_bytes(peer_node_id.as_bytes()) {
-                        let mut addr = EndpointAddr::new(eid);
+                    let Ok(eid) = iroh::EndpointId::from_bytes(peer_node_id.as_bytes()) else {
+                        continue;
+                    };
 
-                        for socket_addr in addrs {
-                            addr = addr.with_ip_addr(*socket_addr);
+                    let mut addr = EndpointAddr::new(eid);
+
+                    for socket_addr in addrs {
+                        addr = addr.with_ip_addr(*socket_addr);
+                    }
+
+                    // Store in address book for QUIC routing.
+                    address_book
+                        .write()
+                        .await
+                        .insert(*peer_node_id, addr.clone());
+
+                    // Try to rejoin via this peer. One successful join is
+                    // enough — the JoinResponse gives us the full member list.
+                    if !joined {
+                        match handle.join_via_seed(addr.clone()).await {
+                            Ok(()) => {
+                                info!(peer = %peer_node_id, "rejoined cluster via persisted peer");
+                                joined = true;
+                                continue;
+                            }
+                            Err(e) => {
+                                warn!(peer = %peer_node_id, %e, "failed to rejoin via persisted peer");
+                            }
                         }
-
-                        handle
-                            .add_peer(*peer_node_id, addr, 1, u64::MAX, NodeTopology::default())
-                            .await;
                     }
+
+                    // Fall back to adding as a known peer if join failed.
+                    handle
+                        .add_peer(*peer_node_id, addr, 1, u64::MAX, NodeTopology::default())
+                        .await;
                 }
             }
             Ok(_) => {}
@@ -733,8 +759,16 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                                                         {
                                                             Ok(key_pairs) => {
                                                                 for (kid, secret) in &key_pairs {
+                                                                    let record = shoal_types::ApiKeyRecord {
+                                                                        secret: secret.clone(),
+                                                                        permissions: shoal_types::ApiKeyPermissions {
+                                                                            admin_read: true,
+                                                                            admin_write: true,
+                                                                            bucket_scopes: vec![],
+                                                                        },
+                                                                    };
                                                                     let _ = meta_bg
-                                                                        .put_api_key(kid, secret);
+                                                                        .put_api_key(kid, &record);
                                                                 }
                                                             }
                                                             Err(e) => {
@@ -1101,7 +1135,18 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
     }
 
     // --- S3 HTTP API ---
-    let server = S3Server::new(S3ServerConfig { engine: engine_dyn });
+    let admin_secret = if config.s3.admin_secret.is_empty() {
+        let secret = hex::encode(rand::random::<[u8; 20]>());
+        info!(admin_secret = %secret, "generated admin secret (configure [s3] admin_secret to set a fixed value)");
+        secret
+    } else {
+        config.s3.admin_secret.clone()
+    };
+
+    let server = S3Server::new(S3ServerConfig {
+        engine: engine_dyn,
+        admin_secret,
+    });
 
     info!(addr = %config.node.s3_listen_addr, "S3 API ready");
     server
@@ -1459,7 +1504,10 @@ mod tests {
             cluster,
         ));
 
-        let server = S3Server::new(S3ServerConfig { engine });
+        let server = S3Server::new(S3ServerConfig {
+            engine,
+            admin_secret: "test-secret".to_string(),
+        });
 
         // Bind the listener ourselves so we can discover the actual port.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
