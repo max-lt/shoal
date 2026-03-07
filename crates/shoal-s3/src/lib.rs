@@ -26,7 +26,7 @@
 //!
 //! ## Authentication
 //!
-//! - **Admin endpoints** (`/admin/keys`): open, no auth required.
+//! - **Admin endpoints** (`/admin/*`): require `Authorization: Bearer <admin_secret>`.
 //! - **S3 data-plane**: all other endpoints require AWS Signature V4
 //!   authentication using an API key created via the admin endpoint.
 //!   Standard S3 clients (AWS CLI, boto3, Bun S3Client) work out of the box.
@@ -75,6 +75,34 @@ pub(crate) struct AppState {
     pub engine: Arc<dyn ShoalEngine>,
     /// In-flight multipart uploads.
     pub uploads: Arc<RwLock<HashMap<String, MultipartUpload>>>,
+    /// Shared secret for admin API authentication.
+    pub admin_secret: String,
+}
+
+/// Authentication middleware for admin API routes.
+///
+/// Verifies `Authorization: Bearer <admin_secret>` against the configured
+/// admin secret. Returns 401 if missing, 403 if invalid.
+async fn admin_auth_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, S3Error> {
+    let header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    let token = match header {
+        Some(h) => h.strip_prefix("Bearer ").unwrap_or(""),
+        None => "",
+    };
+
+    if token.is_empty() || token != state.admin_secret {
+        return Err(S3Error::AccessDenied);
+    }
+
+    Ok(next.run(request).await)
 }
 
 /// Authentication middleware for S3 data-plane routes.
@@ -97,9 +125,9 @@ async fn auth_middleware(
             // Extract the access_key_id from the Authorization header to try a peer pull.
             if let Some(access_key_id) = auth::extract_access_key_id(&request)
                 && !keys.contains_key(&access_key_id)
-                && let Ok(Some(secret)) = state.engine.lookup_api_key(&access_key_id).await
+                && let Ok(Some(record)) = state.engine.lookup_api_key(&access_key_id).await
             {
-                keys.insert(access_key_id, secret);
+                keys.insert(access_key_id, record.secret);
 
                 // Retry verification with the newly fetched key.
                 match auth::verify_sigv4(&request, &keys) {
@@ -116,9 +144,20 @@ async fn auth_middleware(
         }
     };
 
+    // Look up permissions for the authenticated key.
+    let permissions = state
+        .engine
+        .meta()
+        .get_api_key(&caller_key_id)
+        .ok()
+        .flatten()
+        .map(|r| r.permissions)
+        .unwrap_or_default();
+
     // Insert caller identity so handlers can extract it.
     request.extensions_mut().insert(auth::AuthenticatedCaller {
         access_key_id: caller_key_id,
+        permissions,
     });
 
     Ok(next.run(request).await)
@@ -128,6 +167,11 @@ async fn auth_middleware(
 pub struct S3ServerConfig {
     /// The storage engine to serve (any [`ShoalEngine`] implementation).
     pub engine: Arc<dyn ShoalEngine>,
+    /// Shared secret for admin API authentication.
+    ///
+    /// Admin endpoints require `Authorization: Bearer <admin_secret>`.
+    /// If empty, admin endpoints reject all requests.
+    pub admin_secret: String,
 }
 
 /// S3-compatible HTTP server backed by any [`ShoalEngine`] implementation.
@@ -141,6 +185,7 @@ impl S3Server {
         let state = AppState {
             engine: config.engine,
             uploads: Arc::new(RwLock::new(HashMap::new())),
+            admin_secret: config.admin_secret,
         };
 
         let router = Self::build_router(state);
@@ -185,8 +230,7 @@ impl S3Server {
                 auth_middleware,
             ));
 
-        // Admin routes — open for now (no auth required).
-        // TODO: gate behind admin_secret once we have a proper admin UI / bootstrap flow.
+        // Admin routes — require `Authorization: Bearer <admin_secret>`.
         let admin_routes = Router::new()
             .route(
                 "/admin/keys",
@@ -196,7 +240,25 @@ impl S3Server {
                 "/admin/keys/{access_key_id}",
                 delete(handlers::delete_api_key),
             )
-            .route("/admin/buckets/{name}", post(handlers::admin_create_bucket));
+            .route("/admin/buckets", get(handlers::admin_list_buckets))
+            .route(
+                "/admin/buckets/{name}",
+                post(handlers::admin_create_bucket).delete(handlers::admin_delete_bucket),
+            )
+            .route(
+                "/admin/buckets/{bucket}/objects",
+                get(handlers::admin_list_objects),
+            )
+            .route(
+                "/admin/buckets/{bucket}/objects/{*key}",
+                get(handlers::admin_get_object)
+                    .put(handlers::admin_put_object)
+                    .delete(handlers::admin_delete_object),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                admin_auth_middleware,
+            ));
 
         Router::new()
             .merge(s3_routes)

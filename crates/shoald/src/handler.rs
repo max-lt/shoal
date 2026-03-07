@@ -287,7 +287,15 @@ fn handle_log_entry_broadcast(
                                 transport.pull_api_keys(addr, &missing_key_ids).await
                         {
                             for (kid, secret) in &key_pairs {
-                                let _ = meta.put_api_key(kid, secret);
+                                let record = shoal_types::ApiKeyRecord {
+                                    secret: secret.clone(),
+                                    permissions: shoal_types::ApiKeyPermissions {
+                                        admin_read: true,
+                                        admin_write: true,
+                                        bucket_scopes: vec![],
+                                    },
+                                };
+                                let _ = meta.put_api_key(kid, &record);
                             }
                         }
 
@@ -483,7 +491,7 @@ impl iroh::protocol::ProtocolHandler for ShoalProtocol {
                                     meta.get_api_key(kid)
                                         .ok()
                                         .flatten()
-                                        .map(|s| (kid.clone(), s))
+                                        .map(|record| (kid.clone(), record.secret))
                                 })
                                 .collect();
                             Some(ShoalMessage::ApiKeyResponse { keys })

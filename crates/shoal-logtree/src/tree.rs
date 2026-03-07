@@ -337,11 +337,13 @@ impl LogTree {
                 && !latest.deleted
             {
                 let object_id = latest.manifest_id;
-                let (size, last_modified) = self
-                    .store
-                    .get_manifest(&object_id)?
-                    .map(|m| (m.total_size, m.created_at))
-                    .unwrap_or((0, 0));
+                let manifest = self.store.get_manifest(&object_id)?;
+                let (size, last_modified, content_type) = manifest
+                    .map(|m| {
+                        let ct = m.metadata.get("content-type").cloned();
+                        (m.total_size, m.created_at, ct)
+                    })
+                    .unwrap_or((0, 0, None));
 
                 result.push(ObjectInfo {
                     key,
@@ -349,6 +351,7 @@ impl LogTree {
                     last_modified,
                     etag: object_id.to_string(),
                     object_id,
+                    content_type,
                 });
             }
         }

@@ -20,6 +20,7 @@ use crate::S3Error;
 #[derive(Clone, Debug)]
 pub(crate) struct AuthenticatedCaller {
     pub access_key_id: String,
+    pub permissions: shoal_types::ApiKeyPermissions,
 }
 
 type HmacSha256 = Hmac<Sha256>;

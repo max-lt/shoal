@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use shoal_meta::MetaStore;
-use shoal_types::{BucketInfo, LifecycleConfiguration, Manifest, ObjectId, ObjectInfo};
+use shoal_types::{
+    ApiKeyPermissions, ApiKeyRecord, BucketInfo, LifecycleConfiguration, Manifest, ObjectId,
+    ObjectInfo,
+};
 
 use crate::error::EngineError;
 
@@ -51,16 +54,22 @@ pub trait ShoalEngine: Send + Sync {
         prefix: &str,
     ) -> Result<Vec<ObjectInfo>, EngineError>;
 
-    /// Create an API key, persist it, and replicate via LogTree+gossip.
-    async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError>;
+    /// Create an API key with permissions, persist it, and replicate via LogTree+gossip.
+    async fn create_api_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        permissions: ApiKeyPermissions,
+    ) -> Result<(), EngineError>;
 
     /// Delete an API key, persist the deletion, and replicate via LogTree+gossip.
     async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError>;
 
-    /// Look up an API key secret, falling back to QUIC peer pull if not found locally.
-    ///
-    /// Returns `Some(secret)` if found, `None` if no peer has it.
-    async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError>;
+    /// Look up an API key record, falling back to QUIC peer pull if not found locally.
+    async fn lookup_api_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<ApiKeyRecord>, EngineError>;
 
     /// Copy an object from one location to another (key mapping only, no data copy).
     async fn copy_object(

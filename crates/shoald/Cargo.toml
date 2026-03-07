@@ -34,6 +34,7 @@ bytes = { workspace = true }
 clap = { workspace = true }
 ed25519-dalek = { workspace = true }
 dirs = { workspace = true }
+hex = { workspace = true }
 iroh = { workspace = true }
 iroh-gossip = { workspace = true }
 libc = { workspace = true }

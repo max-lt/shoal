@@ -125,12 +125,15 @@ pub struct RepairSection {
 }
 
 /// `[s3]` section.
-///
-/// API keys are created at runtime via `POST /admin/keys` (currently open,
-/// no auth required on admin endpoints).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct S3Section {}
+pub struct S3Section {
+    /// Shared secret for authenticating admin API requests.
+    ///
+    /// Admin endpoints (`/admin/*`) require `Authorization: Bearer <admin_secret>`.
+    /// If empty, a random secret is generated at startup and displayed.
+    pub admin_secret: String,
+}
 
 /// `[log]` section.
 #[derive(Debug, Deserialize)]

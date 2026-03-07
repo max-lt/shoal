@@ -1501,7 +1501,15 @@ impl ShoalNode {
                                     {
                                         Ok(key_pairs) => {
                                             for (kid, secret) in &key_pairs {
-                                                let _ = self.meta.put_api_key(kid, secret);
+                                                let record = shoal_types::ApiKeyRecord {
+                                                    secret: secret.clone(),
+                                                    permissions: shoal_types::ApiKeyPermissions {
+                                                        admin_read: true,
+                                                        admin_write: true,
+                                                        bucket_scopes: vec![],
+                                                    },
+                                                };
+                                                let _ = self.meta.put_api_key(kid, &record);
                                             }
                                         }
                                         Err(e) => {
@@ -1904,11 +1912,20 @@ impl ShoalNode {
 
     /// Create an API key, persist to MetaStore, and replicate via LogTree+gossip.
     ///
-    /// The secret is stored locally in MetaStore. Only the access_key_id is
-    /// recorded in the DAG — peers pull the secret via QUIC.
-    pub async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError> {
+    /// The record is stored locally in MetaStore. Only the access_key_id is
+    /// recorded in the DAG — peers pull the full record via QUIC.
+    pub async fn create_api_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        permissions: shoal_types::ApiKeyPermissions,
+    ) -> Result<(), EngineError> {
         // 1. Persist to MetaStore.
-        self.meta.put_api_key(key_id, secret)?;
+        let record = shoal_types::ApiKeyRecord {
+            secret: secret.to_string(),
+            permissions,
+        };
+        self.meta.put_api_key(key_id, &record)?;
 
         // 2. Append to LogTree + broadcast (if configured).
         if let Some(log_tree) = &self.log_tree {
@@ -1949,11 +1966,14 @@ impl ShoalNode {
         Ok(())
     }
 
-    /// Look up an API key secret locally, falling back to QUIC peer pull.
-    pub async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
+    /// Look up an API key record locally, falling back to QUIC peer pull.
+    pub async fn lookup_api_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<shoal_types::ApiKeyRecord>, EngineError> {
         // Check MetaStore first.
-        if let Some(secret) = self.meta.get_api_key(access_key_id)? {
-            return Ok(Some(secret));
+        if let Some(record) = self.meta.get_api_key(access_key_id)? {
+            return Ok(Some(record));
         }
 
         // Ask peers if transport is available.
@@ -1978,10 +1998,21 @@ impl ShoalNode {
             {
                 Ok(key_pairs) => {
                     for (kid, secret) in &key_pairs {
-                        let _ = self.meta.put_api_key(kid, secret);
+                        // Peer pull only returns secrets — store with default
+                        // (admin_write) permissions. The full record will be
+                        // synced via LogTree eventually.
+                        let record = shoal_types::ApiKeyRecord {
+                            secret: secret.clone(),
+                            permissions: shoal_types::ApiKeyPermissions {
+                                admin_read: true,
+                                admin_write: true,
+                                bucket_scopes: vec![],
+                            },
+                        };
+                        let _ = self.meta.put_api_key(kid, &record);
 
                         if kid == access_key_id {
-                            return Ok(Some(secret.clone()));
+                            return Ok(Some(record));
                         }
                     }
                 }
@@ -2035,15 +2066,23 @@ impl ShoalEngine for ShoalNode {
         ShoalNode::list_objects(self, bucket, prefix).await
     }
 
-    async fn create_api_key(&self, key_id: &str, secret: &str) -> Result<(), EngineError> {
-        ShoalNode::create_api_key(self, key_id, secret).await
+    async fn create_api_key(
+        &self,
+        key_id: &str,
+        secret: &str,
+        permissions: shoal_types::ApiKeyPermissions,
+    ) -> Result<(), EngineError> {
+        ShoalNode::create_api_key(self, key_id, secret, permissions).await
     }
 
     async fn delete_api_key(&self, key_id: &str) -> Result<(), EngineError> {
         ShoalNode::delete_api_key(self, key_id).await
     }
 
-    async fn lookup_api_key(&self, access_key_id: &str) -> Result<Option<String>, EngineError> {
+    async fn lookup_api_key(
+        &self,
+        access_key_id: &str,
+    ) -> Result<Option<shoal_types::ApiKeyRecord>, EngineError> {
         ShoalNode::lookup_api_key(self, access_key_id).await
     }
 

@@ -11,7 +11,7 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, Response, StatusCode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::AppState;
@@ -65,11 +65,19 @@ fn gen_secret_access_key() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Request body for `POST /admin/keys` (optional JSON).
+#[derive(Deserialize, Default)]
+pub(crate) struct CreateApiKeyRequest {
+    #[serde(default)]
+    pub permissions: Option<shoal_types::ApiKeyPermissions>,
+}
+
 /// Response body for `POST /admin/keys`.
 #[derive(Serialize)]
 pub(crate) struct CreateApiKeyResponse {
     pub access_key_id: String,
     pub secret_access_key: String,
+    pub permissions: shoal_types::ApiKeyPermissions,
 }
 
 /// Create a new API key pair, persist it in MetaStore, and return it.
@@ -78,18 +86,27 @@ pub(crate) struct CreateApiKeyResponse {
 /// `access_key_id` is safe to log; `secret_access_key` must be stored securely
 /// and is never returned again.
 ///
-/// Use `Authorization: Bearer <access_key_id>:<secret_access_key>` for subsequent
-/// S3 requests.
+/// Accepts an optional JSON body with `permissions`. If omitted, defaults to
+/// admin read+write (full access).
 pub(crate) async fn create_api_key(
     State(state): State<AppState>,
+    body: Option<Json<CreateApiKeyRequest>>,
 ) -> Result<(StatusCode, Json<CreateApiKeyResponse>), S3Error> {
     let key_id = gen_access_key_id();
     let secret = gen_secret_access_key();
 
+    let permissions =
+        body.and_then(|b| b.0.permissions)
+            .unwrap_or(shoal_types::ApiKeyPermissions {
+                admin_read: true,
+                admin_write: true,
+                bucket_scopes: vec![],
+            });
+
     // Persist to MetaStore + replicate via LogTree+gossip.
     state
         .engine
-        .create_api_key(&key_id, &secret)
+        .create_api_key(&key_id, &secret, permissions.clone())
         .await
         .map_err(|e| S3Error::Internal {
             message: format!("failed to create api key: {e}"),
@@ -102,6 +119,7 @@ pub(crate) async fn create_api_key(
         Json(CreateApiKeyResponse {
             access_key_id: key_id,
             secret_access_key: secret,
+            permissions,
         }),
     ))
 }
@@ -112,29 +130,33 @@ pub(crate) async fn create_api_key(
 
 /// Response item for `GET /admin/keys`.
 ///
-/// Only the access key ID is returned — secrets are never exposed.
+/// Only the access key ID and permissions are returned — secrets are never exposed.
 #[derive(Serialize)]
 pub(crate) struct ApiKeyInfo {
     pub access_key_id: String,
+    pub permissions: shoal_types::ApiKeyPermissions,
 }
 
-/// List all API key IDs (secrets are NOT returned).
+/// List all API keys with their permissions (secrets are NOT returned).
 ///
 /// Requires `Authorization: Bearer <admin_secret>`.
 pub(crate) async fn list_api_keys(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<ApiKeyInfo>>, S3Error> {
-    let ids = state
+    let keys = state
         .engine
         .meta()
-        .list_api_key_ids()
+        .list_api_keys()
         .map_err(|e| S3Error::Internal {
             message: format!("failed to list api keys: {e}"),
         })?;
 
-    let list: Vec<ApiKeyInfo> = ids
+    let list: Vec<ApiKeyInfo> = keys
         .into_iter()
-        .map(|id| ApiKeyInfo { access_key_id: id })
+        .map(|(id, record)| ApiKeyInfo {
+            access_key_id: id,
+            permissions: record.permissions,
+        })
         .collect();
 
     Ok(Json(list))
@@ -198,6 +220,203 @@ pub(crate) async fn admin_create_bucket(
     Ok(StatusCode::OK)
 }
 
+// -----------------------------------------------------------------------
+// DELETE /admin/buckets/{name} — DeleteBucket (admin)
+// -----------------------------------------------------------------------
+
+pub(crate) async fn admin_delete_bucket(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, S3Error> {
+    state.engine.delete_bucket(&name).await?;
+    info!(bucket = %name, "admin_delete_bucket");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// -----------------------------------------------------------------------
+// GET /admin/buckets — ListBuckets (admin, JSON)
+// -----------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub(crate) struct AdminBucket {
+    pub name: String,
+    pub owner: Option<String>,
+}
+
+pub(crate) async fn admin_list_buckets(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AdminBucket>>, S3Error> {
+    let buckets = state.engine.list_buckets().await?;
+    let list: Vec<AdminBucket> = buckets
+        .into_iter()
+        .map(|b| AdminBucket {
+            name: b.name,
+            owner: b.owner,
+        })
+        .collect();
+    Ok(Json(list))
+}
+
+// -----------------------------------------------------------------------
+// GET /admin/buckets/{bucket}/objects?prefix=&delimiter= — ListObjects (admin, JSON)
+// -----------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub(crate) struct AdminListObjectsParams {
+    #[serde(default)]
+    pub prefix: String,
+    #[serde(default)]
+    pub delimiter: String,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AdminObjectInfo {
+    pub key: String,
+    pub size: u64,
+    pub object_id: String,
+    pub content_type: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct AdminListObjectsResponse {
+    pub objects: Vec<AdminObjectInfo>,
+    pub common_prefixes: Vec<String>,
+}
+
+pub(crate) async fn admin_list_objects(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    Query(params): Query<AdminListObjectsParams>,
+) -> Result<Json<AdminListObjectsResponse>, S3Error> {
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
+    }
+
+    let all_objects = state.engine.list_objects(&bucket, &params.prefix).await?;
+
+    if params.delimiter.is_empty() {
+        let objects: Vec<AdminObjectInfo> = all_objects
+            .into_iter()
+            .map(|o| AdminObjectInfo {
+                key: o.key,
+                size: o.size,
+                object_id: o.object_id.to_string(),
+                content_type: o.content_type,
+            })
+            .collect();
+
+        return Ok(Json(AdminListObjectsResponse {
+            objects,
+            common_prefixes: vec![],
+        }));
+    }
+
+    // Group by delimiter (typically "/") to produce common prefixes.
+    let mut prefixes = std::collections::BTreeSet::new();
+    let mut objects = Vec::new();
+    let prefix_len = params.prefix.len();
+
+    for o in all_objects {
+        if let Some(pos) = o.key[prefix_len..].find(&params.delimiter) {
+            prefixes.insert(o.key[..prefix_len + pos + params.delimiter.len()].to_string());
+        } else {
+            objects.push(AdminObjectInfo {
+                key: o.key,
+                size: o.size,
+                object_id: o.object_id.to_string(),
+                content_type: o.content_type,
+            });
+        }
+    }
+
+    Ok(Json(AdminListObjectsResponse {
+        objects,
+        common_prefixes: prefixes.into_iter().collect(),
+    }))
+}
+
+// -----------------------------------------------------------------------
+// GET /admin/buckets/{bucket}/objects/{*key} — GetObject (admin)
+// -----------------------------------------------------------------------
+
+pub(crate) async fn admin_get_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<axum::response::Response, S3Error> {
+    let (data, manifest) = state
+        .engine
+        .get_object(&bucket, &key)
+        .await
+        .map_err(|e| engine_to_s3(e, &bucket, &key))?;
+
+    let content_type = manifest
+        .metadata
+        .get("content-type")
+        .cloned()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("content-length", data.len().to_string())
+        .body(Body::from(data))
+        .unwrap())
+}
+
+// -----------------------------------------------------------------------
+// PUT /admin/buckets/{bucket}/objects/{*key} — PutObject (admin)
+// -----------------------------------------------------------------------
+
+pub(crate) async fn admin_put_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: bytes::Bytes,
+) -> Result<StatusCode, S3Error> {
+    if !state.engine.bucket_exists(&bucket).await? {
+        return Err(S3Error::NoSuchBucket {
+            bucket: bucket.clone(),
+        });
+    }
+
+    let mut metadata = BTreeMap::new();
+
+    if let Some(ct) = headers.get("content-type") {
+        if let Ok(v) = ct.to_str() {
+            metadata.insert("content-type".to_string(), v.to_string());
+        }
+    }
+
+    state
+        .engine
+        .put_object(&bucket, &key, &body, metadata)
+        .await?;
+
+    info!(bucket = %bucket, key = %key, "admin_put_object");
+    Ok(StatusCode::OK)
+}
+
+// -----------------------------------------------------------------------
+// DELETE /admin/buckets/{bucket}/objects/{*key} — DeleteObject (admin)
+// -----------------------------------------------------------------------
+
+pub(crate) async fn admin_delete_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+) -> Result<StatusCode, S3Error> {
+    match state.engine.delete_object(&bucket, &key).await {
+        Ok(()) => {
+            info!(bucket = %bucket, key = %key, "admin_delete_object");
+        }
+        Err(shoal_engine::EngineError::ObjectNotFound { .. }) => {}
+        Err(e) => return Err(engine_to_s3(e, &bucket, &key)),
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// Generate a unique multipart upload ID using an atomic counter + blake3.
 fn generate_upload_id() -> String {
     let count = UPLOAD_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -227,30 +446,24 @@ fn engine_to_s3(e: shoal_engine::EngineError, bucket: &str, key: &str) -> S3Erro
 }
 
 // -----------------------------------------------------------------------
-// Bucket ownership check
+// Permission checks
 // -----------------------------------------------------------------------
 
-/// Verify that `caller` is allowed to access `bucket`.
-///
-/// A bucket with no owner (legacy or admin-created) is accessible to all
-/// authenticated callers. Otherwise only the creating key may access it.
-async fn check_bucket_access(
-    state: &AppState,
-    caller: &AuthenticatedCaller,
-    bucket: &str,
-) -> Result<(), S3Error> {
-    let owner = state
-        .engine
-        .get_bucket_owner(bucket)
-        .await
-        .map_err(|e| S3Error::Internal {
-            message: format!("failed to look up bucket owner: {e}"),
-        })?;
+/// Verify that `caller` can read from `bucket`.
+fn check_read_access(caller: &AuthenticatedCaller, bucket: &str) -> Result<(), S3Error> {
+    if caller.permissions.can_read(bucket) {
+        Ok(())
+    } else {
+        Err(S3Error::AccessDenied)
+    }
+}
 
-    match owner {
-        None => Ok(()),
-        Some(ref key_id) if key_id == &caller.access_key_id => Ok(()),
-        Some(_) => Err(S3Error::AccessDenied),
+/// Verify that `caller` can write to `bucket`.
+fn check_write_access(caller: &AuthenticatedCaller, bucket: &str) -> Result<(), S3Error> {
+    if caller.permissions.can_write(bucket) {
+        Ok(())
+    } else {
+        Err(S3Error::AccessDenied)
     }
 }
 
@@ -258,22 +471,19 @@ async fn check_bucket_access(
 // GET / — ListBuckets
 // -----------------------------------------------------------------------
 
-/// List buckets visible to the caller (owned by them, or unowned legacy buckets).
+/// List buckets visible to the caller based on permissions.
+///
+/// Admin keys see all buckets. Scoped keys see only their permitted buckets.
 pub(crate) async fn list_buckets_handler(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedCaller>,
 ) -> Result<axum::response::Response, S3Error> {
+    if !caller.permissions.can_list_buckets() {
+        return Err(S3Error::AccessDenied);
+    }
+
     let all_buckets = state.engine.list_buckets().await?;
-
-    let visible: Vec<_> = all_buckets
-        .into_iter()
-        .filter(|b| match &b.owner {
-            None => true,
-            Some(key_id) => key_id == &caller.access_key_id,
-        })
-        .collect();
-
-    let body = xml::list_all_my_buckets("shoal", &visible);
+    let body = xml::list_all_my_buckets("shoal", &all_buckets);
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -303,7 +513,7 @@ pub(crate) async fn create_bucket(
 
     // PUT /{bucket}?lifecycle → PutBucketLifecycleConfiguration
     if params.contains_key("lifecycle") {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return put_bucket_lifecycle(&state, &bucket, &body).await;
     }
 
@@ -313,6 +523,10 @@ pub(crate) async fn create_bucket(
                 message: format!("bucket operation '{op}' is not supported"),
             });
         }
+    }
+
+    if !caller.permissions.can_manage_buckets() {
+        return Err(S3Error::AccessDenied);
     }
 
     state
@@ -340,7 +554,7 @@ pub(crate) async fn delete_bucket_handler(
 ) -> Result<axum::response::Response, S3Error> {
     // DELETE /{bucket}?lifecycle → DeleteBucketLifecycleConfiguration
     if params.contains_key("lifecycle") {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return delete_bucket_lifecycle(&state, &bucket).await;
     }
 
@@ -352,7 +566,10 @@ pub(crate) async fn delete_bucket_handler(
         }
     }
 
-    check_bucket_access(&state, &caller, &bucket).await?;
+    if !caller.permissions.can_manage_buckets() {
+        return Err(S3Error::AccessDenied);
+    }
+
     state.engine.delete_bucket(&bucket).await?;
     info!(bucket = %bucket, "delete_bucket");
     Ok(Response::builder()
@@ -377,7 +594,7 @@ pub(crate) async fn head_bucket_handler(
         });
     }
 
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_read_access(&caller, &bucket)?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
@@ -443,7 +660,7 @@ pub(crate) async fn list_objects(
         });
     }
 
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_read_access(&caller, &bucket)?;
 
     // GET /{bucket}?versioning → GetBucketVersioning (always "not configured")
     if params.contains_key("versioning") {
@@ -535,7 +752,7 @@ pub(crate) async fn put_object_handler(
 
     // PUT /{bucket}/{key}?tagging → PutObjectTagging
     if params.contains_key("tagging") {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return put_object_tagging(&state, &bucket, &key, &body).await;
     }
 
@@ -543,7 +760,7 @@ pub(crate) async fn put_object_handler(
     if let (Some(upload_id), Some(part_number_str)) =
         (params.get("uploadId"), params.get("partNumber"))
     {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return upload_part(&state, &bucket, &key, upload_id, part_number_str, body).await;
     }
 
@@ -551,7 +768,7 @@ pub(crate) async fn put_object_handler(
     if let Some(copy_source) = headers.get("x-amz-copy-source")
         && let Ok(source) = copy_source.to_str()
     {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return copy_object(&state, source, &bucket, &key).await;
     }
 
@@ -562,7 +779,7 @@ pub(crate) async fn put_object_handler(
         });
     }
 
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_write_access(&caller, &bucket)?;
 
     // Regular PutObject.
     let mut metadata = BTreeMap::new();
@@ -711,7 +928,7 @@ pub(crate) async fn get_object_handler(
     Query(params): Query<BTreeMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, S3Error> {
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_read_access(&caller, &bucket)?;
 
     // Reject unsupported object sub-resources early.
     for &op in UNSUPPORTED_OBJECT_OPS {
@@ -858,7 +1075,7 @@ pub(crate) async fn delete_object_handler(
         });
     }
 
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_write_access(&caller, &bucket)?;
 
     // Reject unsupported object sub-resources early.
     for &op in UNSUPPORTED_OBJECT_OPS {
@@ -1137,7 +1354,7 @@ pub(crate) async fn post_bucket_handler(
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
     if params.contains_key("delete") {
-        check_bucket_access(&state, &caller, &bucket).await?;
+        check_write_access(&caller, &bucket)?;
         return delete_objects(&state, &bucket, &body).await;
     }
 
@@ -1200,7 +1417,7 @@ pub(crate) async fn head_object_handler(
     Extension(caller): Extension<AuthenticatedCaller>,
     Path((bucket, key)): Path<(String, String)>,
 ) -> Result<axum::response::Response, S3Error> {
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_read_access(&caller, &bucket)?;
     let manifest = state
         .engine
         .head_object(&bucket, &key)
@@ -1245,7 +1462,7 @@ pub(crate) async fn post_object_handler(
     headers: HeaderMap,
     body: bytes::Bytes,
 ) -> Result<axum::response::Response, S3Error> {
-    check_bucket_access(&state, &caller, &bucket).await?;
+    check_write_access(&caller, &bucket)?;
     if params.contains_key("uploads") {
         return initiate_multipart(&state, &bucket, &key, &headers).await;
     }

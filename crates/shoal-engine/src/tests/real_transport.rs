@@ -384,7 +384,7 @@ fn spawn_protocol_handler(
                                         meta.get_api_key(kid)
                                             .ok()
                                             .flatten()
-                                            .map(|s| (kid.clone(), s))
+                                            .map(|record| (kid.clone(), record.secret))
                                     })
                                     .collect();
                                 Some(ShoalMessage::ApiKeyResponse { keys })

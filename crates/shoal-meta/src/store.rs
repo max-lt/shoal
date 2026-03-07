@@ -7,7 +7,8 @@ use std::sync::RwLock;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions};
 use shoal_types::{
-    BucketInfo, LifecycleConfiguration, Manifest, Member, NodeId, ObjectId, ObjectInfo, ShardId,
+    ApiKeyRecord, BucketInfo, LifecycleConfiguration, Manifest, Member, NodeId, ObjectId,
+    ObjectInfo, ShardId,
 };
 use tracing::debug;
 
@@ -57,8 +58,8 @@ struct MemoryBackend {
     repair_queue: RwLock<BTreeMap<Vec<u8>, [u8; 32]>>,
     /// NodeId bytes → serialized Vec<SocketAddr>.
     peers: RwLock<HashMap<[u8; 32], Vec<u8>>>,
-    /// access_key_id (String) → secret_access_key (String).
-    api_keys: RwLock<HashMap<String, String>>,
+    /// access_key_id → ApiKeyRecord (JSON).
+    api_keys: RwLock<HashMap<String, ApiKeyRecord>>,
     /// Explicitly created bucket names → metadata.
     buckets: RwLock<HashMap<String, BucketMeta>>,
     /// `bucket/key` → serialized BTreeMap<String, String> (tags).
@@ -277,10 +278,13 @@ impl MetaStore {
         let mut result = Vec::with_capacity(pairs.len());
 
         for (key, object_id) in pairs {
-            let (size, last_modified) = self
-                .get_manifest(&object_id)?
-                .map(|m| (m.total_size, m.created_at))
-                .unwrap_or((0, 0));
+            let manifest = self.get_manifest(&object_id)?;
+            let (size, last_modified, content_type) = manifest
+                .map(|m| {
+                    let ct = m.metadata.get("content-type").cloned();
+                    (m.total_size, m.created_at, ct)
+                })
+                .unwrap_or((0, 0, None));
 
             result.push(ObjectInfo {
                 key,
@@ -288,6 +292,7 @@ impl MetaStore {
                 last_modified,
                 etag: object_id.to_string(),
                 object_id,
+                content_type,
             });
         }
 
@@ -404,27 +409,20 @@ impl MetaStore {
         }
     }
 
-    /// Return the owner of a bucket, or `None` for legacy/admin buckets.
+    /// Return the owner of a bucket, or `None` for admin-created buckets.
     ///
     /// Returns `Ok(None)` both when the bucket has no owner and when the
     /// bucket does not exist (callers should check existence separately).
     pub fn get_bucket_owner(&self, name: &str) -> Result<Option<String>> {
         match &self.backend {
-            Backend::Fjall { buckets, .. } => {
-                match buckets.get(name.as_bytes())? {
-                    Some(v) => {
-                        if v.len() == 8 {
-                            // Legacy 8-byte timestamp format: no owner.
-                            Ok(None)
-                        } else if let Ok(meta) = postcard::from_bytes::<BucketMeta>(&v) {
-                            Ok(meta.owner)
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    None => Ok(None),
+            Backend::Fjall { buckets, .. } => match buckets.get(name.as_bytes())? {
+                Some(v) => {
+                    let meta = postcard::from_bytes::<BucketMeta>(&v)
+                        .map_err(|e| MetaError::CorruptData(format!("bucket meta: {e}")))?;
+                    Ok(meta.owner)
                 }
-            }
+                None => Ok(None),
+            },
             Backend::Memory(m) => Ok(m
                 .buckets
                 .read()
@@ -444,20 +442,10 @@ impl MetaStore {
                     let (k, v) = guard.into_inner()?;
 
                     if let Ok(name) = std::str::from_utf8(&k) {
-                        let meta = if v.len() == 8 {
-                            // Legacy format: bare u64 LE timestamp, no owner.
-                            BucketMeta {
-                                created_at: u64::from_le_bytes(v[..8].try_into().unwrap()),
-                                owner: None,
-                            }
-                        } else if let Ok(m) = postcard::from_bytes::<BucketMeta>(&v) {
-                            m
-                        } else {
-                            BucketMeta {
-                                created_at: 0,
-                                owner: None,
-                            }
-                        };
+                        let meta = postcard::from_bytes::<BucketMeta>(&v).unwrap_or(BucketMeta {
+                            created_at: 0,
+                            owner: None,
+                        });
 
                         result.insert(name.to_string(), meta);
                     }
@@ -646,40 +634,43 @@ impl MetaStore {
 
     // ----- API keys (persistent, local to this node) -----
 
-    /// Store an API key pair. Overwrites if the access key already exists.
-    pub fn put_api_key(&self, access_key_id: &str, secret_access_key: &str) -> Result<()> {
+    /// Store an API key record. Overwrites if the access key already exists.
+    pub fn put_api_key(&self, access_key_id: &str, record: &ApiKeyRecord) -> Result<()> {
         match &self.backend {
             Backend::Fjall { api_keys, .. } => {
-                api_keys.insert(access_key_id.as_bytes(), secret_access_key.as_bytes())?;
+                let json = serde_json::to_vec(record).map_err(|e| {
+                    MetaError::CorruptData(format!("failed to serialize api key: {e}"))
+                })?;
+                api_keys.insert(access_key_id.as_bytes(), json)?;
             }
             Backend::Memory(m) => {
                 m.api_keys
                     .write()
                     .unwrap()
-                    .insert(access_key_id.to_string(), secret_access_key.to_string());
+                    .insert(access_key_id.to_string(), record.clone());
             }
         }
         debug!(access_key_id, "stored api key");
         Ok(())
     }
 
-    /// Retrieve the secret for a given access key ID.
-    pub fn get_api_key(&self, access_key_id: &str) -> Result<Option<String>> {
+    /// Retrieve the record for a given access key ID.
+    pub fn get_api_key(&self, access_key_id: &str) -> Result<Option<ApiKeyRecord>> {
         match &self.backend {
             Backend::Fjall { api_keys, .. } => {
                 let Some(value) = api_keys.get(access_key_id.as_bytes())? else {
                     return Ok(None);
                 };
-                let secret = String::from_utf8(value.to_vec()).map_err(|e| {
-                    MetaError::CorruptData(format!("api key secret is not UTF-8: {e}"))
+                let record: ApiKeyRecord = serde_json::from_slice(&value).map_err(|e| {
+                    MetaError::CorruptData(format!("api key record is not valid JSON: {e}"))
                 })?;
-                Ok(Some(secret))
+                Ok(Some(record))
             }
             Backend::Memory(m) => Ok(m.api_keys.read().unwrap().get(access_key_id).cloned()),
         }
     }
 
-    /// Delete an API key pair by access key ID.
+    /// Delete an API key by access key ID.
     pub fn delete_api_key(&self, access_key_id: &str) -> Result<()> {
         match &self.backend {
             Backend::Fjall { api_keys, .. } => {
@@ -693,49 +684,43 @@ impl MetaStore {
         Ok(())
     }
 
-    /// List all access key IDs (secrets are NOT returned).
-    pub fn list_api_key_ids(&self) -> Result<Vec<String>> {
+    /// List all access key IDs with their permissions (secrets are NOT returned).
+    pub fn list_api_keys(&self) -> Result<Vec<(String, ApiKeyRecord)>> {
         match &self.backend {
             Backend::Fjall { api_keys, .. } => {
                 let mut result = Vec::new();
-
-                for guard in api_keys.iter() {
-                    let (k, _v) = guard.into_inner()?;
-                    let key_id = String::from_utf8(k.to_vec()).map_err(|e| {
-                        MetaError::CorruptData(format!("api key ID is not UTF-8: {e}"))
-                    })?;
-                    result.push(key_id);
-                }
-
-                Ok(result)
-            }
-            Backend::Memory(m) => Ok(m.api_keys.read().unwrap().keys().cloned().collect()),
-        }
-    }
-
-    /// Load all API key pairs into a HashMap.
-    ///
-    /// Used at startup to populate the in-memory auth cache.
-    pub fn load_all_api_keys(&self) -> Result<HashMap<String, String>> {
-        match &self.backend {
-            Backend::Fjall { api_keys, .. } => {
-                let mut result = HashMap::new();
 
                 for guard in api_keys.iter() {
                     let (k, v) = guard.into_inner()?;
                     let key_id = String::from_utf8(k.to_vec()).map_err(|e| {
                         MetaError::CorruptData(format!("api key ID is not UTF-8: {e}"))
                     })?;
-                    let secret = String::from_utf8(v.to_vec()).map_err(|e| {
-                        MetaError::CorruptData(format!("api key secret is not UTF-8: {e}"))
-                    })?;
-                    result.insert(key_id, secret);
+                    let record: ApiKeyRecord = serde_json::from_slice(&v)
+                        .map_err(|e| MetaError::CorruptData(format!("api key record: {e}")))?;
+                    result.push((key_id, record));
                 }
 
                 Ok(result)
             }
-            Backend::Memory(m) => Ok(m.api_keys.read().unwrap().clone()),
+            Backend::Memory(m) => Ok(m
+                .api_keys
+                .read()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()),
         }
+    }
+
+    /// Load all API keys into a HashMap (key_id → secret).
+    ///
+    /// Used by the auth middleware for SigV4 verification.
+    pub fn load_all_api_keys(&self) -> Result<HashMap<String, String>> {
+        let keys = self.list_api_keys()?;
+        Ok(keys
+            .into_iter()
+            .map(|(id, record)| (id, record.secret))
+            .collect())
     }
 
     // ----- Object tags -----

@@ -87,6 +87,87 @@ define_id!(
 );
 
 // ---------------------------------------------------------------------------
+// API key permissions (R2-style model)
+// ---------------------------------------------------------------------------
+
+/// Stored record for an API key, including secret and permissions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyRecord {
+    /// Secret access key (never exposed via list endpoints).
+    pub secret: String,
+    /// Permission set for this key.
+    pub permissions: ApiKeyPermissions,
+}
+
+/// R2-style permission model for API keys.
+///
+/// Two axes: admin (account-wide) vs object (per-bucket), read vs read+write.
+/// Admin permissions grant access to all buckets; object permissions are
+/// scoped to specific buckets listed in `bucket_scopes`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiKeyPermissions {
+    /// Can list buckets, read bucket config, read and list objects in all buckets.
+    pub admin_read: bool,
+    /// Can create/delete buckets, write/delete objects in all buckets.
+    /// Implies `admin_read`.
+    pub admin_write: bool,
+    /// Per-bucket object-level access. Ignored when admin flags are set.
+    #[serde(default)]
+    pub bucket_scopes: Vec<BucketScope>,
+}
+
+impl Default for ApiKeyPermissions {
+    fn default() -> Self {
+        Self {
+            admin_read: false,
+            admin_write: false,
+            bucket_scopes: vec![],
+        }
+    }
+}
+
+/// Per-bucket permission scope for an API key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketScope {
+    /// Bucket name.
+    pub bucket: String,
+    /// If true, the key can write and delete objects. If false, read-only.
+    pub write: bool,
+}
+
+impl ApiKeyPermissions {
+    /// Can the key read objects in the given bucket?
+    pub fn can_read(&self, bucket: &str) -> bool {
+        if self.admin_read || self.admin_write {
+            return true;
+        }
+
+        self.bucket_scopes.iter().any(|s| s.bucket == bucket)
+    }
+
+    /// Can the key write/delete objects in the given bucket?
+    pub fn can_write(&self, bucket: &str) -> bool {
+        if self.admin_write {
+            return true;
+        }
+
+        self.bucket_scopes
+            .iter()
+            .any(|s| s.bucket == bucket && s.write)
+    }
+
+    /// Can the key list buckets?
+    pub fn can_list_buckets(&self) -> bool {
+        self.admin_read || self.admin_write
+    }
+
+    /// Can the key create or delete buckets?
+    pub fn can_manage_buckets(&self) -> bool {
+        self.admin_write
+    }
+}
+
+// ---------------------------------------------------------------------------
 // List API result types
 // ---------------------------------------------------------------------------
 
@@ -115,6 +196,8 @@ pub struct ObjectInfo {
     pub etag: String,
     /// Raw ObjectId for programmatic use.
     pub object_id: ObjectId,
+    /// MIME type from manifest metadata, if stored.
+    pub content_type: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

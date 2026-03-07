@@ -178,7 +178,11 @@ async fn test_router() -> axum::Router {
         cluster,
     ));
 
-    S3Server::new(S3ServerConfig { engine }).into_router()
+    S3Server::new(S3ServerConfig {
+        engine,
+        admin_secret: "test-secret".to_string(),
+    })
+    .into_router()
 }
 
 /// Deserialized response from `POST /admin/keys`.
@@ -186,6 +190,19 @@ async fn test_router() -> axum::Router {
 struct ApiKeyResponse {
     access_key_id: String,
     secret_access_key: String,
+}
+
+/// The admin secret used in all test routers.
+const TEST_ADMIN_SECRET: &str = "test-secret";
+
+/// Build an admin request with the test Bearer token.
+fn admin_request(method: &str, uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 /// Create a test router and provision one API key.
@@ -196,13 +213,7 @@ async fn test_router_with_key() -> (axum::Router, String, String) {
 
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/keys")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("POST", "/admin/keys"))
         .await
         .unwrap();
 
@@ -775,13 +786,7 @@ async fn test_create_api_key_returns_valid_pair() {
     let app = test_router().await;
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/keys")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("POST", "/admin/keys"))
         .await
         .unwrap();
 
@@ -820,11 +825,12 @@ async fn test_create_api_key_returns_valid_pair() {
 }
 
 #[tokio::test]
-async fn test_admin_keys_endpoint_is_open() {
+async fn test_admin_keys_endpoint_requires_auth() {
     let app = test_router().await;
 
-    // No auth header -> still works (admin endpoints are open).
+    // No auth header -> rejected.
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -832,6 +838,30 @@ async fn test_admin_keys_endpoint_is_open() {
                 .body(Body::empty())
                 .unwrap(),
         )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Wrong token -> rejected.
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/admin/keys")
+                .header("authorization", "Bearer wrong-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // Correct token -> accepted.
+    let response = app
+        .oneshot(admin_request("POST", "/admin/keys"))
         .await
         .unwrap();
 
@@ -846,13 +876,7 @@ async fn test_list_api_keys_returns_ids_only() {
     for _ in 0..2 {
         let response = app
             .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/admin/keys")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(admin_request("POST", "/admin/keys"))
             .await
             .unwrap();
 
@@ -861,13 +885,7 @@ async fn test_list_api_keys_returns_ids_only() {
 
     // List keys.
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/admin/keys")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("GET", "/admin/keys"))
         .await
         .unwrap();
 
@@ -890,13 +908,7 @@ async fn test_delete_api_key_revokes_access() {
     // Create a key.
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/admin/keys")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("POST", "/admin/keys"))
         .await
         .unwrap();
 
@@ -925,13 +937,10 @@ async fn test_delete_api_key_revokes_access() {
     // Delete the key via admin endpoint.
     let response = app
         .clone()
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri(format!("/admin/keys/{}", key.access_key_id))
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request(
+            "DELETE",
+            &format!("/admin/keys/{}", key.access_key_id),
+        ))
         .await
         .unwrap();
 
@@ -954,13 +963,7 @@ async fn test_delete_api_key_revokes_access() {
 
     // Verify listing shows zero keys.
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("GET")
-                .uri("/admin/keys")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("GET", "/admin/keys"))
         .await
         .unwrap();
 
@@ -974,13 +977,7 @@ async fn test_delete_nonexistent_api_key_returns_400() {
     let app = test_router().await;
 
     let response = app
-        .oneshot(
-            Request::builder()
-                .method("DELETE")
-                .uri("/admin/keys/SHOALDOESNOTEXIST1234")
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(admin_request("DELETE", "/admin/keys/SHOALDOESNOTEXIST1234"))
         .await
         .unwrap();
 
