@@ -93,6 +93,10 @@ impl RepairDetector {
                 }
                 Some(event) = rx_ready.recv() => {
                     self.processed_dead.lock().unwrap().remove(&event.node_id);
+                    info!(node_id = %event.node_id, "node ready — triggering rebalance scan");
+                    if let Err(e) = self.scan_local_shards().await {
+                        warn!(error = %e, "rebalance scan after node ready failed");
+                    }
                 }
                 Some(event) = rx_repair.recv() => {
                     debug!(shard_id = %event.shard_id, "repair needed event received");
@@ -156,8 +160,11 @@ impl RepairDetector {
 
     /// Scan local shards and verify they match ring placement.
     ///
-    /// - Shards we hold but shouldn't → log warning (will be cleaned up later).
-    /// - Shards assigned to us that we don't hold → enqueue for repair.
+    /// For each local shard not assigned to us by the current ring:
+    /// - If the shard map already reflects the correct ring owners (a previous
+    ///   repair already pushed it), delete the orphaned local copy.
+    /// - Otherwise, enqueue the shard for repair so the executor pushes it to
+    ///   its correct ring owners.
     pub async fn scan_local_shards(&self) -> Result<ScanResult, crate::RepairError> {
         let ring = self.cluster.ring().await;
         let local_node = self.cluster.local_node_id();
@@ -185,8 +192,42 @@ impl RepairDetector {
             // Check if we should own this shard.
             let owners = ring.owners(shard_id, self.replication_factor);
             if !owners.contains(&local_node) {
-                debug!(%shard_id, "holding shard not assigned by ring");
-                result.misplaced += 1;
+                // Check if the shard map already reflects the correct ring
+                // owners — meaning a previous repair already pushed this
+                // shard.  If so, our local copy is an orphan we can delete.
+                let map_owners = self
+                    .meta
+                    .get_shard_owners(shard_id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+
+                if !map_owners.is_empty()
+                    && map_owners.len() == owners.len()
+                    && owners.iter().all(|o| map_owners.contains(o))
+                {
+                    // Shard map matches ring — safe to delete local orphan.
+                    match self.store.delete(*shard_id).await {
+                        Ok(()) => {
+                            debug!(%shard_id, "deleted orphaned local shard copy");
+                            result.cleaned += 1;
+                        }
+                        Err(e) => {
+                            warn!(%shard_id, error = %e, "failed to delete orphaned shard");
+                        }
+                    }
+                } else {
+                    debug!(%shard_id, ?owners, "holding shard not assigned by ring — enqueuing for redistribution");
+                    result.misplaced += 1;
+
+                    // Enqueue for repair so the executor pushes this shard
+                    // to its correct ring owners.  Priority is low (high
+                    // number) because the shard still exists — it's just in
+                    // the wrong place, not at risk of data loss yet.
+                    if let Err(e) = self.meta.enqueue_repair(shard_id, 10) {
+                        warn!(%shard_id, error = %e, "failed to enqueue misplaced shard for redistribution");
+                    }
+                }
             }
         }
 
@@ -195,6 +236,7 @@ impl RepairDetector {
             scanned = result.total_scanned,
             corrupt = result.corrupt,
             misplaced = result.misplaced,
+            cleaned = result.cleaned,
             "local shard scan complete"
         );
         Ok(result)
@@ -208,6 +250,8 @@ pub struct ScanResult {
     pub total_scanned: usize,
     /// Shards that failed integrity verification.
     pub corrupt: usize,
-    /// Shards held locally but not assigned by the ring.
+    /// Shards held locally but not assigned by the ring (enqueued for redistribution).
     pub misplaced: usize,
+    /// Orphaned local copies deleted after redistribution confirmed.
+    pub cleaned: usize,
 }

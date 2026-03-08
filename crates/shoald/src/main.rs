@@ -1028,11 +1028,12 @@ async fn cmd_start(mut config: CliConfig, standalone: bool, no_logtree: bool) ->
                     tokio::select! {
                         result = detector.scan_local_shards() => {
                             match result {
-                                Ok(r) if r.corrupt > 0 || r.misplaced > 0 => {
+                                Ok(r) if r.corrupt > 0 || r.misplaced > 0 || r.cleaned > 0 => {
                                     warn!(
                                         scanned = r.total_scanned,
                                         corrupt = r.corrupt,
                                         misplaced = r.misplaced,
+                                        cleaned = r.cleaned,
                                         "anti-entropy scan found issues"
                                     );
                                 }
